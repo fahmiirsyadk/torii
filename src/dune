@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name main)
+ (libraries core hyper pages lwt lwt.unix)
+ (preprocess (pps lwt_ppx)))
