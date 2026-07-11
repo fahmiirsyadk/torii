@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/pi-harness",
+    "crates/pi-harness-pi",
+    "crates/pi-shell",
+    "crates/pi-tui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }

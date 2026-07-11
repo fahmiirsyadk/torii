@@ -1,0 +1,22 @@
+{
+  "name": "@pi-shell/sdk-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "start": "node --experimental-strip-types src/index.ts",
+    "smoke": "printf '{\"type\":\"health\"}\\n' | npm run --silent start"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "7.0.2"
+  }
+}
+
