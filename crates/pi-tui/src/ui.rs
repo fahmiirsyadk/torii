@@ -229,6 +229,19 @@ pub fn section_hit_at(
     {
         return None;
     }
+    if let Some((id, index, _, _, actionable)) = state
+        .transcript_hit_regions
+        .borrow()
+        .iter()
+        .find(|(_, _, start, end, _)| screen_row >= *start && screen_row < *end)
+        .cloned()
+    {
+        return Some(SectionHit {
+            id,
+            index,
+            actionable,
+        });
+    }
     let render_width = content_width.saturating_sub(1) as usize;
     let layout = TranscriptLayout::build(state, render_width);
     let max_scroll = layout.max_scroll(viewport);
@@ -457,54 +470,84 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     let viewport_height = content.height as usize;
     let max_scroll = line_count.saturating_sub(viewport_height);
     let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
+    let viewport_end = scroll.saturating_add(viewport_height);
+    let hit_regions = layout
+        .sections
+        .iter()
+        .filter_map(|section| {
+            let entry = state.entries.get(section.index)?;
+            let (start, end) = match entry {
+                Entry::User { .. } => (
+                    section.start.saturating_add(1),
+                    section.end.saturating_sub(1),
+                ),
+                Entry::Reasoning { .. } | Entry::Diff { .. } => {
+                    (section.start, section.end.saturating_sub(1))
+                }
+                Entry::Assistant { .. }
+                | Entry::Compaction { .. }
+                | Entry::CompactionIndicator { .. } => {
+                    (section.start.saturating_add(1), section.end)
+                }
+                Entry::Tool { .. } => (section.start, section.end),
+            };
+            let visible_start = start.max(scroll);
+            let visible_end = end.min(viewport_end);
+            (visible_start < visible_end).then(|| {
+                (
+                    section.id.clone(),
+                    section.index,
+                    content
+                        .y
+                        .saturating_add(visible_start.saturating_sub(scroll) as u16),
+                    content
+                        .y
+                        .saturating_add(visible_end.saturating_sub(scroll) as u16),
+                    section.actionable,
+                )
+            })
+        })
+        .collect();
+    *state.transcript_hit_regions.borrow_mut() = hit_regions;
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme.foreground).bg(theme.background))
         .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, content);
 
-    if let Some(target_id) = state
-        .hovered_target_id
-        .as_deref()
-        .or(state.focused_target_id.as_deref())
+    if let Some(target_id) = state.focused_target_id.as_deref()
         && let Some(section) = layout
             .sections
             .iter()
             .find(|section| section.id == target_id)
-        && section.end > scroll
-        && section.start < scroll.saturating_add(viewport_height)
     {
-        let marker_style = Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD);
-        let visible_start = section.start.max(scroll);
-        let visible_end = section.end.min(scroll.saturating_add(viewport_height));
-        let clipped_below = visible_end < section.end;
-        for logical_row in visible_start..visible_end {
-            let only_row = section.end.saturating_sub(section.start) == 1;
-            let continuation_rail = clipped_below && logical_row.saturating_add(3) >= visible_end;
-            let (left, right) = if continuation_rail {
-                ("┊", "┊")
-            } else if only_row {
-                ("[", "]")
-            } else if logical_row == section.start {
-                ("┌", "┐")
-            } else if logical_row + 1 == section.end {
-                ("└", "┘")
-            } else {
-                ("│", "│")
-            };
-            let y = content
-                .y
-                .saturating_add(logical_row.saturating_sub(scroll) as u16);
-            frame.render_widget(
-                Paragraph::new(left).style(marker_style),
-                Rect::new(area.x, y, 1, 1),
-            );
-            frame.render_widget(
-                Paragraph::new(right).style(marker_style),
-                Rect::new(area.right().saturating_sub(2), y, 1, 1),
-            );
-        }
+        render_section_border(
+            frame,
+            area,
+            content,
+            section,
+            scroll,
+            viewport_height,
+            theme,
+            false,
+        );
+    }
+    if let Some(target_id) = state.hovered_target_id.as_deref()
+        && state.focused_target_id.as_deref() != Some(target_id)
+        && let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.id == target_id)
+    {
+        render_section_border(
+            frame,
+            area,
+            content,
+            section,
+            scroll,
+            viewport_height,
+            theme,
+            true,
+        );
     }
 
     if line_count > viewport_height {
@@ -535,6 +578,59 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         frame.render_widget(
             Paragraph::new(user_card_lines(text, timestamp, width, theme)),
             sticky_area,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_section_border(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    content: Rect,
+    section: &LayoutSection,
+    scroll: usize,
+    viewport_height: usize,
+    theme: Theme,
+    preview: bool,
+) {
+    let viewport_end = scroll.saturating_add(viewport_height);
+    if section.end <= scroll || section.start >= viewport_end {
+        return;
+    }
+    let style = Style::default()
+        .fg(if preview { theme.muted } else { theme.accent })
+        .add_modifier(if preview {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        });
+    let visible_start = section.start.max(scroll);
+    let visible_end = section.end.min(viewport_end);
+    let clipped_below = visible_end < section.end;
+    for row in visible_start..visible_end {
+        let only = section.end.saturating_sub(section.start) == 1;
+        let continuation = clipped_below && row.saturating_add(3) >= visible_end;
+        let (left, right) = if preview {
+            if only { ("‹", "›") } else { ("┆", "┆") }
+        } else if continuation {
+            ("┊", "┊")
+        } else if only {
+            ("[", "]")
+        } else if row == section.start {
+            ("┌", "┐")
+        } else if row + 1 == section.end {
+            ("└", "┘")
+        } else {
+            ("│", "│")
+        };
+        let y = content.y.saturating_add(row.saturating_sub(scroll) as u16);
+        frame.render_widget(
+            Paragraph::new(left).style(style),
+            Rect::new(area.x, y, 1, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(right).style(style),
+            Rect::new(area.right().saturating_sub(2), y, 1, 1),
         );
     }
 }

@@ -414,8 +414,7 @@ async fn run_app(
                             size.height,
                             mouse.column,
                             mouse.row,
-                        )
-                        .filter(|hit| hit.actionable);
+                        );
                         state.hovered_entry = hovered.as_ref().map(|hit| hit.index);
                         state.hovered_target_id = hovered.map(|hit| hit.id);
                     }
@@ -1110,7 +1109,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         let edit = output.lines().find(|line| line.contains("> Edit")).unwrap();
-        assert_eq!(edit.chars().nth(1), Some('┌'));
+        assert_eq!(edit.chars().nth(1), Some('┆'));
         assert_eq!(state.scroll_from_bottom, scroll_before);
         assert_eq!(
             state.focused_target_id.as_deref(),

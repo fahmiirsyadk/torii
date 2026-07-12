@@ -2,7 +2,11 @@ use pi_harness::{
     AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
     SessionTreeEntry, ToolResult, Usage,
 };
-use std::{cell::Cell, collections::HashSet, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    time::Instant,
+};
 
 const COMMANDS: &[&str] = &[
     "Resume session",
@@ -11,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "Cycle mode",
     "Quit",
 ];
+pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/model",
@@ -335,6 +340,7 @@ pub struct AppState {
     pub hovered_entry: Option<usize>,
     pub hovered_target_id: Option<String>,
     pub transcript_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub transcript_hit_regions: RefCell<Vec<TranscriptHitRegion>>,
 }
 
 impl Default for AppState {
@@ -393,6 +399,7 @@ impl Default for AppState {
             hovered_entry: None,
             hovered_target_id: None,
             transcript_rect: Cell::new(None),
+            transcript_hit_regions: RefCell::new(Vec::new()),
         }
     }
 }
