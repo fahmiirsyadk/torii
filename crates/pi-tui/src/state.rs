@@ -333,6 +333,7 @@ pub struct AppState {
     pub focused_section: Option<usize>,
     pub focused_target_id: Option<String>,
     pub hovered_entry: Option<usize>,
+    pub hovered_target_id: Option<String>,
     pub transcript_rect: Cell<Option<(u16, u16, u16, u16)>>,
 }
 
@@ -390,6 +391,7 @@ impl Default for AppState {
             focused_section: None,
             focused_target_id: None,
             hovered_entry: None,
+            hovered_target_id: None,
             transcript_rect: Cell::new(None),
         }
     }
@@ -1339,6 +1341,7 @@ impl AppState {
                 self.focused_section = None;
                 self.focused_target_id = None;
                 self.hovered_entry = None;
+                self.hovered_target_id = None;
             }
             AgentEvent::UserMessage { text } => {
                 self.entries.push(Entry::User {

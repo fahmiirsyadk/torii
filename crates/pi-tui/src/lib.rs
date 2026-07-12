@@ -408,15 +408,16 @@ async fn run_app(
                     MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
                     MouseEventKind::ScrollDown => state.scroll_down(1),
                     MouseEventKind::Moved => {
-                        state.hovered_entry = ui::section_hit_at(
+                        let hovered = ui::section_hit_at(
                             &state,
                             size.width,
                             size.height,
                             mouse.column,
                             mouse.row,
                         )
-                        .filter(|hit| hit.actionable)
-                        .map(|hit| hit.index);
+                        .filter(|hit| hit.actionable);
+                        state.hovered_entry = hovered.as_ref().map(|hit| hit.index);
+                        state.hovered_target_id = hovered.map(|hit| hit.id);
                     }
                     MouseEventKind::Down(_) => {
                         if mouse.row >= size.height.saturating_sub(5)
@@ -983,7 +984,7 @@ mod tests {
         state.toggle_tool_at(2);
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let focused = buffer_text(terminal.backend().buffer(), width, height);
-        assert!(focused.contains('▌'));
+        assert!(!focused.contains('▌'));
         assert!(focused.contains("cargo clippy --workspace"));
     }
 
@@ -1094,6 +1095,27 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("> Run 3 calls"));
+    }
+
+    #[test]
+    fn hovered_edit_uses_pointer_and_moves_border_without_scrolling() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.focused_target_id = Some("tool-group:tool-test".into());
+        state.hovered_entry = Some(4);
+        state.hovered_target_id = Some("diff:fixture-diff-2".into());
+        let scroll_before = state.scroll_from_bottom;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        let edit = output.lines().find(|line| line.contains("> Edit")).unwrap();
+        assert_eq!(edit.chars().nth(1), Some('┌'));
+        assert_eq!(state.scroll_from_bottom, scroll_before);
+        assert_eq!(
+            state.focused_target_id.as_deref(),
+            Some("tool-group:tool-test")
+        );
     }
 
     #[test]

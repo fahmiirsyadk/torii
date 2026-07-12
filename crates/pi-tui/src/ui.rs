@@ -82,7 +82,8 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                 expanded,
                 ..
             } => {
-                row += diff_render_lines(path, lines, *expanded, width, Theme::GROK_NIGHT).len();
+                row += diff_render_lines(path, lines, *expanded, false, width, Theme::GROK_NIGHT)
+                    .len();
                 actionable = true;
             }
             Entry::Tool { .. } => {
@@ -388,7 +389,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 expanded,
                 ..
             } => {
-                lines.extend(diff_render_lines(path, diff_lines, *expanded, width, theme));
+                lines.extend(diff_render_lines(
+                    path,
+                    diff_lines,
+                    *expanded,
+                    state.hovered_entry == Some(entry_index),
+                    width,
+                    theme,
+                ));
             }
             Entry::Tool { .. } => {
                 let (rendered, consumed) = tool_group_lines(state, entry_index, width, theme);
@@ -454,7 +462,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, content);
 
-    if let Some(target_id) = state.focused_target_id.as_deref()
+    if let Some(target_id) = state
+        .hovered_target_id
+        .as_deref()
+        .or(state.focused_target_id.as_deref())
         && let Some(section) = layout
             .sections
             .iter()
@@ -1081,10 +1092,9 @@ fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Li
     let detail_width =
         width.saturating_sub(tool.label.chars().count() + timing.chars().count() + 4);
     let prefix = if tool.nested { "  ├ " } else { "" };
-    let focus = if tool.focused { "▌  " } else { "   " };
     let mut spans = vec![
         Span::styled(
-            format!("{focus}{prefix}{marker} "),
+            format!("{prefix}{marker} "),
             Style::default().fg(if tool.focused {
                 theme.success
             } else {
@@ -1109,7 +1119,7 @@ fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Li
     if tool.expanded
         && let Some(result) = tool.result
     {
-        let detail_indent = if tool.nested { 9 } else { 5 };
+        let detail_indent = if tool.nested { 6 } else { 2 };
         let result_width = width.saturating_sub(detail_indent + 2);
         for (index, line) in markdown::wrap(result, result_width).into_iter().enumerate() {
             let prefix = if index == 0 {
@@ -1178,6 +1188,7 @@ fn diff_render_lines(
     path: &str,
     diff_lines: &[DiffLine],
     expanded: bool,
+    hovered: bool,
     width: usize,
     theme: Theme,
 ) -> Vec<Line<'static>> {
@@ -1196,7 +1207,10 @@ fn diff_render_lines(
     };
     let path_width = width.saturating_sub(7 + summary.chars().count());
     let mut lines = vec![Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(theme.foreground)),
+        Span::styled(
+            if hovered { "> " } else { "◆ " },
+            Style::default().fg(theme.foreground),
+        ),
         Span::styled(
             "Edit ",
             Style::default()
