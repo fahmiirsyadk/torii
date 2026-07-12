@@ -1855,6 +1855,34 @@ mod tests {
     }
 
     #[test]
+    fn markdown_renders_numbered_lists_and_checkboxes() {
+        let source: Vec<String> = vec![
+            "## Next Steps".into(),
+            "1. Run the test suite".into(),
+            "2. Push the changes".into(),
+            "### Done".into(),
+            "- [x] Wire compaction".into(),
+            "- [ ] Visual review".into(),
+        ];
+        let lines = crate::markdown::render(&source, 80, Theme::GROK_NIGHT);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            text.iter().any(|line| line.contains("1. Run the test suite")),
+            "numbered list should keep the number, got: {text:?}"
+        );
+        assert!(text.iter().any(|line| line.contains("☑ Wire compaction")));
+        assert!(text.iter().any(|line| line.contains("☐ Visual review")));
+    }
+
+    #[test]
     fn compaction_appears_in_render_output() {
         let (width, height) = (100, 32);
         let backend = TestBackend::new(width, height);
@@ -1872,7 +1900,7 @@ mod tests {
             phase: pi_harness::CompactionPhase::End,
             reason: Some("manual".into()),
             summary: Some(
-                "## Highlights\n- Retained recent user requests\n- Dropped old tool outputs".into(),
+                "## Highlights\n- [x] Retained recent user requests\n- [ ] Dropped old tool outputs\n1. First next step\n2. Second next step".into(),
             ),
             tokens_before: Some(180_000),
             tokens_after: Some(24_000),
@@ -1885,12 +1913,20 @@ mod tests {
         assert!(output.contains("180K → 24K tokens"));
         assert!(output.contains("Highlights"), "heading should be rendered");
         assert!(
-            output.contains("Retained recent user requests"),
-            "list item should be rendered"
+            output.contains("☑ Retained recent user requests"),
+            "checked checkbox should be rendered, got output: {output}"
         );
         assert!(
-            output.contains("Dropped old tool outputs"),
-            "second list item should be rendered"
+            output.contains("☐ Dropped old tool outputs"),
+            "unchecked checkbox should be rendered, got output: {output}"
+        );
+        assert!(
+            output.contains("1. First next step"),
+            "numbered list should keep the number"
+        );
+        assert!(
+            output.contains("2. Second next step"),
+            "second numbered item should be rendered"
         );
     }
 

@@ -62,6 +62,35 @@ pub fn render(source: &[String], width: usize, theme: Theme) -> Vec<Line<'static
         }
 
         if let Some(item) = source_line
+            .strip_prefix("- [x] ")
+            .or_else(|| source_line.strip_prefix("- [X] "))
+        {
+            let item_width = width.saturating_sub(2);
+            for (index, line) in wrap(item, item_width).into_iter().enumerate() {
+                let prefix = if index == 0 { "☑ " } else { "  " };
+                let mut spans = vec![Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(theme.accent),
+                )];
+                spans.extend(inline_spans(&line, Style::default(), theme));
+                output.push(Line::from(spans));
+            }
+            continue;
+        }
+        if let Some(item) = source_line.strip_prefix("- [ ] ") {
+            let item_width = width.saturating_sub(2);
+            for (index, line) in wrap(item, item_width).into_iter().enumerate() {
+                let prefix = if index == 0 { "☐ " } else { "  " };
+                let mut spans = vec![Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(theme.muted),
+                )];
+                spans.extend(inline_spans(&line, Style::default(), theme));
+                output.push(Line::from(spans));
+            }
+            continue;
+        }
+        if let Some(item) = source_line
             .strip_prefix("- ")
             .or_else(|| source_line.strip_prefix("* "))
         {
@@ -70,6 +99,26 @@ pub fn render(source: &[String], width: usize, theme: Theme) -> Vec<Line<'static
                 let prefix = if index == 0 { "• " } else { "  " };
                 let mut spans = vec![Span::styled(
                     prefix.to_string(),
+                    Style::default().fg(theme.accent),
+                )];
+                spans.extend(inline_spans(&line, Style::default(), theme));
+                output.push(Line::from(spans));
+            }
+            continue;
+        }
+        if let Some(numbered) = numbered_list_item(source_line) {
+            let (number, item) = numbered;
+            let marker = format!("{number}. ");
+            let marker_width = marker.chars().count();
+            let item_width = width.saturating_sub(marker_width);
+            for (index, line) in wrap(item, item_width).into_iter().enumerate() {
+                let prefix = if index == 0 {
+                    marker.clone()
+                } else {
+                    " ".repeat(marker_width)
+                };
+                let mut spans = vec![Span::styled(
+                    prefix,
                     Style::default().fg(theme.accent),
                 )];
                 spans.extend(inline_spans(&line, Style::default(), theme));
@@ -98,6 +147,15 @@ fn wrap_code(value: &str, width: usize) -> Vec<String> {
         .chunks(width)
         .map(|chunk| chunk.iter().collect())
         .collect()
+}
+
+fn numbered_list_item(source_line: &str) -> Option<(String, &str)> {
+    let dot = source_line.find(". ")?;
+    let (number, after) = source_line.split_at(dot);
+    if number.is_empty() || !number.chars().all(|char| char.is_ascii_digit()) {
+        return None;
+    }
+    Some((number.to_string(), &after[2..]))
 }
 
 pub fn wrap(value: &str, width: usize) -> Vec<String> {
