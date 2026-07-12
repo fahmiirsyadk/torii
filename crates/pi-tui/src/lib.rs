@@ -1133,6 +1133,15 @@ mod tests {
                 (left != " ").then_some((left, right))
             })
             .collect();
+        let edit_row = (2..height - 5)
+            .find(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("Edit crates/pi-tui/src/ui.rs")
+            })
+            .unwrap();
+        assert_eq!(buffer[(1, edit_row)].symbol(), "┌");
         assert_eq!(markers.first(), Some(&("┌".into(), "┐".into())));
         assert_eq!(markers.last(), Some(&("└".into(), "┘".into())));
         assert!(markers.len() > 2);

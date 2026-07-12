@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use crate::{
@@ -452,8 +452,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme.foreground).bg(theme.background))
-        .scroll((scroll as u16, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, content);
 
     if let Some(target_id) = state.focused_target_id.as_deref()
