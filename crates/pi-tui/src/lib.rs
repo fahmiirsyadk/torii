@@ -1057,6 +1057,38 @@ mod tests {
     }
 
     #[test]
+    fn rendered_tool_rows_hit_exactly_after_scrolling() {
+        let (width, height) = (100, 24);
+        let mut state = fixtures::long_session(120);
+        let max_scroll = ui::max_scroll(&state, width, height);
+        for from_bottom in [0, max_scroll / 2, max_scroll] {
+            state.scroll_from_bottom = from_bottom;
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for row in 2..height.saturating_sub(5) {
+                let line: String = (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                if let Some(path) = line.split("Read src/file-").nth(1)
+                    && let Some(index) = path
+                        .split(".rs")
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                {
+                    let hit = ui::section_hit_at(&state, width, height, 6, row);
+                    assert_eq!(
+                        hit.map(|target| target.index),
+                        Some(index),
+                        "row {row}, scroll {from_bottom}: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hovered_tool_uses_pointer_marker() {
         let (width, height) = (100, 32);
         let mut state = fixtures::tools();

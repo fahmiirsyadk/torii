@@ -2,7 +2,7 @@ use pi_harness::{
     AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
     SessionTreeEntry, ToolResult, Usage,
 };
-use std::{collections::HashSet, time::Instant};
+use std::{cell::Cell, collections::HashSet, time::Instant};
 
 const COMMANDS: &[&str] = &[
     "Resume session",
@@ -333,6 +333,7 @@ pub struct AppState {
     pub focused_section: Option<usize>,
     pub focused_target_id: Option<String>,
     pub hovered_entry: Option<usize>,
+    pub transcript_rect: Cell<Option<(u16, u16, u16, u16)>>,
 }
 
 impl Default for AppState {
@@ -389,6 +390,7 @@ impl Default for AppState {
             focused_section: None,
             focused_target_id: None,
             hovered_entry: None,
+            transcript_rect: Cell::new(None),
         }
     }
 }

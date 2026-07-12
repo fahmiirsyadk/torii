@@ -49,6 +49,9 @@ impl TranscriptLayout {
 }
 
 fn transcript_geometry(state: &AppState, width: u16, height: u16) -> (u16, u16, u16, usize) {
+    if let Some((x, y, width, height)) = state.transcript_rect.get() {
+        return (x, y, width, usize::from(height));
+    }
     let banners = u16::from(state.turn_started_at.is_some())
         + u16::from(state.active_compaction_started_at().is_some());
     let viewport = height.saturating_sub(7).saturating_sub(banners);
@@ -354,6 +357,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         horizontal: 2,
         vertical: 0,
     });
+    state
+        .transcript_rect
+        .set(Some((content.x, content.y, content.width, content.height)));
     let width = content.width.saturating_sub(1) as usize;
     let layout = TranscriptLayout::build(state, width);
     let mut lines = Vec::new();
