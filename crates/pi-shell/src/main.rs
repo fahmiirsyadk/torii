@@ -142,6 +142,16 @@ async fn main() -> Result<()> {
                             .resume_session(&command_session, target)
                             .await;
                     }
+                    pi_tui::UiCommand::RenameSession { target, name } => {
+                        let _ = command_harness
+                            .rename_session(&command_session, target, name)
+                            .await;
+                    }
+                    pi_tui::UiCommand::DeleteSession(target) => {
+                        let _ = command_harness
+                            .delete_session(&command_session, target)
+                            .await;
+                    }
                     pi_tui::UiCommand::NewSession => {
                         let _ = command_harness.new_session(&command_session).await;
                     }

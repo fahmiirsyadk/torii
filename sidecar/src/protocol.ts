@@ -28,6 +28,8 @@ export type SidecarCommand =
   | { type: "logout"; request_id: string; session_id: string; provider: string }
   | { type: "list_sessions"; request_id: string; session_id: string }
   | { type: "resume_session"; request_id: string; session_id: string; target: string }
+  | { type: "rename_session"; request_id: string; session_id: string; target: string; name: string }
+  | { type: "delete_session"; request_id: string; session_id: string; target: string }
   | { type: "new_session"; request_id: string; session_id: string }
   | { type: "name_session"; request_id: string; session_id: string; name: string }
   | { type: "session_info"; request_id: string; session_id: string }
@@ -98,6 +100,8 @@ export type SidecarMessage =
         modified: string;
         message_count: number;
         current: boolean;
+        cwd: string;
+        parent_session_path?: string;
       }>;
       session_info?: {
         id: string;

@@ -38,6 +38,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2
         + usize::from(matches!(
             state.overlay,
+            OverlayKind::SessionPicker | OverlayKind::SessionDeleteConfirm
+        )) * 2
+        + usize::from(state.overlay == OverlayKind::SessionPicker && items.is_empty())
+        + usize::from(matches!(
+            state.overlay,
             OverlayKind::TreePicker | OverlayKind::ForkPicker
         )) * 2;
     let height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
@@ -49,6 +54,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::CommandPalette => " Commands ",
         OverlayKind::ModelPicker => " Select model ",
         OverlayKind::SessionPicker => " Resume session ",
+        OverlayKind::SessionRename => " Rename Session ",
+        OverlayKind::SessionDeleteConfirm => " Delete Session? ",
         OverlayKind::TreePicker => " Session tree ",
         OverlayKind::ForkPicker => " Fork from prompt ",
         OverlayKind::TreeSummaryPicker => " Summarize branch? ",
@@ -69,6 +76,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::CommandPalette
             | OverlayKind::ModelPicker
             | OverlayKind::SessionPicker
+            | OverlayKind::SessionRename
             | OverlayKind::TreePicker
             | OverlayKind::ForkPicker
             | OverlayKind::TreeSummaryEditor
@@ -83,6 +91,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             Span::styled(
                 if state.overlay == OverlayKind::LabelEditor {
                     "  Label: "
+                } else if state.overlay == OverlayKind::SessionRename {
+                    "  Name: "
                 } else if state.overlay == OverlayKind::TreeSummaryEditor {
                     "  Instructions: "
                 } else if state.overlay == OverlayKind::OauthPrompt {
@@ -96,6 +106,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
                 if state.overlay_query.is_empty() {
                     if state.overlay == OverlayKind::LabelEditor {
                         "empty clears label…".to_string()
+                    } else if state.overlay == OverlayKind::SessionRename {
+                        "enter a session name…".to_string()
                     } else if state.overlay == OverlayKind::TreeSummaryEditor {
                         "what should the summary preserve?…".to_string()
                     } else if state.overlay == OverlayKind::OauthPrompt {
@@ -126,6 +138,46 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         )));
         lines.push(Line::raw(""));
     }
+    if state.overlay == OverlayKind::SessionPicker {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Sort: {}  ·  Name: {}  ·  Ctrl+P path ({})",
+                state.session_sort.label(),
+                if state.session_named_only {
+                    "Named"
+                } else {
+                    "All"
+                },
+                if state.session_show_path { "on" } else { "off" }
+            ),
+            Style::default().fg(theme.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Ctrl+S sort  ·  Ctrl+N named  ·  Ctrl+R rename  ·  Ctrl+D delete",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if state.overlay == OverlayKind::SessionDeleteConfirm {
+        let target = state.pending_session_path.as_deref().unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("  Delete {target}?"),
+            Style::default().fg(theme.error),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Enter confirm  ·  Esc cancel",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if state.overlay == OverlayKind::SessionPicker && items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if state.session_named_only {
+                "  No named sessions found. Press Ctrl+N to show all."
+            } else {
+                "  No sessions found"
+            },
+            Style::default().fg(theme.muted),
+        )));
+    }
     if let Some(permission) = &state.pending_permission
         && state.overlay == OverlayKind::Permission
     {
@@ -155,9 +207,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         let model_current = state.overlay == OverlayKind::ModelPicker && item == &state.model;
         let session_current = state.overlay == OverlayKind::SessionPicker
             && state
-                .available_sessions
-                .iter()
-                .any(|session| session.current && crate::state::session_label(session) == *item);
+                .filtered_sessions()
+                .get(index)
+                .is_some_and(|session| session.current);
         let current = if model_current || session_current {
             "  ✓ current"
         } else {

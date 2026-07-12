@@ -76,6 +76,9 @@ pub enum AgentEvent {
     SessionInfo {
         summary: String,
     },
+    SessionList {
+        sessions: Vec<SessionInfo>,
+    },
     PromptPrefill {
         text: String,
     },
@@ -201,6 +204,10 @@ pub struct SessionInfo {
     pub modified: String,
     pub message_count: usize,
     pub current: bool,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub parent_session_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -333,6 +340,8 @@ pub trait AgentHarness: Send + Sync {
     async fn export_trace(&self, id: &SessionId, path: Option<String>) -> Result<()>;
     async fn list_sessions(&self, id: &SessionId) -> Result<Vec<SessionInfo>>;
     async fn resume_session(&self, id: &SessionId, target: String) -> Result<()>;
+    async fn rename_session(&self, id: &SessionId, target: String, name: String) -> Result<()>;
+    async fn delete_session(&self, id: &SessionId, target: String) -> Result<()>;
     async fn new_session(&self, id: &SessionId) -> Result<()>;
     async fn name_session(&self, id: &SessionId, name: String) -> Result<()>;
     async fn session_stats(&self, id: &SessionId) -> Result<SessionStats>;
@@ -585,6 +594,12 @@ impl AgentHarness for MockHarness {
     }
 
     async fn resume_session(&self, _id: &SessionId, _target: String) -> Result<()> {
+        Ok(())
+    }
+    async fn rename_session(&self, _id: &SessionId, _target: String, _name: String) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_session(&self, _id: &SessionId, _target: String) -> Result<()> {
         Ok(())
     }
 

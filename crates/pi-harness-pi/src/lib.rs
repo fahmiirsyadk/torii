@@ -596,6 +596,48 @@ impl AgentHarness for PiHarness {
         .await
     }
 
+    async fn rename_session(&self, id: &SessionId, target: String, name: String) -> Result<()> {
+        let sessions = self
+            .request(
+                json!({ "type": "rename_session", "session_id": id.0, "target": target, "name": name }),
+                None,
+            )
+            .await?
+            .sessions
+            .unwrap_or_default();
+        if let Some(sender) = self
+            .inner
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .get(id)
+        {
+            let _ = sender.send(AgentEvent::SessionList { sessions });
+        }
+        Ok(())
+    }
+
+    async fn delete_session(&self, id: &SessionId, target: String) -> Result<()> {
+        let sessions = self
+            .request(
+                json!({ "type": "delete_session", "session_id": id.0, "target": target }),
+                None,
+            )
+            .await?
+            .sessions
+            .unwrap_or_default();
+        if let Some(sender) = self
+            .inner
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .get(id)
+        {
+            let _ = sender.send(AgentEvent::SessionList { sessions });
+        }
+        Ok(())
+    }
+
     async fn new_session(&self, id: &SessionId) -> Result<()> {
         self.session_replacement(id, json!({ "type": "new_session", "session_id": id.0 }))
             .await

@@ -52,6 +52,8 @@ pub enum OverlayKind {
     CommandPalette,
     ModelPicker,
     SessionPicker,
+    SessionRename,
+    SessionDeleteConfirm,
     TreePicker,
     ForkPicker,
     TreeSummaryPicker,
@@ -92,6 +94,13 @@ pub enum OverlayAction {
         id: String,
     },
     ResumeSession {
+        target: String,
+    },
+    RenameSession {
+        target: String,
+        name: String,
+    },
+    DeleteSession {
         target: String,
     },
     NewSession,
@@ -144,6 +153,32 @@ pub enum TreeFilter {
     UserOnly,
     LabeledOnly,
     All,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionSort {
+    #[default]
+    Threaded,
+    Recent,
+    Relevance,
+}
+
+impl SessionSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Threaded => Self::Recent,
+            Self::Recent => Self::Relevance,
+            Self::Relevance => Self::Threaded,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Threaded => "Threaded",
+            Self::Recent => "Recent",
+            Self::Relevance => "Fuzzy",
+        }
+    }
 }
 
 impl TreeFilter {
@@ -326,6 +361,10 @@ pub struct AppState {
     pub pending_oauth: Option<PendingOauth>,
     pub available_models: Vec<ModelInfo>,
     pub available_sessions: Vec<SessionInfo>,
+    pub session_sort: SessionSort,
+    pub session_named_only: bool,
+    pub session_show_path: bool,
+    pub pending_session_path: Option<String>,
     pub available_files: Vec<String>,
     pub runtime_commands: Vec<RuntimeCommand>,
     pub context_files: Vec<String>,
@@ -387,6 +426,10 @@ impl Default for AppState {
                 display_name: "Mock model".into(),
             }],
             available_sessions: Vec::new(),
+            session_sort: SessionSort::default(),
+            session_named_only: false,
+            session_show_path: false,
+            pending_session_path: None,
             available_files: Vec::new(),
             runtime_commands: Vec::new(),
             context_files: Vec::new(),
@@ -568,6 +611,14 @@ impl AppState {
     pub fn cancel_oauth(&mut self) -> OverlayAction {
         if matches!(
             self.overlay,
+            OverlayKind::SessionRename | OverlayKind::SessionDeleteConfirm
+        ) {
+            self.pending_session_path = None;
+            self.open_overlay(OverlayKind::SessionPicker);
+            return OverlayAction::None;
+        }
+        if matches!(
+            self.overlay,
             OverlayKind::TreeSummaryPicker | OverlayKind::TreeSummaryEditor
         ) {
             let selected = self.pending_tree_entry.clone();
@@ -608,9 +659,12 @@ impl AppState {
                 .iter()
                 .map(|model| model.display_name.clone())
                 .collect(),
-            OverlayKind::SessionPicker => {
-                self.available_sessions.iter().map(session_label).collect()
-            }
+            OverlayKind::SessionPicker => self
+                .filtered_sessions()
+                .into_iter()
+                .map(|session| self.session_picker_label(session))
+                .collect(),
+            OverlayKind::SessionRename | OverlayKind::SessionDeleteConfirm => Vec::new(),
             OverlayKind::TreePicker | OverlayKind::ForkPicker => self
                 .filtered_tree()
                 .into_iter()
@@ -698,7 +752,11 @@ impl AppState {
         let query = self.overlay_query.to_ascii_lowercase();
         source
             .into_iter()
-            .filter(|item| query.is_empty() || item.to_ascii_lowercase().contains(&query))
+            .filter(|item| {
+                self.overlay == OverlayKind::SessionPicker
+                    || query.is_empty()
+                    || item.to_ascii_lowercase().contains(&query)
+            })
             .collect()
     }
 
@@ -747,6 +805,7 @@ impl AppState {
             OverlayKind::CommandPalette
                 | OverlayKind::ModelPicker
                 | OverlayKind::SessionPicker
+                | OverlayKind::SessionRename
                 | OverlayKind::TreePicker
                 | OverlayKind::TreeSummaryEditor
                 | OverlayKind::LabelEditor
@@ -773,6 +832,26 @@ impl AppState {
     }
 
     pub fn activate_overlay(&mut self) -> OverlayAction {
+        if self.overlay == OverlayKind::SessionRename {
+            let Some(target) = self.pending_session_path.take() else {
+                return OverlayAction::None;
+            };
+            let name = self.overlay_query.trim().to_string();
+            if name.is_empty() {
+                self.pending_session_path = Some(target);
+                self.status = "session name cannot be empty".into();
+                return OverlayAction::None;
+            }
+            self.open_overlay(OverlayKind::SessionPicker);
+            return OverlayAction::RenameSession { target, name };
+        }
+        if self.overlay == OverlayKind::SessionDeleteConfirm {
+            let Some(target) = self.pending_session_path.take() else {
+                return OverlayAction::None;
+            };
+            self.open_overlay(OverlayKind::SessionPicker);
+            return OverlayAction::DeleteSession { target };
+        }
         if self.overlay == OverlayKind::OauthPrompt {
             let Some(pending) = self.pending_oauth.take() else {
                 return OverlayAction::None;
@@ -837,11 +916,8 @@ impl AppState {
                 return OverlayAction::SetModel { id: model.id };
             }
             OverlayKind::SessionPicker => {
-                let Some(session) = self
-                    .available_sessions
-                    .iter()
-                    .find(|session| session_label(session) == item)
-                else {
+                let sessions = self.filtered_sessions();
+                let Some(session) = sessions.get(self.overlay_selected) else {
                     return OverlayAction::None;
                 };
                 let target = session.path.clone();
@@ -985,6 +1061,8 @@ impl AppState {
                 }
             }
             OverlayKind::OauthPrompt
+            | OverlayKind::SessionRename
+            | OverlayKind::SessionDeleteConfirm
             | OverlayKind::TreeSummaryEditor
             | OverlayKind::LabelEditor
             | OverlayKind::None => {}
@@ -994,6 +1072,119 @@ impl AppState {
             }
         }
         OverlayAction::None
+    }
+
+    pub fn cycle_session_sort(&mut self) {
+        if self.overlay == OverlayKind::SessionPicker {
+            self.session_sort = self.session_sort.next();
+            self.overlay_selected = 0;
+        }
+    }
+
+    pub fn toggle_named_sessions(&mut self) {
+        if self.overlay == OverlayKind::SessionPicker {
+            self.session_named_only = !self.session_named_only;
+            self.overlay_selected = 0;
+        }
+    }
+
+    pub fn toggle_session_paths(&mut self) {
+        if self.overlay == OverlayKind::SessionPicker {
+            self.session_show_path = !self.session_show_path;
+        }
+    }
+
+    pub fn begin_session_rename(&mut self) {
+        if self.overlay != OverlayKind::SessionPicker {
+            return;
+        }
+        let sessions = self.filtered_sessions();
+        let Some(session) = sessions.get(self.overlay_selected) else {
+            return;
+        };
+        let target = session.path.clone();
+        let name = session.name.clone().unwrap_or_default();
+        self.pending_session_path = Some(target);
+        self.overlay = OverlayKind::SessionRename;
+        self.overlay_query = name;
+        self.overlay_selected = 0;
+    }
+
+    pub fn begin_session_delete(&mut self) {
+        if self.overlay != OverlayKind::SessionPicker {
+            return;
+        }
+        let sessions = self.filtered_sessions();
+        let Some(session) = sessions.get(self.overlay_selected) else {
+            return;
+        };
+        if session.current {
+            self.status = "cannot delete the active session".into();
+            return;
+        }
+        self.pending_session_path = Some(session.path.clone());
+        self.overlay = OverlayKind::SessionDeleteConfirm;
+        self.overlay_query.clear();
+        self.overlay_selected = 0;
+    }
+
+    pub(crate) fn filtered_sessions(&self) -> Vec<&SessionInfo> {
+        let query = self.overlay_query.trim().to_ascii_lowercase();
+        let mut sessions = self
+            .available_sessions
+            .iter()
+            .filter(|session| {
+                !self.session_named_only
+                    || session
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty())
+            })
+            .filter(|session| session_search_text(session).contains(&query))
+            .collect::<Vec<_>>();
+        match self.session_sort {
+            SessionSort::Recent => sessions.sort_by(|a, b| b.modified.cmp(&a.modified)),
+            SessionSort::Relevance if !query.is_empty() => sessions.sort_by_key(|session| {
+                session_search_text(session)
+                    .find(&query)
+                    .unwrap_or(usize::MAX)
+            }),
+            SessionSort::Threaded if query.is_empty() => {
+                sessions = threaded_session_order(sessions);
+            }
+            SessionSort::Relevance | SessionSort::Threaded => {}
+        }
+        sessions
+    }
+
+    fn session_picker_label(&self, session: &SessionInfo) -> String {
+        let prefix =
+            if self.session_sort == SessionSort::Threaded && self.overlay_query.trim().is_empty() {
+                let mut depth = 0usize;
+                let mut parent = session.parent_session_path.as_deref();
+                while let Some(path) = parent {
+                    let Some(ancestor) = self
+                        .available_sessions
+                        .iter()
+                        .find(|candidate| candidate.path == path)
+                    else {
+                        break;
+                    };
+                    depth += 1;
+                    if depth >= 32 {
+                        break;
+                    }
+                    parent = ancestor.parent_session_path.as_deref();
+                }
+                if depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}└─ ", "   ".repeat(depth.saturating_sub(1)))
+                }
+            } else {
+                String::new()
+            };
+        format!("{prefix}{}", session_label(session, self.session_show_path))
     }
 
     pub fn toggle_scoped_model(&mut self) {
@@ -1623,6 +1814,12 @@ impl AppState {
                 });
                 self.status = "session info".into();
             }
+            AgentEvent::SessionList { sessions } => {
+                self.available_sessions = sessions;
+                self.pending_session_path = None;
+                self.open_overlay(OverlayKind::SessionPicker);
+                self.status = "sessions refreshed".into();
+            }
             AgentEvent::PromptPrefill { text } => {
                 self.prompt = text;
                 self.cursor = self.prompt.chars().count();
@@ -1998,7 +2195,7 @@ fn char_to_byte(value: &str, character_index: usize) -> usize {
         .map_or(value.len(), |(index, _)| index)
 }
 
-pub(crate) fn session_label(session: &SessionInfo) -> String {
+pub(crate) fn session_label(session: &SessionInfo, show_path: bool) -> String {
     let title = session
         .name
         .as_deref()
@@ -2011,7 +2208,56 @@ pub(crate) fn session_label(session: &SessionInfo) -> String {
     };
     let title = title.chars().take(20).collect::<String>();
     let modified = session.modified.get(..16).unwrap_or(&session.modified);
-    format!("{title}  · {modified}  · {} msg", session.message_count)
+    let path = if show_path {
+        format!("  · {}", session.path)
+    } else {
+        String::new()
+    };
+    format!(
+        "{title}  · {modified}  · {} msg{path}",
+        session.message_count
+    )
+}
+
+fn session_search_text(session: &SessionInfo) -> String {
+    format!(
+        "{} {} {} {} {}",
+        session.id,
+        session.name.as_deref().unwrap_or_default(),
+        session.first_message,
+        session.path,
+        session.cwd
+    )
+    .to_ascii_lowercase()
+}
+
+fn threaded_session_order(sessions: Vec<&SessionInfo>) -> Vec<&SessionInfo> {
+    let paths = sessions
+        .iter()
+        .map(|session| session.path.as_str())
+        .collect::<HashSet<_>>();
+    let mut children: std::collections::HashMap<Option<&str>, Vec<&SessionInfo>> =
+        std::collections::HashMap::new();
+    for session in sessions {
+        let parent = session
+            .parent_session_path
+            .as_deref()
+            .filter(|parent| paths.contains(parent));
+        children.entry(parent).or_default().push(session);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|a, b| b.modified.cmp(&a.modified));
+    }
+    let mut ordered = Vec::new();
+    let mut stack = children.get(&None).cloned().unwrap_or_default();
+    stack.reverse();
+    while let Some(session) = stack.pop() {
+        ordered.push(session);
+        if let Some(descendants) = children.get(&Some(session.path.as_str())) {
+            stack.extend(descendants.iter().rev().copied());
+        }
+    }
+    ordered
 }
 
 pub(crate) fn tree_label(entry: &SessionTreeEntry, show_timestamp: bool) -> String {

@@ -858,7 +858,28 @@ export async function listAllSessions(active: ActiveSession) {
     modified: session.modified.toISOString(),
     message_count: session.messageCount,
     current: currentPath === session.path,
+    cwd: session.cwd,
+    parent_session_path: session.parentSessionPath,
   }));
+}
+
+export function renameSession(path: string, name: string): void {
+  const trimmed = name.trim();
+  if (trimmed === "") throw new Error("session name cannot be empty");
+  SessionManager.open(path).appendSessionInfo(trimmed);
+}
+
+export async function deleteSession(path: string): Promise<"trash" | "unlink"> {
+  try {
+    await execFileAsync("trash", path.startsWith("-") ? ["--", path] : [path]);
+    return "trash";
+  } catch {
+    if (!existsSync(path)) return "trash";
+    // Match Pi: use permanent deletion only when the platform trash command
+    // is unavailable or failed.
+    unlinkSync(path);
+    return "unlink";
+  }
 }
 
 export function listTree(active: ActiveSession, userOnly: boolean) {

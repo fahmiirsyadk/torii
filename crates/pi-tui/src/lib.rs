@@ -37,6 +37,11 @@ pub enum UiCommand {
     },
     SetModel(String),
     ResumeSession(String),
+    RenameSession {
+        target: String,
+        name: String,
+    },
+    DeleteSession(String),
     NewSession,
     NameSession(String),
     SessionInfo,
@@ -295,6 +300,36 @@ async fn run_app(
                             ) =>
                     {
                         state.cycle_tree_filter();
+                    }
+                    KeyCode::Char('p')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.overlay == OverlayKind::SessionPicker =>
+                    {
+                        state.toggle_session_paths();
+                    }
+                    KeyCode::Char('s')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.overlay == OverlayKind::SessionPicker =>
+                    {
+                        state.cycle_session_sort();
+                    }
+                    KeyCode::Char('n')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.overlay == OverlayKind::SessionPicker =>
+                    {
+                        state.toggle_named_sessions();
+                    }
+                    KeyCode::Char('r')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.overlay == OverlayKind::SessionPicker =>
+                    {
+                        state.begin_session_rename();
+                    }
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.overlay == OverlayKind::SessionPicker =>
+                    {
+                        state.begin_session_delete();
                     }
                     KeyCode::Char('t')
                         if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -584,6 +619,18 @@ fn dispatch_overlay_action(
         OverlayAction::ResumeSession { target } => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::ResumeSession(target));
+            }
+            false
+        }
+        OverlayAction::RenameSession { target, name } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::RenameSession { target, name });
+            }
+            false
+        }
+        OverlayAction::DeleteSession { target } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::DeleteSession(target));
             }
             false
         }
@@ -1864,6 +1911,8 @@ mod tests {
                     modified: "2026-07-11T08:30:00.000Z".into(),
                     message_count: 12,
                     current: true,
+                    cwd: "/work/pi-shell".into(),
+                    parent_session_path: None,
                 },
                 pi_harness::SessionInfo {
                     id: "two".into(),
@@ -1873,6 +1922,8 @@ mod tests {
                     modified: "2026-07-11T07:00:00.000Z".into(),
                     message_count: 4,
                     current: false,
+                    cwd: "/work/pi-shell".into(),
+                    parent_session_path: Some("/sessions/one.jsonl".into()),
                 },
             ],
             ..super::AppState::default()
@@ -1883,6 +1934,7 @@ mod tests {
         assert!(output.contains("Resume session"));
         assert!(output.contains("DeepSeek subagent"));
         assert!(output.contains("✓ current"));
+        assert!(output.contains("Ctrl+S sort"));
 
         for character in "model".chars() {
             state.insert_overlay_char(character);
@@ -1894,6 +1946,70 @@ mod tests {
                 if target == "/sessions/two.jsonl"
         ));
         assert!(state.available_sessions[1].current);
+    }
+
+    #[test]
+    fn session_picker_supports_pi_management_controls() {
+        let mut state = super::AppState {
+            available_sessions: vec![
+                pi_harness::SessionInfo {
+                    id: "one".into(),
+                    path: "/sessions/one.jsonl".into(),
+                    name: Some("Named session".into()),
+                    first_message: "first".into(),
+                    modified: "2026-07-11T08:30:00.000Z".into(),
+                    message_count: 12,
+                    current: true,
+                    cwd: "/work".into(),
+                    parent_session_path: None,
+                },
+                pi_harness::SessionInfo {
+                    id: "two".into(),
+                    path: "/sessions/two.jsonl".into(),
+                    name: None,
+                    first_message: "second".into(),
+                    modified: "2026-07-11T07:00:00.000Z".into(),
+                    message_count: 4,
+                    current: false,
+                    cwd: "/work".into(),
+                    parent_session_path: Some("/sessions/one.jsonl".into()),
+                },
+            ],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::SessionPicker);
+
+        state.toggle_session_paths();
+        assert!(state.overlay_items()[0].contains("/sessions/one.jsonl"));
+        state.cycle_session_sort();
+        assert_eq!(state.session_sort.label(), "Recent");
+        state.toggle_named_sessions();
+        assert_eq!(state.overlay_items().len(), 1);
+        state.toggle_named_sessions();
+
+        state.overlay_selected = 1;
+        state.begin_session_rename();
+        assert_eq!(state.overlay, super::OverlayKind::SessionRename);
+        state.overlay_query = "Renamed child".into();
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::RenameSession { target, name }
+                if target == "/sessions/two.jsonl" && name == "Renamed child"
+        ));
+
+        state.overlay_selected = 1;
+        state.begin_session_delete();
+        assert_eq!(state.overlay, super::OverlayKind::SessionDeleteConfirm);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::DeleteSession { target }
+                if target == "/sessions/two.jsonl"
+        ));
+
+        state.overlay_selected = 0;
+        state.begin_session_delete();
+        assert_eq!(state.overlay, super::OverlayKind::SessionPicker);
+        assert!(state.status.contains("active session"));
     }
 
     #[test]

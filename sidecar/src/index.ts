@@ -183,6 +183,18 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
     return;
   }
 
+  if (command.type === "rename_session") {
+    pi.renameSession(command.target, command.name);
+    writeMessage({ type: "response", request_id: command.request_id, sessions: await pi.listAllSessions(active) });
+    return;
+  }
+
+  if (command.type === "delete_session") {
+    await pi.deleteSession(command.target);
+    writeMessage({ type: "response", request_id: command.request_id, sessions: await pi.listAllSessions(active) });
+    return;
+  }
+
   if (command.type === "list_tree") {
     writeMessage({ type: "response", request_id: command.request_id, tree: pi.listTree(active, command.user_only ?? false) });
     return;

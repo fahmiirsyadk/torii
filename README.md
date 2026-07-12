@@ -62,6 +62,10 @@ Inside the TUI, enter `/resume` to open a searchable current-project session
 picker. The picker shows the session name or first prompt, last-modified time,
 message count, and a `✓ current` marker. Selecting a session replaces the
 transcript and active Pi runtime without restarting pi-shell.
+Use `Ctrl+P` to show full session paths, `Ctrl+S` to cycle threaded/recent/fuzzy
+sorting, and `Ctrl+N` to show only named sessions. `Ctrl+R` renames the selected
+session through Pi metadata. `Ctrl+D` asks for confirmation before deleting a
+non-active session and uses the platform trash command when available.
 
 Pi-native session operations are also available in the TUI: `/new` starts a
 fresh persistent session, `/name <name>` updates its display name, `/session`
