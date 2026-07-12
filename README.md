@@ -77,8 +77,8 @@ prompt. `-r` opens the resume picker on startup, while `--fork` copies an
 existing session into the current project using Pi's native lineage metadata.
 Inside the tree picker, `Ctrl+O` cycles Pi-compatible filters, `Shift+T`
 toggles timestamps, and `Shift+L` edits or clears the selected entry label.
-Plain Enter navigates without summarizing; Shift+Enter asks Pi to summarize
-the abandoned branch before switching.
+Enter opens Pi's branch-summary choice (no summary, default summary, or custom
+summary instructions); Shift+Enter remains a direct summarize shortcut.
 
 Update a provider API key through Pi's credential store:
 
@@ -114,6 +114,8 @@ cargo run -p pi-shell -- --story palette
 cargo run -p pi-shell -- --story model-picker
 cargo run -p pi-shell -- --story settings
 cargo run -p pi-shell -- --story permission
+cargo run -p pi-shell -- --story tree
+cargo run -p pi-shell -- --story fork
 ```
 
 Add `--headless` to render a `100×32` plain-text reference frame without

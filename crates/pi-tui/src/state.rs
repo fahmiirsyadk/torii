@@ -54,6 +54,8 @@ pub enum OverlayKind {
     SessionPicker,
     TreePicker,
     ForkPicker,
+    TreeSummaryPicker,
+    TreeSummaryEditor,
     LabelEditor,
     FilePicker,
     ScopedModels,
@@ -103,6 +105,7 @@ pub enum OverlayAction {
     NavigateTree {
         entry_id: String,
         summarize: bool,
+        instructions: Option<String>,
     },
     ForkSession {
         entry_id: String,
@@ -331,6 +334,8 @@ pub struct AppState {
     pub rewind_checkpoints: Vec<pi_harness::RewindCheckpoint>,
     pub tree_filter: TreeFilter,
     pub tree_show_timestamps: bool,
+    pub tree_folded: HashSet<String>,
+    pub pending_tree_entry: Option<String>,
     pub pending_label_entry: Option<String>,
     pub expanded_tool_groups: HashSet<usize>,
     pub focused_tool: Option<usize>,
@@ -390,6 +395,8 @@ impl Default for AppState {
             rewind_checkpoints: Vec::new(),
             tree_filter: TreeFilter::default(),
             tree_show_timestamps: false,
+            tree_folded: HashSet::new(),
+            pending_tree_entry: None,
             pending_label_entry: None,
             expanded_tool_groups: HashSet::new(),
             focused_tool: None,
@@ -559,6 +566,20 @@ impl AppState {
     }
 
     pub fn cancel_oauth(&mut self) -> OverlayAction {
+        if matches!(
+            self.overlay,
+            OverlayKind::TreeSummaryPicker | OverlayKind::TreeSummaryEditor
+        ) {
+            let selected = self.pending_tree_entry.clone();
+            self.overlay = OverlayKind::TreePicker;
+            self.overlay_query.clear();
+            let entries = self.filtered_tree();
+            self.overlay_selected = selected
+                .as_deref()
+                .and_then(|id| entries.iter().position(|entry| entry.id == id))
+                .unwrap_or_else(|| entries.len().saturating_sub(1));
+            return OverlayAction::None;
+        }
         if !matches!(
             self.overlay,
             OverlayKind::OauthPrompt | OverlayKind::OauthSelect
@@ -595,6 +616,12 @@ impl AppState {
                 .into_iter()
                 .map(|entry| tree_label(entry, self.tree_show_timestamps))
                 .collect(),
+            OverlayKind::TreeSummaryPicker => vec![
+                "No summary".into(),
+                "Summarize".into(),
+                "Summarize with custom prompt".into(),
+            ],
+            OverlayKind::TreeSummaryEditor => Vec::new(),
             OverlayKind::Settings => vec![
                 format!("Steering delivery: {}", self.runtime_settings.steering_mode),
                 format!(
@@ -681,6 +708,19 @@ impl AppState {
             self.overlay_selected = 0;
             return;
         }
+        if matches!(
+            self.overlay,
+            OverlayKind::TreePicker | OverlayKind::ForkPicker
+        ) {
+            self.overlay_selected = if delta < 0 {
+                self.overlay_selected.checked_sub(1).unwrap_or(count - 1)
+            } else if self.overlay_selected + 1 >= count {
+                0
+            } else {
+                self.overlay_selected + 1
+            };
+            return;
+        }
         self.overlay_selected = if delta < 0 {
             self.overlay_selected.saturating_sub(delta.unsigned_abs())
         } else {
@@ -697,7 +737,7 @@ impl AppState {
                 | OverlayKind::ModelPicker
                 | OverlayKind::SessionPicker
                 | OverlayKind::TreePicker
-                | OverlayKind::ForkPicker
+                | OverlayKind::TreeSummaryEditor
                 | OverlayKind::LabelEditor
                 | OverlayKind::FilePicker
                 | OverlayKind::ScopedModels
@@ -707,12 +747,18 @@ impl AppState {
         ) {
             self.overlay_query.push(character);
             self.overlay_selected = 0;
+            if self.overlay == OverlayKind::TreePicker {
+                self.tree_folded.clear();
+            }
         }
     }
 
     pub fn overlay_backspace(&mut self) {
         self.overlay_query.pop();
         self.overlay_selected = 0;
+        if self.overlay == OverlayKind::TreePicker {
+            self.tree_folded.clear();
+        }
     }
 
     pub fn activate_overlay(&mut self) -> OverlayAction {
@@ -735,6 +781,18 @@ impl AppState {
                 .then(|| self.overlay_query.trim().to_string());
             self.close_overlay();
             return OverlayAction::SetLabel { entry_id, label };
+        }
+        if self.overlay == OverlayKind::TreeSummaryEditor {
+            let Some(entry_id) = self.pending_tree_entry.take() else {
+                return OverlayAction::None;
+            };
+            let instructions = self.overlay_query.trim().to_string();
+            self.close_overlay();
+            return OverlayAction::NavigateTree {
+                entry_id,
+                summarize: true,
+                instructions: (!instructions.is_empty()).then_some(instructions),
+            };
         }
         let Some(item) = self.overlay_items().get(self.overlay_selected).cloned() else {
             return OverlayAction::None;
@@ -783,23 +841,44 @@ impl AppState {
                 return OverlayAction::ResumeSession { target };
             }
             OverlayKind::TreePicker | OverlayKind::ForkPicker => {
-                let Some(entry) = self
-                    .filtered_tree()
-                    .into_iter()
-                    .find(|entry| tree_label(entry, self.tree_show_timestamps) == item)
-                else {
+                let entries = self.filtered_tree();
+                let Some(entry) = entries.get(self.overlay_selected) else {
                     return OverlayAction::None;
                 };
                 let entry_id = entry.id.clone();
                 let fork = self.overlay == OverlayKind::ForkPicker;
+                if fork {
+                    self.close_overlay();
+                    return OverlayAction::ForkSession { entry_id };
+                }
+                let active_leaf = self
+                    .session_tree
+                    .iter()
+                    .rfind(|entry| entry.active)
+                    .map(|entry| entry.id.as_str());
+                if active_leaf == Some(entry_id.as_str()) {
+                    self.status = "already at this point".into();
+                    self.close_overlay();
+                    return OverlayAction::None;
+                }
+                self.pending_tree_entry = Some(entry_id);
+                self.open_overlay(OverlayKind::TreeSummaryPicker);
+                return OverlayAction::None;
+            }
+            OverlayKind::TreeSummaryPicker => {
+                let Some(entry_id) = self.pending_tree_entry.clone() else {
+                    return OverlayAction::None;
+                };
+                if item == "Summarize with custom prompt" {
+                    self.open_overlay(OverlayKind::TreeSummaryEditor);
+                    return OverlayAction::None;
+                }
+                self.pending_tree_entry = None;
                 self.close_overlay();
-                return if fork {
-                    OverlayAction::ForkSession { entry_id }
-                } else {
-                    OverlayAction::NavigateTree {
-                        entry_id,
-                        summarize: false,
-                    }
+                return OverlayAction::NavigateTree {
+                    entry_id,
+                    summarize: item == "Summarize",
+                    instructions: None,
                 };
             }
             OverlayKind::Settings => {
@@ -894,7 +973,10 @@ impl AppState {
                     };
                 }
             }
-            OverlayKind::OauthPrompt | OverlayKind::LabelEditor | OverlayKind::None => {}
+            OverlayKind::OauthPrompt
+            | OverlayKind::TreeSummaryEditor
+            | OverlayKind::LabelEditor
+            | OverlayKind::None => {}
             OverlayKind::FilePicker => {
                 self.insert_file_reference(&item);
                 self.close_overlay();
@@ -945,12 +1027,75 @@ impl AppState {
     }
 
     pub fn cycle_tree_filter(&mut self) {
+        let selected_id = self
+            .filtered_tree()
+            .get(self.overlay_selected)
+            .map(|entry| entry.id.clone());
         self.tree_filter = self.tree_filter.next();
-        self.overlay_selected = 0;
+        self.tree_folded.clear();
+        let entries = self.filtered_tree();
+        self.overlay_selected = selected_id
+            .as_deref()
+            .and_then(|id| entries.iter().position(|entry| entry.id == id))
+            .unwrap_or_else(|| entries.len().saturating_sub(1));
     }
 
     pub fn toggle_tree_timestamps(&mut self) {
         self.tree_show_timestamps = !self.tree_show_timestamps;
+    }
+
+    pub fn move_tree_page(&mut self, direction: isize, page: usize) {
+        let count = self.filtered_tree().len();
+        if count == 0 {
+            self.overlay_selected = 0;
+        } else if direction < 0 {
+            self.overlay_selected = self.overlay_selected.saturating_sub(page);
+        } else {
+            self.overlay_selected = self.overlay_selected.saturating_add(page).min(count - 1);
+        }
+    }
+
+    pub fn fold_or_move_tree(&mut self, unfold: bool) {
+        if self.overlay != OverlayKind::TreePicker {
+            return;
+        }
+        let entries = self.filtered_tree();
+        let Some(selected) = entries.get(self.overlay_selected) else {
+            return;
+        };
+        let selected_id = selected.id.clone();
+        let parent_id = selected.parent_id.clone();
+        let child_id = entries
+            .iter()
+            .find(|entry| entry.parent_id.as_deref() == Some(selected_id.as_str()))
+            .map(|entry| entry.id.clone());
+        let sibling_count = entries
+            .iter()
+            .filter(|entry| entry.parent_id == parent_id)
+            .count();
+        let foldable = child_id.is_some() && (parent_id.is_none() || sibling_count > 1);
+        drop(entries);
+
+        if unfold {
+            if self.tree_folded.remove(&selected_id) {
+                return;
+            }
+            if let Some(child_id) = child_id {
+                let entries = self.filtered_tree();
+                if let Some(index) = entries.iter().position(|entry| entry.id == child_id) {
+                    self.overlay_selected = index;
+                }
+            }
+        } else if foldable {
+            self.tree_folded.insert(selected_id);
+            let count = self.filtered_tree().len();
+            self.overlay_selected = self.overlay_selected.min(count.saturating_sub(1));
+        } else if let Some(parent_id) = parent_id {
+            let entries = self.filtered_tree();
+            if let Some(index) = entries.iter().position(|entry| entry.id == parent_id) {
+                self.overlay_selected = index;
+            }
+        }
     }
 
     pub fn begin_tree_label(&mut self) {
@@ -993,22 +1138,87 @@ impl AppState {
         OverlayAction::NavigateTree {
             entry_id,
             summarize: true,
+            instructions: None,
         }
     }
 
-    fn filtered_tree(&self) -> Vec<&SessionTreeEntry> {
-        self.session_tree
+    pub(crate) fn filtered_tree(&self) -> Vec<&SessionTreeEntry> {
+        let query = if self.overlay == OverlayKind::TreePicker {
+            self.overlay_query.trim().to_ascii_lowercase()
+        } else {
+            String::new()
+        };
+        let by_id = self
+            .session_tree
             .iter()
-            .filter(|entry| match self.tree_filter {
-                TreeFilter::Default => {
-                    !matches!(entry.kind.as_str(), "custom" | "label" | "session_info")
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let filtered = self
+            .session_tree
+            .iter()
+            .filter(|entry| {
+                if self.overlay == OverlayKind::ForkPicker {
+                    return true;
                 }
-                TreeFilter::NoTools => entry.role.as_deref() != Some("toolResult"),
-                TreeFilter::UserOnly => entry.role.as_deref() == Some("user"),
-                TreeFilter::LabeledOnly => entry.label.is_some(),
-                TreeFilter::All => true,
+                match self.tree_filter {
+                    TreeFilter::Default => {
+                        !matches!(
+                            entry.kind.as_str(),
+                            "custom"
+                                | "label"
+                                | "session_info"
+                                | "model_change"
+                                | "thinking_level_change"
+                        ) && !(entry.role.as_deref() == Some("assistant")
+                            && entry.text.trim().is_empty()
+                            && !entry.active)
+                    }
+                    TreeFilter::NoTools => {
+                        entry.role.as_deref() != Some("toolResult")
+                            && !matches!(
+                                entry.kind.as_str(),
+                                "custom"
+                                    | "label"
+                                    | "session_info"
+                                    | "model_change"
+                                    | "thinking_level_change"
+                            )
+                    }
+                    TreeFilter::UserOnly => entry.role.as_deref() == Some("user"),
+                    TreeFilter::LabeledOnly => entry.label.is_some(),
+                    TreeFilter::All => true,
+                }
             })
-            .collect()
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.text.to_ascii_lowercase().contains(&query)
+                    || entry
+                        .role
+                        .as_deref()
+                        .is_some_and(|role| role.to_ascii_lowercase().contains(&query))
+                    || entry
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.to_ascii_lowercase().contains(&query))
+            })
+            .filter(|entry| {
+                let mut parent_id = entry.parent_id.as_deref();
+                while let Some(parent) = parent_id {
+                    if self.tree_folded.contains(parent) {
+                        return false;
+                    }
+                    parent_id = by_id
+                        .get(parent)
+                        .and_then(|entry| entry.parent_id.as_deref());
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+        if self.overlay == OverlayKind::ForkPicker {
+            filtered
+        } else {
+            active_first_tree_order(filtered, &by_id)
+        }
     }
 
     fn append_assistant_text(&mut self, text: &str) {
@@ -1460,11 +1670,22 @@ impl AppState {
             }
             AgentEvent::SessionTree { entries, user_only } => {
                 self.session_tree = entries;
+                self.tree_folded.clear();
+                self.pending_tree_entry = None;
                 self.open_overlay(if user_only {
                     OverlayKind::ForkPicker
                 } else {
                     OverlayKind::TreePicker
                 });
+                let visible = self.filtered_tree();
+                self.overlay_selected = if user_only {
+                    visible.len().saturating_sub(1)
+                } else {
+                    visible
+                        .iter()
+                        .rposition(|entry| entry.active)
+                        .unwrap_or_else(|| visible.len().saturating_sub(1))
+                };
             }
             AgentEvent::TextDelta { text } => {
                 self.begin_turn_if_needed();
@@ -1769,11 +1990,46 @@ pub(crate) fn tree_label(entry: &SessionTreeEntry, show_timestamp: bool) -> Stri
         .map(|value| format!(" [{value}]"))
         .unwrap_or_default();
     let timestamp = if show_timestamp {
-        format!("  {}", entry.timestamp)
+        format!(
+            "  {}",
+            entry.label_timestamp.as_deref().unwrap_or(&entry.timestamp)
+        )
     } else {
         String::new()
     };
     format!("{branch} {indent}{role}: {}{label}{timestamp}", entry.text)
+}
+
+fn active_first_tree_order<'a>(
+    visible: Vec<&'a SessionTreeEntry>,
+    all: &std::collections::HashMap<&str, &'a SessionTreeEntry>,
+) -> Vec<&'a SessionTreeEntry> {
+    let visible_ids = visible
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut children: std::collections::HashMap<Option<&str>, Vec<&SessionTreeEntry>> =
+        std::collections::HashMap::new();
+    for entry in visible {
+        let mut parent = entry.parent_id.as_deref();
+        while parent.is_some_and(|id| !visible_ids.contains(id)) {
+            parent = parent.and_then(|id| all.get(id).and_then(|item| item.parent_id.as_deref()));
+        }
+        children.entry(parent).or_default().push(entry);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by_key(|entry| !entry.active);
+    }
+    let mut ordered = Vec::new();
+    let mut stack = children.get(&None).cloned().unwrap_or_default();
+    stack.reverse();
+    while let Some(entry) = stack.pop() {
+        ordered.push(entry);
+        if let Some(descendants) = children.get(&Some(entry.id.as_str())) {
+            stack.extend(descendants.iter().rev().copied());
+        }
+    }
+    ordered
 }
 
 fn tool_display(name: &str, args: &serde_json::Value) -> (String, String) {

@@ -12,6 +12,8 @@ pub enum Story {
     ModelPicker,
     Settings,
     Permission,
+    Tree,
+    Fork,
 }
 
 impl Story {
@@ -25,6 +27,8 @@ impl Story {
             "model-picker" => Some(Self::ModelPicker),
             "settings" => Some(Self::Settings),
             "permission" => Some(Self::Permission),
+            "tree" => Some(Self::Tree),
+            "fork" => Some(Self::Fork),
             _ => None,
         }
     }
@@ -39,7 +43,111 @@ impl Story {
             Self::ModelPicker => with_overlay(OverlayKind::ModelPicker),
             Self::Settings => with_overlay(OverlayKind::Settings),
             Self::Permission => permission(),
+            Self::Tree => tree(false),
+            Self::Fork => tree(true),
         }
+    }
+}
+
+fn tree(user_only: bool) -> AppState {
+    let entries = vec![
+        tree_entry(
+            "root",
+            None,
+            "user",
+            "Explore the session implementation",
+            true,
+        ),
+        tree_entry(
+            "answer",
+            Some("root"),
+            "assistant",
+            "I will inspect the session APIs and current UI.",
+            true,
+        ),
+        tree_entry(
+            "tools",
+            Some("answer"),
+            "toolResult",
+            "[read: src/session.rs]",
+            true,
+        ),
+        pi_harness::SessionTreeEntry {
+            label: Some("working version".into()),
+            label_timestamp: Some("2026-07-13T10:42:00Z".into()),
+            ..tree_entry(
+                "active-prompt",
+                Some("tools"),
+                "user",
+                "Keep the active branch and add tree navigation",
+                true,
+            )
+        },
+        tree_entry(
+            "active-answer",
+            Some("active-prompt"),
+            "assistant",
+            "The tree navigator now preserves the active path.",
+            true,
+        ),
+        tree_entry(
+            "other-prompt",
+            Some("tools"),
+            "user",
+            "Try a flat generic picker instead",
+            false,
+        ),
+        tree_entry(
+            "other-answer",
+            Some("other-prompt"),
+            "assistant",
+            "This branch loses the session topology.",
+            false,
+        ),
+    ];
+    let entries = if user_only {
+        entries
+            .into_iter()
+            .filter(|entry| entry.role.as_deref() == Some("user"))
+            .collect::<Vec<_>>()
+    } else {
+        entries
+    };
+    let selected = if user_only {
+        entries.len().saturating_sub(1)
+    } else {
+        entries.iter().rposition(|entry| entry.active).unwrap_or(0)
+    };
+    AppState {
+        session_tree: entries,
+        overlay: if user_only {
+            OverlayKind::ForkPicker
+        } else {
+            OverlayKind::TreePicker
+        },
+        overlay_selected: selected,
+        ..AppState::default()
+    }
+}
+
+fn tree_entry(
+    id: &str,
+    parent_id: Option<&str>,
+    role: &str,
+    text: &str,
+    active: bool,
+) -> pi_harness::SessionTreeEntry {
+    pi_harness::SessionTreeEntry {
+        id: id.into(),
+        parent_id: parent_id.map(str::to_string),
+        kind: "message".into(),
+        role: Some(role.into()),
+        text: text.into(),
+        timestamp: "2026-07-13T10:40:00Z".into(),
+        label: None,
+        label_timestamp: None,
+        depth: 0,
+        active,
     }
 }
 

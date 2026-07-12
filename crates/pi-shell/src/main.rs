@@ -167,9 +167,10 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::NavigateTree {
                         entry_id,
                         summarize,
+                        instructions,
                     } => {
                         let _ = command_harness
-                            .navigate_tree(&command_session, entry_id, summarize, None)
+                            .navigate_tree(&command_session, entry_id, summarize, instructions)
                             .await;
                     }
                     pi_tui::UiCommand::ForkSession { entry_id } => {

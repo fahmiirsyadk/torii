@@ -48,6 +48,7 @@ pub enum UiCommand {
     NavigateTree {
         entry_id: String,
         summarize: bool,
+        instructions: Option<String>,
     },
     ForkSession {
         entry_id: String,
@@ -259,6 +260,30 @@ async fn run_app(
                     }
                     KeyCode::Up => state.move_overlay_selection(-1),
                     KeyCode::Down => state.move_overlay_selection(1),
+                    KeyCode::Left
+                        if state.overlay == OverlayKind::TreePicker
+                            && key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        state.fold_or_move_tree(false);
+                    }
+                    KeyCode::Right
+                        if state.overlay == OverlayKind::TreePicker
+                            && key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        state.fold_or_move_tree(true);
+                    }
+                    KeyCode::Left | KeyCode::PageUp if state.overlay == OverlayKind::TreePicker => {
+                        state.move_tree_page(-1, usize::from(size.height / 2).max(1));
+                    }
+                    KeyCode::Right | KeyCode::PageDown
+                        if state.overlay == OverlayKind::TreePicker =>
+                    {
+                        state.move_tree_page(1, usize::from(size.height / 2).max(1));
+                    }
                     KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
                         state.toggle_scoped_model();
                     }
@@ -438,6 +463,18 @@ async fn run_app(
                 MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
                 MouseEventKind::ScrollDown => state.move_overlay_selection(1),
                 MouseEventKind::Down(_) => {
+                    if let Some(index) =
+                        crate::overlay::item_at(&state, size.width, size.height, mouse.row)
+                    {
+                        state.overlay_selected = index;
+                        continue;
+                    }
+                    if matches!(
+                        state.overlay,
+                        OverlayKind::TreePicker | OverlayKind::ForkPicker
+                    ) {
+                        continue;
+                    }
                     let items = state.overlay_items();
                     let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2;
                     let overlay_height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
@@ -589,11 +626,13 @@ fn dispatch_overlay_action(
         OverlayAction::NavigateTree {
             entry_id,
             summarize,
+            instructions,
         } => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::NavigateTree {
                     entry_id,
                     summarize,
+                    instructions,
                 });
             }
             false
@@ -714,7 +753,7 @@ mod tests {
     use pi_harness::AgentEvent;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{buffer_text, fixtures, theme::Theme, ui};
+    use super::{buffer_text, fixtures, overlay, theme::Theme, ui};
 
     #[test]
     fn conversation_story_renders_at_reference_sizes() {
@@ -1884,8 +1923,9 @@ mod tests {
             text: "try the other approach".into(),
             timestamp: "2026-07-11T00:00:00Z".into(),
             label: Some("checkpoint".into()),
+            label_timestamp: Some("2026-07-11T01:00:00Z".into()),
             depth: 0,
-            active: true,
+            active: false,
         }];
         state.apply(AgentEvent::SessionTree {
             entries: entries.clone(),
@@ -1897,7 +1937,7 @@ mod tests {
         assert!(state.overlay_items()[0].contains("2026-07-11"));
         assert!(matches!(
             state.activate_tree_with_summary(),
-            super::state::OverlayAction::NavigateTree { entry_id, summarize: true }
+            super::state::OverlayAction::NavigateTree { entry_id, summarize: true, .. }
                 if entry_id == "entry-1"
         ));
 
@@ -1918,9 +1958,40 @@ mod tests {
             entries: entries.clone(),
             user_only: false,
         });
-        assert!(
-            matches!(state.activate_overlay(), super::state::OverlayAction::NavigateTree { entry_id, summarize: false } if entry_id == "entry-1")
-        );
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::TreeSummaryPicker);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::NavigateTree { entry_id, summarize: false, instructions: None }
+                if entry_id == "entry-1"
+        ));
+
+        state.apply(AgentEvent::SessionTree {
+            entries: entries.clone(),
+            user_only: false,
+        });
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        state.overlay_selected = 2;
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::TreeSummaryEditor);
+        state.overlay_query = "preserve the benchmark results".into();
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::NavigateTree {
+                entry_id,
+                summarize: true,
+                instructions: Some(instructions),
+            } if entry_id == "entry-1" && instructions == "preserve the benchmark results"
+        ));
 
         state.apply(AgentEvent::SessionTree {
             entries,
@@ -1937,6 +2008,137 @@ mod tests {
         assert_eq!(state.prompt, "editable prompt");
         assert_eq!(state.cursor, 15);
         assert_eq!(state.focus, super::Focus::Prompt);
+    }
+
+    #[test]
+    fn tree_picker_renders_pi_topology_active_path_and_label_time() {
+        let entries = tree_picker_entries();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::SessionTree {
+            entries,
+            user_only: false,
+        });
+        state.toggle_tree_timestamps();
+
+        let (width, height) = (120, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("Session Tree"));
+        assert!(output.contains("Ctrl+←/→ fold/jump"));
+        assert!(
+            output.contains("├─ • [checkpoint] 07-11 01:00 user: active approach"),
+            "{output}"
+        );
+        assert!(output.contains("└─ user: abandoned approach"));
+        assert!(
+            output
+                .lines()
+                .any(|line| { line.contains('›') && line.contains("active approach") })
+        );
+        let selected_row = output
+            .lines()
+            .position(|line| line.contains('›') && line.contains("active approach"))
+            .unwrap() as u16;
+        assert_eq!(
+            overlay::item_at(&state, width, height, selected_row),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn fork_picker_is_a_dedicated_latest_user_message_selector() {
+        let mut state = super::AppState::default();
+        let entries = tree_picker_entries()
+            .into_iter()
+            .filter(|entry| entry.role.as_deref() == Some("user"))
+            .collect();
+        state.apply(AgentEvent::SessionTree {
+            entries,
+            user_only: true,
+        });
+
+        let (width, height) = (120, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("Fork from Message"));
+        assert!(output.contains("Message 3 of 3"));
+        assert!(!output.contains("Filter:"));
+        assert!(
+            output
+                .lines()
+                .any(|line| { line.contains('›') && line.contains("abandoned approach") })
+        );
+        let selected_row = output
+            .lines()
+            .position(|line| line.contains('›') && line.contains("abandoned approach"))
+            .unwrap() as u16;
+        assert_eq!(
+            overlay::item_at(&state, width, height, selected_row),
+            Some(2)
+        );
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::ForkSession { entry_id } if entry_id == "branch-b"
+        ));
+    }
+
+    fn tree_picker_entries() -> Vec<pi_harness::SessionTreeEntry> {
+        vec![
+            pi_harness::SessionTreeEntry {
+                id: "root".into(),
+                parent_id: None,
+                kind: "message".into(),
+                role: Some("user".into()),
+                text: "start here".into(),
+                timestamp: "2026-07-11T00:00:00Z".into(),
+                label: None,
+                label_timestamp: None,
+                depth: 0,
+                active: true,
+            },
+            pi_harness::SessionTreeEntry {
+                id: "answer".into(),
+                parent_id: Some("root".into()),
+                kind: "message".into(),
+                role: Some("assistant".into()),
+                text: "choose an approach".into(),
+                timestamp: "2026-07-11T00:01:00Z".into(),
+                label: None,
+                label_timestamp: None,
+                depth: 1,
+                active: true,
+            },
+            pi_harness::SessionTreeEntry {
+                id: "branch-a".into(),
+                parent_id: Some("answer".into()),
+                kind: "message".into(),
+                role: Some("user".into()),
+                text: "active approach".into(),
+                timestamp: "2026-07-11T00:02:00Z".into(),
+                label: Some("checkpoint".into()),
+                label_timestamp: Some("2026-07-11T01:00:00Z".into()),
+                depth: 2,
+                active: true,
+            },
+            pi_harness::SessionTreeEntry {
+                id: "branch-b".into(),
+                parent_id: Some("answer".into()),
+                kind: "message".into(),
+                role: Some("user".into()),
+                text: "abandoned approach".into(),
+                timestamp: "2026-07-11T00:03:00Z".into(),
+                label: None,
+                label_timestamp: None,
+                depth: 2,
+                active: false,
+            },
+        ]
     }
 
     #[test]

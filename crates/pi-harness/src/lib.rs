@@ -226,6 +226,8 @@ pub struct SessionTreeEntry {
     pub text: String,
     pub timestamp: String,
     pub label: Option<String>,
+    #[serde(default)]
+    pub label_timestamp: Option<String>,
     pub depth: usize,
     pub active: bool,
 }

@@ -119,6 +119,7 @@ export type SidecarMessage =
         text: string;
         timestamp: string;
         label?: string;
+        label_timestamp?: string;
         depth: number;
         active: boolean;
       }>;

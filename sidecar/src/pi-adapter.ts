@@ -866,6 +866,26 @@ export function listTree(active: ActiveSession, userOnly: boolean) {
   const entries = manager.getEntries();
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
   const activeIds = new Set(manager.getBranch().map((entry) => entry.id));
+  const toolCalls = new Map<string, { name: string; arguments: Record<string, unknown> }>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
+    for (const block of entry.message.content) {
+      if (block.type === "toolCall") {
+        toolCalls.set(block.id, { name: block.name, arguments: block.arguments });
+      }
+    }
+  }
+  const treeMetadata = new Map<string, { label?: string; labelTimestamp?: string }>();
+  const stack = [...manager.getTree()];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === undefined) continue;
+    treeMetadata.set(node.entry.id, {
+      label: node.label,
+      labelTimestamp: node.labelTimestamp,
+    });
+    stack.push(...node.children);
+  }
   return entries
     .filter((entry) => !userOnly || (entry.type === "message" && entry.message.role === "user"))
     .map((entry) => {
@@ -875,7 +895,11 @@ export function listTree(active: ActiveSession, userOnly: boolean) {
         depth += 1;
         parentId = byId.get(parentId)?.parentId ?? null;
       }
-      const display = entryText(entry);
+      let display = entryText(entry);
+      if (entry.type === "message" && entry.message.role === "toolResult") {
+        const toolCall = toolCalls.get(entry.message.toolCallId);
+        if (toolCall !== undefined) display = { role: "toolResult", text: formatTreeToolCall(toolCall.name, toolCall.arguments) };
+      }
       return {
         id: entry.id,
         parent_id: entry.parentId ?? undefined,
@@ -883,11 +907,31 @@ export function listTree(active: ActiveSession, userOnly: boolean) {
         role: display.role,
         text: display.text.replaceAll("\n", " ").slice(0, 240),
         timestamp: entry.timestamp,
-        label: manager.getLabel(entry.id),
+        label: treeMetadata.get(entry.id)?.label,
+        label_timestamp: treeMetadata.get(entry.id)?.labelTimestamp,
         depth,
         active: activeIds.has(entry.id),
       };
     });
+}
+
+function formatTreeToolCall(name: string, args: Record<string, unknown>): string {
+  const shortPath = (value: unknown): string => {
+    const path = String(value ?? "");
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+    return home !== "" && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+  };
+  if (name === "read" || name === "write" || name === "edit") {
+    return `[${name}: ${shortPath(args.path ?? args.file_path)}]`;
+  }
+  if (name === "bash") {
+    const command = String(args.command ?? "").replaceAll(/\s+/g, " ").trim();
+    return `[bash: ${command.slice(0, 50)}${command.length > 50 ? "..." : ""}]`;
+  }
+  if (name === "grep") return `[grep: /${String(args.pattern ?? "")}/ in ${shortPath(args.path ?? ".")}]`;
+  if (name === "find") return `[find: ${String(args.pattern ?? "")} in ${shortPath(args.path ?? ".")}]`;
+  if (name === "ls") return `[ls: ${shortPath(args.path ?? ".")}]`;
+  return `[${name}]`;
 }
 
 export function listRewinds(active: ActiveSession) {
