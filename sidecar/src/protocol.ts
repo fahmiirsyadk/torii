@@ -144,7 +144,7 @@ export type AgentEvent =
   | {
       type: "tool_call_result";
       id: string;
-      result: { content: string };
+      result: { content: string; details?: unknown };
       is_error: boolean;
       duration_ms?: number;
     }

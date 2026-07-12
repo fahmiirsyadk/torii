@@ -169,17 +169,24 @@ async fn run_app(
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut dirty = true;
 
     loop {
         if let Some(receiver) = &mut events {
             while let Ok(agent_event) = receiver.try_recv() {
                 state.apply(agent_event);
+                dirty = true;
             }
         }
 
-        terminal.draw(|frame| ui::render(frame, &state))?;
+        let animated = state.streaming || state.active_compaction_started_at().is_some();
+        if dirty || animated {
+            terminal.draw(|frame| ui::render(frame, &state))?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(30))? {
+            dirty = true;
             let size = terminal.size()?;
             let max_scroll = ui::max_scroll(&state, size.width, size.height);
             let page = usize::from(size.height.saturating_sub(8)).max(1);
@@ -322,8 +329,8 @@ async fn run_app(
                     KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
                     KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
                     KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
-                    KeyCode::Up => state.scroll_up(1, max_scroll),
-                    KeyCode::Down => state.scroll_down(1),
+                    KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
+                    KeyCode::Down => ui::move_section_focus(&mut state, size.width, size.height, 1),
                     KeyCode::PageUp => state.scroll_up(page, max_scroll),
                     KeyCode::PageDown => state.scroll_down(page),
                     KeyCode::Home => state.scroll_to_top(max_scroll),
@@ -398,20 +405,52 @@ async fn run_app(
                     _ => {}
                 },
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => state.scroll_up(3, max_scroll),
-                    MouseEventKind::ScrollDown => state.scroll_down(3),
+                    MouseEventKind::ScrollUp => {
+                        ui::move_section_focus(&mut state, size.width, size.height, -1)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        ui::move_section_focus(&mut state, size.width, size.height, 1)
+                    }
+                    MouseEventKind::Moved => {
+                        state.hovered_entry = ui::section_hit_at(
+                            &state,
+                            size.width,
+                            size.height,
+                            mouse.column,
+                            mouse.row,
+                        )
+                        .filter(|hit| hit.actionable)
+                        .map(|hit| hit.index);
+                    }
                     MouseEventKind::Down(_) => {
                         if mouse.row >= size.height.saturating_sub(5)
                             && mouse.row < size.height.saturating_sub(2)
                         {
                             state.focus_prompt();
-                        } else if let Some(hit) =
-                            ui::tool_hit_at(&state, size.width, size.height, mouse.row)
-                        {
+                        } else if let Some(hit) = ui::section_hit_at(
+                            &state,
+                            size.width,
+                            size.height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
                             state.focus_scrollback();
-                            match hit {
-                                ui::ToolHit::Group(index) => state.toggle_tool_group(index),
-                                ui::ToolHit::Item(index) => state.toggle_tool_at(index),
+                            if hit.actionable {
+                                let target_id = hit.id.clone();
+                                let grouped = state.entries.get(hit.index).is_some_and(|entry| {
+                                    let state::Entry::Tool { label, .. } = entry else { return false; };
+                                    let begins_group = hit.index == 0 || !matches!(state.entries.get(hit.index - 1), Some(state::Entry::Tool { label: previous, .. }) if previous == label);
+                                    begins_group && state.entries[hit.index..].iter().take_while(|candidate| matches!(candidate, state::Entry::Tool { label: other, .. } if other == label)).count() > 1
+                                });
+                                if grouped {
+                                    state.toggle_tool_group(hit.index);
+                                } else {
+                                    state.toggle_entry_at(hit.index);
+                                }
+                                state.focused_target_id = Some(target_id);
+                            } else {
+                                state.focused_entry = Some(hit.index);
+                                state.focused_target_id = Some(hit.id);
                             }
                         } else {
                             state.focus_scrollback();
@@ -619,6 +658,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Str
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
     use pi_harness::AgentEvent;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -931,8 +971,8 @@ mod tests {
         assert!(collapsed.contains("Run 3 calls"));
         assert!(!collapsed.contains("cargo clippy --workspace"));
         assert_eq!(
-            ui::tool_hit_at(&state, width, height, 7),
-            Some(ui::ToolHit::Group(1))
+            ui::section_hit_at(&state, width, height, 5, 7).map(|hit| hit.index),
+            Some(1)
         );
 
         state.toggle_tool_group(1);
@@ -941,8 +981,8 @@ mod tests {
         assert!(expanded.contains("cargo clippy --workspace"));
         assert!(expanded.contains("├ ◆ Run"));
         assert_eq!(
-            ui::tool_hit_at(&state, width, height, 9),
-            Some(ui::ToolHit::Item(2))
+            ui::section_hit_at(&state, width, height, 5, 9).map(|hit| hit.index),
+            Some(2)
         );
         state.toggle_tool_at(2);
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
@@ -968,6 +1008,7 @@ mod tests {
                 id: id.into(),
                 result: pi_harness::ToolResult {
                     content: "done".into(),
+                    details: None,
                 },
                 is_error: false,
                 duration_ms: Some(10),
@@ -995,6 +1036,107 @@ mod tests {
     }
 
     #[test]
+    fn section_focus_steps_entries_and_keeps_them_visible() {
+        let mut state = fixtures::conversation();
+        state.focus = super::Focus::Scrollback;
+        ui::move_section_focus(&mut state, 100, 20, 1);
+        assert_eq!(state.focused_entry, Some(0));
+        ui::move_section_focus(&mut state, 100, 20, 1);
+        assert_eq!(state.focused_entry, Some(1));
+        ui::move_section_focus(&mut state, 100, 20, -1);
+        assert_eq!(state.focused_entry, Some(0));
+    }
+
+    #[test]
+    fn section_hits_respect_horizontal_and_dynamic_banner_bounds() {
+        let mut state = fixtures::tools();
+        state.turn_started_at = Some(std::time::Instant::now());
+        assert_eq!(ui::section_hit_at(&state, 100, 32, 0, 7), None);
+        let hit = (2..24).find_map(|row| ui::section_hit_at(&state, 100, 32, 5, row));
+        assert!(hit.is_some());
+    }
+
+    #[test]
+    fn hovered_tool_uses_pointer_marker() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.hovered_entry = Some(1);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("> Run 3 calls"));
+    }
+
+    #[test]
+    fn expanded_tool_children_are_independent_focus_stops() {
+        let mut state = fixtures::tools();
+        state.toggle_tool_group(1);
+        state.focused_section = None;
+        let mut visited = Vec::new();
+        for _ in 0..8 {
+            ui::move_section_focus(&mut state, 100, 32, 1);
+            visited.push(state.focused_entry);
+        }
+        assert!(visited.contains(&Some(2)), "visited: {visited:?}");
+        assert!(visited.contains(&Some(3)), "visited: {visited:?}");
+    }
+
+    #[test]
+    fn focus_identity_survives_tool_expansion_and_stream_updates() {
+        let mut state = fixtures::tools();
+        state.toggle_tool_group(1);
+        state.focused_section = None;
+        while state.focused_entry != Some(2) {
+            ui::move_section_focus(&mut state, 100, 32, 1);
+        }
+        let stable_id = state.focused_target_id.clone();
+        state.toggle_tool_at(2);
+        state.focused_target_id = stable_id.clone();
+        state.apply(AgentEvent::TextDelta {
+            text: "streamed after tools".into(),
+        });
+        ui::move_section_focus(&mut state, 100, 32, 1);
+        assert_eq!(stable_id.as_deref(), Some("tool:tool-clippy"));
+        assert_eq!(state.focused_entry, Some(3));
+    }
+
+    #[test]
+    fn thousand_entry_transcript_meets_interaction_budgets() {
+        let hydration_started = std::time::Instant::now();
+        let mut state = fixtures::long_session(1_000);
+        let hydration = hydration_started.elapsed();
+
+        let focus_started = std::time::Instant::now();
+        ui::move_section_focus(&mut state, 120, 40, 1);
+        let focus = focus_started.elapsed();
+
+        let hit_started = std::time::Instant::now();
+        let _ = ui::section_hit_at(&state, 120, 40, 5, 10);
+        let hit = hit_started.elapsed();
+
+        let frame_started = std::time::Instant::now();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let frame = frame_started.elapsed();
+
+        assert!(
+            hydration < std::time::Duration::from_millis(250),
+            "hydration: {hydration:?}"
+        );
+        assert!(
+            focus < std::time::Duration::from_millis(250),
+            "focus: {focus:?}"
+        );
+        assert!(hit < std::time::Duration::from_millis(250), "hit: {hit:?}");
+        assert!(
+            frame < std::time::Duration::from_millis(500),
+            "frame: {frame:?}"
+        );
+    }
+
+    #[test]
     fn search_tools_render_semantic_detail_and_provider_duration() {
         let mut state = super::AppState::default();
         state.apply(AgentEvent::ToolCallStart {
@@ -1006,6 +1148,7 @@ mod tests {
             id: "search-1".into(),
             result: pi_harness::ToolResult {
                 content: "one\ntwo\nthree".into(),
+                details: None,
             },
             is_error: false,
             duration_ms: Some(1_234),
@@ -1060,6 +1203,7 @@ mod tests {
             id: "spawn-call".into(),
             result: pi_harness::ToolResult {
                 content: "Agent started in background. Agent ID: scout-123".into(),
+                details: None,
             },
             is_error: false,
             duration_ms: Some(55),
@@ -1083,6 +1227,7 @@ mod tests {
             id: "result-call".into(),
             result: pi_harness::ToolResult {
                 content: "Session persistence report".into(),
+                details: None,
             },
             is_error: false,
             duration_ms: Some(20),
@@ -1113,6 +1258,7 @@ mod tests {
             id: "agent-a".into(),
             result: pi_harness::ToolResult {
                 content: "done".into(),
+                details: None,
             },
             is_error: false,
             duration_ms: Some(250),
@@ -1218,6 +1364,7 @@ mod tests {
                 path,
                 lines,
                 expanded,
+                ..
             } => {
                 assert_eq!(path, "src/lib.rs");
                 assert!(*expanded, "edit diffs default to expanded");
@@ -1254,6 +1401,43 @@ mod tests {
                 assert!(matches!(lines[1].kind, super::state::DiffKind::Added));
             }
             other => panic!("expected Diff entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_pi_edit_schema_uses_authoritative_result_diff() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "edit-current".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/lib.rs",
+                "edits": [{"oldText": "old", "newText": "preview"}]
+            }),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "edit-current".into(),
+            result: pi_harness::ToolResult {
+                content: "Edited src/lib.rs".into(),
+                details: Some(serde_json::json!({
+                    "diff": "@@ -12,2 +12,2 @@\n context\n-old\n+final"
+                })),
+            },
+            is_error: false,
+            duration_ms: Some(10),
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Diff { lines, .. } => {
+                assert!(matches!(lines[0].kind, super::state::DiffKind::Context));
+                assert_eq!(lines[0].number, Some(12));
+                assert!(matches!(lines[1].kind, super::state::DiffKind::Removed));
+                assert_eq!(lines[1].number, Some(13));
+                assert!(matches!(lines[2].kind, super::state::DiffKind::Added));
+                assert_eq!(lines[2].number, Some(13));
+                assert_eq!(lines[2].text, "final");
+            }
+            other => panic!("expected diff entry, got {other:?}"),
         }
     }
 
@@ -1857,6 +2041,102 @@ mod tests {
     }
 
     #[test]
+    fn repeated_compactions_keep_distinct_chronological_cards() {
+        let mut state = super::AppState::default();
+        for (reason, before, after) in [
+            ("threshold", 190_000, 40_000),
+            ("overflow", 198_000, 35_000),
+        ] {
+            state.apply(AgentEvent::Compaction {
+                phase: pi_harness::CompactionPhase::Start,
+                reason: Some(reason.into()),
+                summary: None,
+                tokens_before: Some(before),
+                tokens_after: None,
+                error: None,
+            });
+            state.apply(AgentEvent::Compaction {
+                phase: pi_harness::CompactionPhase::End,
+                reason: Some(reason.into()),
+                summary: Some(format!("{reason} summary")),
+                tokens_before: Some(before),
+                tokens_after: Some(after),
+                error: None,
+            });
+        }
+        let summaries: Vec<&str> = state
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                super::state::Entry::Compaction { summary, .. } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries, ["threshold summary", "overflow summary"]);
+        assert_eq!(state.context_used, 35_000);
+    }
+
+    #[test]
+    fn aborted_compaction_preserves_error_and_does_not_change_tokens() {
+        let mut state = super::AppState {
+            context_used: 150_000,
+            ..super::AppState::default()
+        };
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(150_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(150_000),
+            tokens_after: None,
+            error: Some("aborted".into()),
+        });
+        assert_eq!(state.context_used, 150_000);
+        assert!(
+            matches!(state.entries.last(), Some(super::state::Entry::Compaction { active: false, error: Some(error), .. }) if error == "aborted")
+        );
+    }
+
+    #[test]
+    fn split_turn_compaction_stays_between_surrounding_messages() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::TextDelta {
+            text: "before".into(),
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("overflow".into()),
+            summary: None,
+            tokens_before: Some(200_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("overflow".into()),
+            summary: Some("middle".into()),
+            tokens_before: Some(200_000),
+            tokens_after: Some(30_000),
+            error: None,
+        });
+        state.apply(AgentEvent::TextDelta {
+            text: "after".into(),
+        });
+        assert!(matches!(state.entries.as_slice(), [
+            super::state::Entry::Assistant { .. },
+            super::state::Entry::Compaction { summary, .. },
+            super::state::Entry::Assistant { .. }
+        ] if summary == "middle"));
+    }
+
+    #[test]
     fn markdown_renders_numbered_lists_and_checkboxes() {
         let source: Vec<String> = vec![
             "## Next Steps".into(),
@@ -1877,7 +2157,8 @@ mod tests {
             })
             .collect();
         assert!(
-            text.iter().any(|line| line.contains("1. Run the test suite")),
+            text.iter()
+                .any(|line| line.contains("1. Run the test suite")),
             "numbered list should keep the number, got: {text:?}"
         );
         assert!(text.iter().any(|line| line.contains("☑ Wire compaction")));
@@ -2078,7 +2359,9 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let before = buffer_text(terminal.backend().buffer(), width, height);
         assert!(
-            before.lines().any(|line| line.contains("Compacting context") && line.contains("s")),
+            before
+                .lines()
+                .any(|line| line.contains("Compacting context") && line.contains("s")),
             "banner should be visible after Start, output: {before}"
         );
 
@@ -2184,7 +2467,10 @@ mod tests {
         // banner. The "1K" input is the snapshot of context_used at
         // turn start. Both are in the same line, so the test just checks
         // both substrings are present anywhere in the rendered output.
-        assert!(output.contains("1K"), "input snapshot should be visible: {output}");
+        assert!(
+            output.contains("1K"),
+            "input snapshot should be visible: {output}"
+        );
         assert!(
             output.contains("Working"),
             "working banner should be visible: {output}"

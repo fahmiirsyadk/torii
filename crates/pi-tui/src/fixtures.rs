@@ -57,6 +57,7 @@ pub fn conversation() -> AppState {
                 timestamp: "5:01 PM".into(),
             },
             Entry::Diff {
+                id: "fixture-diff-1".into(),
                 path: "app/Livewire/History.php".into(),
                 lines: vec![
                     diff(
@@ -131,6 +132,51 @@ pub fn conversation() -> AppState {
         model: "Minimax M3 via opencode-go".into(),
         permission_mode: PermissionMode::AlwaysApprove,
         scroll_from_bottom: 12,
+        ..AppState::default()
+    }
+}
+
+#[cfg(test)]
+pub fn long_session(count: usize) -> AppState {
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        match index % 4 {
+            0 => entries.push(Entry::User {
+                text: format!(
+                    "Prompt {index}: inspect the current implementation and report findings."
+                ),
+                timestamp: "12:00 PM".into(),
+            }),
+            1 => entries.push(Entry::Assistant {
+                lines: vec![
+                    format!("Result {index}"),
+                    "A compact response with **markdown** output.".into(),
+                ],
+                timestamp: "12:00 PM".into(),
+            }),
+            2 => entries.push(Entry::Reasoning {
+                text: "Reviewing the relevant files and checking the implementation details."
+                    .into(),
+                active: false,
+                expanded: false,
+            }),
+            _ => entries.push(Entry::Tool {
+                id: format!("tool-{index}"),
+                label: "Read".into(),
+                detail: format!("src/file-{index}.rs"),
+                status: ToolStatus::Success,
+                duration: Some("12ms".into()),
+                started_at: None,
+                result: Some(
+                    "A sufficiently large stored tool result\nwith a second output line.".into(),
+                ),
+                expanded: index % 16 == 3,
+            }),
+        }
+    }
+    AppState {
+        entries,
+        focus: crate::state::Focus::Scrollback,
         ..AppState::default()
     }
 }
@@ -244,6 +290,7 @@ pub fn tools() -> AppState {
                 expanded: true,
             },
             Entry::Diff {
+                id: "fixture-diff-2".into(),
                 path: "crates/pi-tui/src/ui.rs".into(),
                 lines: vec![
                     DiffLine {

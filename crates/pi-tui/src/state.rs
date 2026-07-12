@@ -172,6 +172,7 @@ pub enum Entry {
         expanded: bool,
     },
     Diff {
+        id: String,
         path: String,
         lines: Vec<DiffLine>,
         expanded: bool,
@@ -328,6 +329,10 @@ pub struct AppState {
     pub pending_label_entry: Option<String>,
     pub expanded_tool_groups: HashSet<usize>,
     pub focused_tool: Option<usize>,
+    pub focused_entry: Option<usize>,
+    pub focused_section: Option<usize>,
+    pub focused_target_id: Option<String>,
+    pub hovered_entry: Option<usize>,
 }
 
 impl Default for AppState {
@@ -380,6 +385,10 @@ impl Default for AppState {
             pending_label_entry: None,
             expanded_tool_groups: HashSet::new(),
             focused_tool: None,
+            focused_entry: None,
+            focused_section: None,
+            focused_target_id: None,
+            hovered_entry: None,
         }
     }
 }
@@ -1176,6 +1185,8 @@ impl AppState {
     }
 
     pub fn toggle_tool_at(&mut self, index: usize) {
+        self.focused_entry = Some(index);
+        self.focused_section = None;
         self.focused_tool = Some(index);
         if let Some(Entry::Tool { expanded, .. }) = self.entries.get_mut(index) {
             *expanded = !*expanded;
@@ -1183,6 +1194,8 @@ impl AppState {
     }
 
     pub fn toggle_tool_group(&mut self, start: usize) {
+        self.focused_entry = Some(start);
+        self.focused_section = None;
         self.focused_tool = Some(start);
         if !self.expanded_tool_groups.remove(&start) {
             self.expanded_tool_groups.insert(start);
@@ -1197,6 +1210,18 @@ impl AppState {
             .find(|entry| matches!(entry, Entry::Diff { .. }))
         {
             *expanded = !*expanded;
+        }
+    }
+
+    pub fn toggle_entry_at(&mut self, index: usize) {
+        self.focused_entry = Some(index);
+        self.focused_section = None;
+        match self.entries.get_mut(index) {
+            Some(Entry::Reasoning { expanded, .. } | Entry::Diff { expanded, .. }) => {
+                *expanded = !*expanded;
+            }
+            Some(Entry::Tool { .. }) => self.toggle_tool_at(index),
+            _ => {}
         }
     }
 
@@ -1260,17 +1285,14 @@ impl AppState {
     /// The banner above the composer uses this to render a ticking elapsed-time
     /// counter (e.g. "3.2s") while compaction is in flight.
     pub fn active_compaction_started_at(&self) -> Option<Instant> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                Entry::Compaction {
-                    active: true,
-                    started_at,
-                    ..
-                } => *started_at,
-                _ => None,
-            })
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Compaction {
+                active: true,
+                started_at,
+                ..
+            } => *started_at,
+            _ => None,
+        })
     }
 
     /// Records the start of a new LLM turn. Called by the TextDelta and
@@ -1311,6 +1333,10 @@ impl AppState {
                 self.turn_output_chars = 0;
                 self.expanded_tool_groups.clear();
                 self.focused_tool = None;
+                self.focused_entry = None;
+                self.focused_section = None;
+                self.focused_target_id = None;
+                self.hovered_entry = None;
             }
             AgentEvent::UserMessage { text } => {
                 self.entries.push(Entry::User {
@@ -1443,6 +1469,7 @@ impl AppState {
                         .unwrap_or("(unknown path)")
                         .to_string();
                     self.entries.push(Entry::Diff {
+                        id,
                         path,
                         lines: diff_lines,
                         expanded: true,
@@ -1464,10 +1491,24 @@ impl AppState {
             }
             AgentEvent::ToolCallResult {
                 id,
-                result: ToolResult { content },
+                result: ToolResult { content, details },
                 is_error,
                 duration_ms,
             } => {
+                if let Some(Entry::Diff { lines, .. }) = self.entries.iter_mut().rev().find(
+                    |entry| matches!(entry, Entry::Diff { id: diff_id, .. } if diff_id == &id),
+                ) {
+                    if !is_error && let Some(diff) = result_diff(details.as_ref()) {
+                        *lines = parse_unified_diff(diff);
+                    }
+                    self.status = if is_error {
+                        "tool failed"
+                    } else {
+                        "tool complete"
+                    }
+                    .into();
+                    return;
+                }
                 let mut completed_agent: Option<(String, String, Option<u64>)> = None;
                 if let Some(Entry::Tool {
                     status,
@@ -1793,6 +1834,16 @@ fn search_match_count(result: &str) -> Option<usize> {
 
 fn build_edit_diff(args: &serde_json::Value) -> Option<Vec<DiffLine>> {
     let object = args.as_object()?;
+    if let Some(edits) = object.get("edits").and_then(serde_json::Value::as_array) {
+        let mut lines = Vec::new();
+        for edit in edits {
+            let edit = edit.as_object()?;
+            let old = edit.get("oldText").and_then(serde_json::Value::as_str)?;
+            let new = edit.get("newText").and_then(serde_json::Value::as_str)?;
+            lines.extend(replacement_diff(old, new, None));
+        }
+        return (!lines.is_empty()).then_some(lines);
+    }
     let old_text = object
         .get("old_text")
         .or_else(|| object.get("old_string"))
@@ -1810,6 +1861,10 @@ fn build_edit_diff(args: &serde_json::Value) -> Option<Vec<DiffLine>> {
         .or_else(|| object.get("line"))
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as u32);
+    Some(replacement_diff(old_text, new_text, start))
+}
+
+fn replacement_diff(old_text: &str, new_text: &str, start: Option<u32>) -> Vec<DiffLine> {
     let mut diff_lines = Vec::new();
     let old_lines: Vec<&str> = old_text.split_terminator('\n').collect();
     let new_lines: Vec<&str> = new_text.split_terminator('\n').collect();
@@ -1838,13 +1893,63 @@ fn build_edit_diff(args: &serde_json::Value) -> Option<Vec<DiffLine>> {
             });
         }
     }
-    if diff_lines.is_empty() {
-        None
-    } else {
-        Some(diff_lines)
-    }
+    diff_lines
 }
 
+fn result_diff(details: Option<&serde_json::Value>) -> Option<&str> {
+    let details = details?.as_object()?;
+    details
+        .get("diff")
+        .or_else(|| details.get("patch"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
+    let mut old_line = 0_u32;
+    let mut new_line = 0_u32;
+    let mut lines = Vec::new();
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("@@ ") {
+            let mut ranges = header.split_whitespace();
+            old_line = ranges.next().and_then(parse_diff_range).unwrap_or(0);
+            new_line = ranges.next().and_then(parse_diff_range).unwrap_or(0);
+        } else if line.starts_with("---") || line.starts_with("+++") {
+            continue;
+        } else if let Some(text) = line.strip_prefix('-') {
+            lines.push(DiffLine {
+                number: Some(old_line),
+                text: text.into(),
+                kind: DiffKind::Removed,
+            });
+            old_line = old_line.saturating_add(1);
+        } else if let Some(text) = line.strip_prefix('+') {
+            lines.push(DiffLine {
+                number: Some(new_line),
+                text: text.into(),
+                kind: DiffKind::Added,
+            });
+            new_line = new_line.saturating_add(1);
+        } else if let Some(text) = line.strip_prefix(' ') {
+            lines.push(DiffLine {
+                number: Some(new_line),
+                text: text.into(),
+                kind: DiffKind::Context,
+            });
+            old_line = old_line.saturating_add(1);
+            new_line = new_line.saturating_add(1);
+        }
+    }
+    lines
+}
+
+fn parse_diff_range(range: &str) -> Option<u32> {
+    range
+        .trim_start_matches(['-', '+'])
+        .split(',')
+        .next()?
+        .parse()
+        .ok()
+}
 fn background_agent_id(result: &str) -> Option<String> {
     for marker in ["Agent ID:", "agent_id\":\"", "agent_id': '"] {
         let Some((_, remainder)) = result.split_once(marker) else {
@@ -1909,9 +2014,12 @@ fn apply_compaction(
                 error: slot_error,
                 started_at: slot_started_at,
                 ..
-            }) = state.entries.iter_mut().rev().find(|entry| {
-                matches!(entry, Entry::Compaction { active: true, .. })
-            }) {
+            }) = state
+                .entries
+                .iter_mut()
+                .rev()
+                .find(|entry| matches!(entry, Entry::Compaction { active: true, .. }))
+            {
                 *slot = final_summary;
                 *slot_after = tokens_after;
                 *slot_error = error;

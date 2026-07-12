@@ -286,7 +286,11 @@ impl AgentHarness for PiHarness {
                 .session_id
                 .context("Pi sidecar omitted session_id")?,
         );
-        let (sender, _) = broadcast::channel(256);
+        // A resumed transcript is replayed immediately after subscribe. Size the
+        // channel for that one bounded snapshot so history cannot be silently
+        // dropped before the UI drains it.
+        let history_capacity = response.history.as_ref().map_or(0, Vec::len);
+        let (sender, _) = broadcast::channel(256_usize.max(history_capacity.saturating_add(16)));
         self.inner
             .sessions
             .write()

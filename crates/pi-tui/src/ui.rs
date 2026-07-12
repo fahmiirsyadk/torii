@@ -12,27 +12,57 @@ use crate::{
     theme::Theme,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToolHit {
-    Group(usize),
-    Item(usize),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SectionHit {
+    pub index: usize,
+    pub actionable: bool,
+    pub id: String,
 }
 
-pub fn tool_hit_at(
-    state: &AppState,
-    terminal_width: u16,
-    terminal_height: u16,
-    screen_row: u16,
-) -> Option<ToolHit> {
-    let width = terminal_width.saturating_sub(7) as usize;
-    let viewport = terminal_height.saturating_sub(7) as usize;
-    let total = max_scroll(state, terminal_width, terminal_height) + viewport;
-    let max_scroll = total.saturating_sub(viewport);
-    let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
-    let logical_row = usize::from(screen_row.saturating_sub(2)).saturating_add(scroll);
+#[derive(Clone, Debug)]
+struct LayoutSection {
+    id: String,
+    index: usize,
+    start: usize,
+    end: usize,
+    actionable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptLayout {
+    total_rows: usize,
+    sections: Vec<LayoutSection>,
+}
+
+impl TranscriptLayout {
+    fn build(state: &AppState, width: usize) -> Self {
+        let (total_rows, sections) = build_layout_sections(state, width);
+        Self {
+            total_rows,
+            sections,
+        }
+    }
+
+    fn max_scroll(&self, viewport: usize) -> usize {
+        self.total_rows.saturating_sub(viewport)
+    }
+}
+
+fn transcript_geometry(state: &AppState, width: u16, height: u16) -> (u16, u16, u16, usize) {
+    let banners = u16::from(state.turn_started_at.is_some())
+        + u16::from(state.active_compaction_started_at().is_some());
+    let viewport = height.saturating_sub(7).saturating_sub(banners);
+    (3, 2, width.saturating_sub(6), viewport as usize)
+}
+
+fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSection>) {
     let mut row = 0;
+    let mut sections = Vec::new();
     let mut index = 0;
     while index < state.entries.len() {
+        let section_index = index;
+        let start = row;
+        let mut actionable = false;
         match &state.entries[index] {
             Entry::User { .. } => row += 5,
             Entry::Reasoning {
@@ -41,13 +71,60 @@ pub fn tool_hit_at(
                 expanded,
             } => {
                 row += reasoning_lines(text, *active, *expanded, width, Theme::GROK_NIGHT).len();
+                actionable = true;
             }
             Entry::Diff {
                 path,
                 lines,
                 expanded,
+                ..
             } => {
                 row += diff_render_lines(path, lines, *expanded, width, Theme::GROK_NIGHT).len();
+                actionable = true;
+            }
+            Entry::Tool { .. } => {
+                let Entry::Tool { label, .. } = &state.entries[index] else {
+                    unreachable!()
+                };
+                let count = state.entries[index..]
+                    .iter()
+                    .take_while(
+                        |entry| matches!(entry, Entry::Tool { label: other, .. } if other == label),
+                    )
+                    .count();
+                if count > 1 {
+                    let Entry::Tool { id, .. } = &state.entries[index] else {
+                        unreachable!()
+                    };
+                    sections.push(LayoutSection {
+                        id: format!("tool-group:{id}"),
+                        index,
+                        start: row,
+                        end: row + 1,
+                        actionable: true,
+                    });
+                    row += 1;
+                    if state.expanded_tool_groups.contains(&index) {
+                        for child in index..index + count {
+                            let child_start = row;
+                            row += tool_item_line_count(&state.entries[child], width, true);
+                            let Entry::Tool { id, .. } = &state.entries[child] else {
+                                unreachable!()
+                            };
+                            sections.push(LayoutSection {
+                                id: format!("tool:{id}"),
+                                index: child,
+                                start: child_start,
+                                end: row.max(child_start + 1),
+                                actionable: true,
+                            });
+                        }
+                    }
+                    index += count;
+                    continue;
+                }
+                row += tool_item_line_count(&state.entries[index], width, false);
+                actionable = true;
             }
             Entry::Compaction {
                 summary,
@@ -55,9 +132,9 @@ pub fn tool_hit_at(
                 tokens_after,
                 active,
                 error,
-                started_at: _,
+                ..
             } => {
-                row += compaction_lines(
+                row += 1 + compaction_lines(
                     summary,
                     *tokens_before,
                     *tokens_after,
@@ -69,49 +146,138 @@ pub fn tool_hit_at(
                 .len();
             }
             Entry::CompactionIndicator { tokens_before, .. } => {
-                row += compaction_indicator_line(*tokens_before, width, Theme::GROK_NIGHT).len();
+                row +=
+                    1 + compaction_indicator_line(*tokens_before, width, Theme::GROK_NIGHT).len();
             }
             Entry::Assistant { lines, .. } => {
-                row += markdown::render(lines, width, Theme::GROK_NIGHT).len() + 1;
-            }
-            Entry::Tool { label, .. } => {
-                let count = state.entries[index..]
-                    .iter()
-                    .take_while(
-                        |entry| matches!(entry, Entry::Tool { label: other, .. } if other == label),
-                    )
-                    .count();
-                if logical_row == row {
-                    return Some(if count > 1 {
-                        ToolHit::Group(index)
-                    } else {
-                        ToolHit::Item(index)
-                    });
-                }
-                row += 1;
-                if count > 1 && state.expanded_tool_groups.contains(&index) {
-                    for child in index..index + count {
-                        if logical_row == row {
-                            return Some(ToolHit::Item(child));
-                        }
-                        let Entry::Tool {
-                            result, expanded, ..
-                        } = &state.entries[child]
-                        else {
-                            continue;
-                        };
-                        row += 1;
-                        if *expanded && let Some(result) = result {
-                            row += markdown::wrap(result, width.saturating_sub(6)).len();
-                        }
-                    }
-                }
-                index += count.saturating_sub(1);
+                row += 1 + markdown::render(lines, width, Theme::GROK_NIGHT).len()
             }
         }
+        sections.push(LayoutSection {
+            id: section_target_id(&state.entries[section_index], section_index),
+            index: section_index,
+            start,
+            end: row.max(start + 1),
+            actionable,
+        });
         index += 1;
     }
-    None
+    (row, sections)
+}
+
+fn section_target_id(entry: &Entry, index: usize) -> String {
+    match entry {
+        Entry::Tool { id, .. } => format!("tool:{id}"),
+        Entry::Diff { id, .. } => format!("diff:{id}"),
+        Entry::User { .. } => format!("user:{index}"),
+        Entry::Reasoning { .. } => format!("reasoning:{index}"),
+        Entry::Assistant { .. } => format!("assistant:{index}"),
+        Entry::Compaction { .. } => format!("compaction:{index}"),
+        Entry::CompactionIndicator { .. } => format!("compaction-indicator:{index}"),
+    }
+}
+
+fn tool_item_line_count(entry: &Entry, width: usize, nested: bool) -> usize {
+    let Entry::Tool {
+        label,
+        detail,
+        status,
+        duration,
+        started_at,
+        result,
+        expanded,
+        ..
+    } = entry
+    else {
+        return 0;
+    };
+    tool_render_lines(
+        ToolRender {
+            label,
+            detail,
+            status: *status,
+            result: result.as_deref(),
+            expanded: *expanded,
+            duration: duration.as_deref(),
+            started_at: *started_at,
+            nested,
+            focused: false,
+            hovered: false,
+        },
+        width,
+        Theme::GROK_NIGHT,
+    )
+    .len()
+}
+
+pub fn section_hit_at(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    column: u16,
+    screen_row: u16,
+) -> Option<SectionHit> {
+    let (x, y, content_width, viewport) = transcript_geometry(state, width, height);
+    if column < x
+        || column >= x.saturating_add(content_width)
+        || screen_row < y
+        || usize::from(screen_row - y) >= viewport
+    {
+        return None;
+    }
+    let render_width = content_width.saturating_sub(1) as usize;
+    let layout = TranscriptLayout::build(state, render_width);
+    let max_scroll = layout.max_scroll(viewport);
+    let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
+    let logical = usize::from(screen_row - y).saturating_add(scroll);
+    layout
+        .sections
+        .into_iter()
+        .find(|section| logical >= section.start && logical < section.end)
+        .map(|section| SectionHit {
+            index: section.index,
+            actionable: section.actionable,
+            id: section.id,
+        })
+}
+
+pub fn move_section_focus(state: &mut AppState, width: u16, height: u16, direction: i32) {
+    let (_, _, content_width, viewport) = transcript_geometry(state, width, height);
+    let layout = TranscriptLayout::build(state, content_width.saturating_sub(1) as usize);
+    let sections = &layout.sections;
+    if sections.is_empty() {
+        return;
+    }
+    let current = state
+        .focused_target_id
+        .as_ref()
+        .and_then(|id| sections.iter().position(|section| &section.id == id))
+        .or_else(|| {
+            state
+                .focused_section
+                .filter(|position| *position < sections.len())
+        });
+    let next = if direction < 0 {
+        current.map_or(sections.len() - 1, |position| position.saturating_sub(1))
+    } else {
+        current.map_or(0, |position| (position + 1).min(sections.len() - 1))
+    };
+    let section = &sections[next];
+    let (index, start, end) = (section.index, section.start, section.end);
+    state.focused_section = Some(next);
+    state.focused_target_id = Some(section.id.clone());
+    state.focused_entry = Some(index);
+    state.focused_tool =
+        matches!(state.entries.get(index), Some(Entry::Tool { .. })).then_some(index);
+    let max_scroll = layout.max_scroll(viewport);
+    let mut top = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
+    if start < top {
+        top = start;
+    }
+    if end > top.saturating_add(viewport) {
+        top = end.saturating_sub(viewport);
+    }
+    state.scroll_from_bottom = max_scroll.saturating_sub(top.min(max_scroll));
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
@@ -155,56 +321,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
-    let content_width = width.saturating_sub(7) as usize;
-    let mut line_count = 0;
-    let mut index = 0;
-    while index < state.entries.len() {
-        let entry = &state.entries[index];
-        line_count += match entry {
-            Entry::User { .. } => 5,
-            Entry::Reasoning {
-                text,
-                active,
-                expanded,
-            } => reasoning_lines(text, *active, *expanded, content_width, Theme::GROK_NIGHT).len(),
-            Entry::Diff {
-                path,
-                lines,
-                expanded,
-            } => diff_render_lines(path, lines, *expanded, content_width, Theme::GROK_NIGHT).len(),
-            Entry::Tool { .. } => {
-                let (lines, consumed) =
-                    tool_group_lines(state, index, content_width, Theme::GROK_NIGHT);
-                index += consumed.saturating_sub(1);
-                lines.len()
-            }
-            Entry::Compaction {
-                summary,
-                tokens_before,
-                tokens_after,
-                active,
-                error,
-                started_at: _,
-            } => compaction_lines(
-                summary,
-                *tokens_before,
-                *tokens_after,
-                *active,
-                error.as_deref(),
-                content_width,
-                Theme::GROK_NIGHT,
-            )
-            .len(),
-            Entry::CompactionIndicator { tokens_before, .. } => {
-                compaction_indicator_line(*tokens_before, content_width, Theme::GROK_NIGHT).len()
-            }
-            Entry::Assistant { lines, .. } => {
-                markdown::render(lines, content_width, Theme::GROK_NIGHT).len() + 1
-            }
-        };
-        index += 1;
-    }
-    line_count.saturating_sub(height.saturating_sub(7) as usize)
+    let (_, _, content_width, viewport) = transcript_geometry(state, width, height);
+    TranscriptLayout::build(state, content_width.saturating_sub(1) as usize).max_scroll(viewport)
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
@@ -237,6 +355,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         vertical: 0,
     });
     let width = content.width.saturating_sub(1) as usize;
+    let layout = TranscriptLayout::build(state, width);
     let mut lines = Vec::new();
     let mut user_headers = Vec::new();
 
@@ -262,6 +381,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 path,
                 lines: diff_lines,
                 expanded,
+                ..
             } => {
                 lines.extend(diff_render_lines(path, diff_lines, *expanded, width, theme));
             }
@@ -315,7 +435,12 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         entry_index += 1;
     }
 
-    let line_count = lines.len();
+    let line_count = layout.total_rows;
+    debug_assert_eq!(
+        line_count,
+        lines.len(),
+        "painted transcript diverged from TranscriptLayout"
+    );
     let viewport_height = content.height as usize;
     let max_scroll = line_count.saturating_sub(viewport_height);
     let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
@@ -418,7 +543,13 @@ fn compaction_lines(
     width: usize,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let glyph = if active { "◌" } else if error.is_some() { "✕" } else { "◆" };
+    let glyph = if active {
+        "◌"
+    } else if error.is_some() {
+        "✕"
+    } else {
+        "◆"
+    };
     let title = if active {
         "Compacting context…".to_string()
     } else if error.is_some() {
@@ -426,15 +557,21 @@ fn compaction_lines(
     } else {
         "Compacted context".to_string()
     };
-    let mut header = vec![Line::from(vec![
-        Span::styled(
-            format!("{glyph} {title}"),
-            Style::default().fg(if error.is_some() { theme.error } else { theme.accent }),
-        ),
-    ])];
+    let mut header = vec![Line::from(vec![Span::styled(
+        format!("{glyph} {title}"),
+        Style::default().fg(if error.is_some() {
+            theme.error
+        } else {
+            theme.accent
+        }),
+    )])];
     if let (Some(before), Some(after)) = (tokens_before, tokens_after) {
         header.push(Line::from(Span::styled(
-            format!("   {} → {} tokens", compact_number(before), compact_number(after)),
+            format!(
+                "   {} → {} tokens",
+                compact_number(before),
+                compact_number(after)
+            ),
             Style::default().fg(theme.muted),
         )));
     } else if let Some(before) = tokens_before {
@@ -533,22 +670,14 @@ struct ToolRender<'a> {
     started_at: Option<std::time::Instant>,
     nested: bool,
     focused: bool,
+    hovered: bool,
 }
 
-const COMPACTION_SPINNER: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-];
+const COMPACTION_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const WORKING_SPINNER: &[&str] = &[
-    "⠋", "⠙", "⠸", "⠴", "⠦", "⠇", "⠏", "⠋",
-];
+const WORKING_SPINNER: &[&str] = &["⠋", "⠙", "⠸", "⠴", "⠦", "⠇", "⠏", "⠋"];
 
-fn render_working_banner(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &AppState,
-    theme: Theme,
-) {
+fn render_working_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
     let started_at = state
         .turn_started_at
         .unwrap_or_else(std::time::Instant::now);
@@ -567,9 +696,19 @@ fn render_working_banner(
         compact_number(state.turn_input_tokens),
         compact_number(estimated_output_tokens),
     );
-    render_three_column_banner(frame, area, &left, &elapsed_label, &tokens_label, theme, theme.accent, theme.muted);
+    render_three_column_banner(
+        frame,
+        area,
+        &left,
+        &elapsed_label,
+        &tokens_label,
+        theme,
+        theme.accent,
+        theme.muted,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_three_column_banner(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -594,16 +733,31 @@ fn render_three_column_banner(
     if needed <= width {
         let gap_left = (width - left_chars - center_chars - right_chars) / 2;
         let gap_right = width - left_chars - gap_left - center_chars - right_chars;
-        spans.push(Span::styled(left.to_string(), Style::default().fg(left_color)));
+        spans.push(Span::styled(
+            left.to_string(),
+            Style::default().fg(left_color),
+        ));
         spans.push(Span::raw(" ".repeat(gap_left)));
-        spans.push(Span::styled(center.to_string(), Style::default().fg(theme.foreground)));
+        spans.push(Span::styled(
+            center.to_string(),
+            Style::default().fg(theme.foreground),
+        ));
         spans.push(Span::raw(" ".repeat(gap_right)));
-        spans.push(Span::styled(right.to_string(), Style::default().fg(right_color)));
+        spans.push(Span::styled(
+            right.to_string(),
+            Style::default().fg(right_color),
+        ));
     } else if left_chars + min_gap + right_chars <= width {
         let gap = width - left_chars - right_chars;
-        spans.push(Span::styled(left.to_string(), Style::default().fg(left_color)));
+        spans.push(Span::styled(
+            left.to_string(),
+            Style::default().fg(left_color),
+        ));
         spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(right.to_string(), Style::default().fg(right_color)));
+        spans.push(Span::styled(
+            right.to_string(),
+            Style::default().fg(right_color),
+        ));
     } else {
         let budget = width.saturating_sub(right_chars + min_gap);
         let truncated: String = if left.chars().count() > budget {
@@ -623,12 +777,7 @@ fn render_three_column_banner(
     );
 }
 
-fn render_compaction_banner(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &AppState,
-    theme: Theme,
-) {
+fn render_compaction_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
     let started_at = state.active_compaction_started_at();
     let elapsed_ms = started_at
         .map(|start| start.elapsed().as_millis() as u64)
@@ -640,13 +789,29 @@ fn render_compaction_banner(
     let center = elapsed_label;
     let right = format!("↓ {} tokens", compact_number(state.context_used));
     let error_color = if state.entries.iter().rev().any(|entry| {
-        matches!(entry, Entry::Compaction { active: false, error: Some(_), .. })
+        matches!(
+            entry,
+            Entry::Compaction {
+                active: false,
+                error: Some(_),
+                ..
+            }
+        )
     }) {
         theme.error
     } else {
         theme.muted
     };
-    render_three_column_banner(frame, area, &left, &center, &right, theme, theme.accent, error_color);
+    render_three_column_banner(
+        frame,
+        area,
+        &left,
+        &center,
+        &right,
+        theme,
+        theme.accent,
+        error_color,
+    );
 }
 
 fn format_elapsed(milliseconds: u64) -> String {
@@ -722,6 +887,7 @@ fn tool_group_lines(
                     started_at: *started_at,
                     nested: false,
                     focused: state.focused_tool == Some(start),
+                    hovered: state.hovered_entry == Some(start),
                 },
                 width,
                 theme,
@@ -790,6 +956,7 @@ fn tool_group_lines(
             focused: state
                 .focused_tool
                 .is_some_and(|focused| focused >= start && focused < start + count),
+            hovered: state.hovered_entry == Some(start),
         },
         width,
         theme,
@@ -820,6 +987,7 @@ fn tool_group_lines(
                     started_at: *started_at,
                     nested: true,
                     focused: state.focused_tool == Some(start + offset),
+                    hovered: state.hovered_entry == Some(start + offset),
                 },
                 width,
                 theme,
@@ -854,6 +1022,7 @@ fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Li
         ToolStatus::Success => ("◆", theme.foreground),
         ToolStatus::Error => ("◆", theme.error),
     };
+    let marker = if tool.hovered { ">" } else { marker };
     let elapsed = tool
         .started_at
         .map(|started| format_live_elapsed(started.elapsed()));

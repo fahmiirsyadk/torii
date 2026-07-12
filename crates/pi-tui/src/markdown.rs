@@ -117,10 +117,7 @@ pub fn render(source: &[String], width: usize, theme: Theme) -> Vec<Line<'static
                 } else {
                     " ".repeat(marker_width)
                 };
-                let mut spans = vec![Span::styled(
-                    prefix,
-                    Style::default().fg(theme.accent),
-                )];
+                let mut spans = vec![Span::styled(prefix, Style::default().fg(theme.accent))];
                 spans.extend(inline_spans(&line, Style::default(), theme));
                 output.push(Line::from(spans));
             }

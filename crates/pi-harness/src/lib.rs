@@ -37,6 +37,8 @@ pub enum SessionPersistence {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolResult {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -414,6 +416,7 @@ impl AgentHarness for MockHarness {
                     id: "tool-1".into(),
                     result: ToolResult {
                         content: "Mock file contents loaded successfully.".into(),
+                        details: None,
                     },
                     is_error: false,
                     duration_ms: Some(180),
@@ -482,6 +485,7 @@ impl AgentHarness for MockHarness {
             id: tool_id,
             result: ToolResult {
                 content: "mock bash output".into(),
+                details: None,
             },
             is_error: false,
             duration_ms: Some(1),

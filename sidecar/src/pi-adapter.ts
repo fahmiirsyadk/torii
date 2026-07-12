@@ -23,11 +23,12 @@ import { promisify } from "node:util";
 
 import {
   createAgentSessionFromServices,
+  createAgentSessionRuntime,
   createAgentSessionServices,
   type AgentSession,
   type AgentSessionEvent,
   type ExtensionAPI,
-  AgentSessionRuntime,
+  type AgentSessionRuntime,
   type ModelRegistry,
   ProjectTrustStore,
   copyToClipboard,
@@ -473,7 +474,7 @@ export function sessionHistory(messages: readonly unknown[]): AgentEvent[] {
       history.push({
         type: "tool_call_result",
         id,
-        result: { content },
+        result: { content, details: item.details },
         is_error: item.isError === true,
         duration_ms:
           startedAt !== undefined && completedAt >= startedAt ? completedAt - startedAt : undefined,
@@ -534,7 +535,7 @@ export function handlePiEvent(
       emitEvent(sessionId, {
         type: "tool_call_result",
         id: event.toolCallId,
-        result: { content },
+        result: { content, details: event.result.details },
         is_error: event.isError,
         duration_ms: startedAt === undefined ? undefined : Date.now() - startedAt,
       });
@@ -606,14 +607,12 @@ export function handlePiEvent(
 }
 
 export function loadedHistory(session: AgentSession, sessionManager: SessionManager): AgentEvent[] {
-  const history = sessionHistory(sessionManager.buildSessionContext().messages);
-  for (const entry of sessionManager.getEntries()) {
-    if (entry.type === "compaction" || entry.type === "branch_summary") {
-      // Replay stored compaction/branch_summary entries as a slim "previously compacted"
-      // indicator rather than a fresh end event. The full summary still lives in the
-      // session context that we sent to the LLM above (via sessionHistory), so resuming
-      // a session does not lose information — but the user no longer sees a fake "new"
-      // compaction card appear at the top of the transcript on /resume.
+  const history: AgentEvent[] = [];
+  for (const entry of sessionManager.buildContextEntries()) {
+    if (entry.type === "message") {
+      history.push(...sessionHistory([entry.message]));
+    } else if (entry.type === "compaction" || entry.type === "branch_summary") {
+      // Preserve the position selected by Pi's compaction-aware context projection.
       const reason = entry.type === "branch_summary" ? "branch" : "manual";
       const tokens_before = entry.type === "compaction" ? entry.tokensBefore : undefined;
       history.push({ type: "compaction_indicator", reason, tokens_before });
@@ -701,42 +700,9 @@ export async function openSession(
           : persistence.mode === "fork"
             ? SessionManager.forkFrom(await resolveSessionTarget(persistence.target), cwd)
           : SessionManager.create(cwd);
-  const services = await createAgentSessionServices({
-    cwd,
-    resourceLoaderOptions: {
-      extensionFactories: [
-        permissionExtension(
-          sessionManager.getSessionId(),
-          cwd,
-          hooks.getNextPermissionId,
-          () => hooks.getMode(sessionManager.getSessionId()),
-          hooks.isAlwaysAllowed,
-          hooks.rememberAlwaysAllowed,
-          hooks.registerPermissionReply,
-          hooks.unregisterPermissionReply,
-          (event) => hooks.emitEvent(sessionManager.getSessionId(), event),
-        ),
-        grokToolsExtension(sessionManager.getSessionId(), (event) => hooks.emitEvent(sessionManager.getSessionId(), event)),
-        mcpExtension(sessionManager.getSessionId(), cwd, getAgentDir(), hooks.mcpClients, (event) => hooks.emitEvent(sessionManager.getSessionId(), event)),
-      ],
-    },
-  });
-  const defaultProvider = services.settingsManager.getDefaultProvider();
-  const defaultModel = services.settingsManager.getDefaultModel();
-  const model =
-    defaultProvider !== undefined && defaultModel !== undefined
-      ? services.modelRegistry.find(defaultProvider, defaultModel)
-      : undefined;
-  const { session } = await createAgentSessionFromServices({
-    services,
-    sessionManager,
-    model: persistence.mode === "continue" || persistence.mode === "open" || persistence.mode === "fork" ? undefined : model,
-  });
-  const runtime = new AgentSessionRuntime(
-    session,
-    services,
+  const runtime = await createAgentSessionRuntime(
     runtimeFactory(
-      session.sessionId,
+      sessionManager.getSessionId(),
       hooks.mcpClients,
       hooks.getMode,
       hooks.isAlwaysAllowed,
@@ -746,8 +712,14 @@ export async function openSession(
       hooks.getNextPermissionId,
       (id) => (event) => hooks.emitEvent(id, event),
     ),
-    services.diagnostics,
+    {
+      cwd,
+      agentDir: getAgentDir(),
+      sessionManager,
+    },
   );
+  const session = runtime.session;
+  const services = runtime.services;
   const active: ActiveSession = {
     session,
     runtime,
