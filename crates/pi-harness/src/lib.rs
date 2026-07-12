@@ -154,6 +154,13 @@ pub enum AgentEvent {
         tokens_after: Option<u64>,
         error: Option<String>,
     },
+    /// Emitted on session load for each stored compaction/branch_summary entry.
+    /// Unlike `Compaction` it does not start/end a live action — the user just
+    /// sees a single static "this session was previously compacted" line.
+    CompactionIndicator {
+        reason: String,
+        tokens_before: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

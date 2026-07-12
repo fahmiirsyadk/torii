@@ -162,6 +162,11 @@ export type AgentEvent =
       tokens_before?: number;
       tokens_after?: number;
       error?: string;
+    }
+  | {
+      type: "compaction_indicator";
+      reason: string;
+      tokens_before?: number;
     };
 
 export function writeMessage(message: SidecarMessage): void {

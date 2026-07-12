@@ -67,6 +67,9 @@ pub fn tool_hit_at(
                 )
                 .len();
             }
+            Entry::CompactionIndicator { tokens_before, .. } => {
+                row += compaction_indicator_line(*tokens_before, width, Theme::GROK_NIGHT).len();
+            }
             Entry::Assistant { lines, .. } => {
                 row += markdown::render(lines, width, Theme::GROK_NIGHT).len() + 1;
             }
@@ -178,6 +181,9 @@ pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
                 Theme::GROK_NIGHT,
             )
             .len(),
+            Entry::CompactionIndicator { tokens_before, .. } => {
+                compaction_indicator_line(*tokens_before, content_width, Theme::GROK_NIGHT).len()
+            }
             Entry::Assistant { lines, .. } => {
                 markdown::render(lines, content_width, Theme::GROK_NIGHT).len() + 1
             }
@@ -267,6 +273,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                     width,
                     theme,
                 ));
+            }
+            Entry::CompactionIndicator { tokens_before, .. } => {
+                lines.push(Line::raw(""));
+                lines.extend(compaction_indicator_line(*tokens_before, width, theme));
             }
             Entry::Assistant {
                 lines: message_lines,
@@ -508,6 +518,30 @@ struct ToolRender<'a> {
     started_at: Option<std::time::Instant>,
     nested: bool,
     focused: bool,
+}
+
+fn compaction_indicator_line(
+    tokens_before: Option<u64>,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let label = match tokens_before {
+        Some(count) => format!("Previously compacted from {} tokens", compact_number(count)),
+        None => "Previously compacted".to_string(),
+    };
+    let budget = width.saturating_sub(6);
+    let truncated: String = if label.chars().count() > budget {
+        let take = budget.saturating_sub(1);
+        let mut out: String = label.chars().take(take).collect();
+        out.push('…');
+        out
+    } else {
+        label
+    };
+    vec![Line::from(Span::styled(
+        format!("   ┊ {truncated}"),
+        Style::default().fg(theme.muted),
+    ))]
 }
 
 fn tool_group_lines(

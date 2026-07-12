@@ -8,6 +8,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types src/*.test.ts",
     "start": "node --experimental-strip-types src/index.ts",
     "smoke": "printf '{\"type\":\"health\"}\\n' | npm run --silent start"
   },

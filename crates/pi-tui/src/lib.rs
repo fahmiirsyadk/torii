@@ -1967,4 +1967,47 @@ mod tests {
         );
         assert!(output.contains("Compaction finished."));
     }
+
+    #[test]
+    fn compaction_indicator_renders_a_muted_static_line() {
+        let (width, height) = (100, 16);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::CompactionIndicator {
+            reason: "manual".into(),
+            tokens_before: Some(180_000),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(
+            output.contains("Previously compacted from 180K tokens"),
+            "indicator should show pre-compaction token count, got: {output}"
+        );
+        assert!(
+            !output.contains("Compacted context"),
+            "indicator should not look like a live compaction card"
+        );
+        assert!(
+            !output.contains("→"),
+            "indicator has no after value so should not show a delta"
+        );
+    }
+
+    #[test]
+    fn compaction_indicator_without_tokens_before_still_renders() {
+        let (width, height) = (100, 16);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::CompactionIndicator {
+            reason: "branch".into(),
+            tokens_before: None,
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("Previously compacted"));
+    }
 }

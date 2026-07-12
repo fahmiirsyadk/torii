@@ -197,6 +197,14 @@ pub enum Entry {
         active: bool,
         error: Option<String>,
     },
+    /// A slim "this session was previously compacted" line emitted on
+    /// session load for each stored compaction/branch_summary entry.
+    /// Not interactive — the user just sees the diamond glyph and the
+    /// pre-compaction token count.
+    CompactionIndicator {
+        reason: String,
+        tokens_before: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1532,6 +1540,15 @@ impl AppState {
                     tokens_after,
                     error,
                 );
+            }
+            AgentEvent::CompactionIndicator {
+                reason,
+                tokens_before,
+            } => {
+                self.entries.push(Entry::CompactionIndicator {
+                    reason,
+                    tokens_before,
+                });
             }
             AgentEvent::PermissionRequest {
                 id, tool, reason, ..

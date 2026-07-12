@@ -290,6 +290,25 @@ function projectFiles(cwd: string): string[] {
   walk(cwd);
   return output.sort();
 }
+/**
+ * The compaction summarization model sometimes copies the conversation-metadata
+ * tags it saw in prior user messages (e.g. <read-files>...</read-files>,
+ * <modified-files>...</modified-files>) into the summary text. Strip them out
+ * so the rendered compaction card is just the summary itself.
+ */
+function cleanCompactionSummary(summary: string): string {
+  const blockTags = ["read-files", "modified-files", "summary", "read_files", "modified_files"];
+  let cleaned = summary;
+  for (const tag of blockTags) {
+    const re = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`, "g");
+    cleaned = cleaned.replace(re, "");
+  }
+  // Strip orphan opening/closing tags that ended up on their own line.
+  cleaned = cleaned.replace(/^<\/?(?:read-files|modified-files|summary|read_files|modified_files)[^>]*>\s*$/gm, "");
+  // Collapse runs of more than two blank lines into two.
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+  return cleaned.trim();
+}
 
 function resultText(result: unknown): string {
   if (typeof result !== "object" || result === null || !("content" in result)) {
@@ -522,7 +541,7 @@ function handlePiEvent(active: ActiveSession, event: AgentSessionEvent): void {
         error?: string;
       } = { type: "compaction", phase: "end", reason: event.reason };
       if (event.result !== undefined) {
-        payload.summary = event.result.summary;
+        payload.summary = cleanCompactionSummary(event.result.summary);
         payload.tokens_before = event.result.tokensBefore;
         if (event.result.estimatedTokensAfter !== undefined) {
           payload.tokens_after = event.result.estimatedTokensAfter;
@@ -543,15 +562,14 @@ function loadedHistory(session: AgentSession, sessionManager: SessionManager): A
   const history = sessionHistory(sessionManager.buildSessionContext().messages);
   for (const entry of sessionManager.getEntries()) {
     if (entry.type === "compaction" || entry.type === "branch_summary") {
+      // Replay stored compaction/branch_summary entries as a slim "previously compacted"
+      // indicator rather than a fresh end event. The full summary still lives in the
+      // session context that we sent to the LLM above (via sessionHistory), so resuming
+      // a session does not lose information — but the user no longer sees a fake "new"
+      // compaction card appear at the top of the transcript on /resume.
       const reason = entry.type === "branch_summary" ? "branch" : "manual";
-      const payload: { type: "compaction"; phase: "end"; reason: string; summary: string; tokens_before?: number } = {
-        type: "compaction",
-        phase: "end",
-        reason,
-        summary: entry.summary,
-      };
-      if (entry.type === "compaction") payload.tokens_before = entry.tokensBefore;
-      history.push(payload);
+      const tokens_before = entry.type === "compaction" ? entry.tokensBefore : undefined;
+      history.push({ type: "compaction_indicator", reason, tokens_before });
     }
   }
   const savedPlan = [...sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-shell.plan");
@@ -584,7 +602,7 @@ function entryText(entry: ReturnType<SessionManager["getEntries"]>[number]): { r
         : "";
     return { role, text };
   }
-  if (entry.type === "compaction" || entry.type === "branch_summary") return { text: entry.summary };
+  if (entry.type === "compaction" || entry.type === "branch_summary") return { text: cleanCompactionSummary(entry.summary) };
   if (entry.type === "custom_message") {
     const text = typeof entry.content === "string" ? entry.content : entry.content.filter((part) => part.type === "text").map((part) => part.text).join("");
     return { role: "custom", text };
