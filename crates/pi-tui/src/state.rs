@@ -1,5 +1,6 @@
 use pi_harness::{
-    AgentEvent, ModelInfo, PermissionDecision, SessionInfo, SessionTreeEntry, ToolResult, Usage,
+    AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
+    SessionTreeEntry, ToolResult, Usage,
 };
 use std::{collections::HashSet, time::Instant};
 
@@ -10,7 +11,6 @@ const COMMANDS: &[&str] = &[
     "Cycle mode",
     "Quit",
 ];
-const SETTINGS: &[&str] = &["Appearance", "Permissions", "Input", "Terminal"];
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/model",
@@ -22,6 +22,17 @@ const SLASH_COMMANDS: &[&str] = &[
     "/tree",
     "/fork",
     "/thinking",
+    "/context",
+    "/reload",
+    "/scoped-models",
+    "/trust",
+    "/export",
+    "/import",
+    "/copy",
+    "/login",
+    "/rewind",
+    "/plan",
+    "/trace",
     "/mode",
     "/settings",
     "/clear",
@@ -39,6 +50,11 @@ pub enum OverlayKind {
     TreePicker,
     ForkPicker,
     LabelEditor,
+    FilePicker,
+    ScopedModels,
+    OauthPrompt,
+    OauthSelect,
+    RewindPicker,
     Settings,
     Permission,
 }
@@ -48,6 +64,13 @@ pub struct PendingPermission {
     pub id: String,
     pub tool: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOauth {
+    pub id: String,
+    pub message: String,
+    pub options: Vec<pi_harness::AuthChoice>,
 }
 
 #[derive(Debug)]
@@ -84,6 +107,25 @@ pub enum OverlayAction {
         label: Option<String>,
     },
     CycleThinking,
+    ReloadResources,
+    SetRuntimeSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    SetProjectTrust(bool),
+    SetScopedModels(Vec<String>),
+    ExportSession(Option<String>),
+    ImportSession(String),
+    CopyLast,
+    OauthReply {
+        id: String,
+        value: Option<String>,
+    },
+    BeginOauth(String),
+    SetPermissionMode(String),
+    LoadRewinds,
+    RewindFile(String),
+    ExportTrace(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -106,6 +148,7 @@ impl TreeFilter {
             Self::All => Self::Default,
         }
     }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -146,6 +189,13 @@ pub enum Entry {
     Assistant {
         lines: Vec<String>,
         timestamp: String,
+    },
+    Compaction {
+        summary: String,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        active: bool,
+        error: Option<String>,
     },
 }
 
@@ -193,6 +243,14 @@ impl PermissionMode {
             Self::AlwaysApprove => Self::Normal,
         }
     }
+
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Plan => "plan",
+            Self::AlwaysApprove => "always_approve",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +267,7 @@ pub struct AppState {
     pub context_limit: u64,
     pub tasks_complete: usize,
     pub tasks_total: usize,
+    pub plan_entries: Vec<pi_harness::PlanEntry>,
     pub entries: Vec<Entry>,
     pub prompt: String,
     pub cursor: usize,
@@ -229,9 +288,15 @@ pub struct AppState {
     pub overlay_query: String,
     pub overlay_selected: usize,
     pub pending_permission: Option<PendingPermission>,
+    pub pending_oauth: Option<PendingOauth>,
     pub available_models: Vec<ModelInfo>,
     pub available_sessions: Vec<SessionInfo>,
+    pub available_files: Vec<String>,
+    pub runtime_commands: Vec<RuntimeCommand>,
+    pub context_files: Vec<String>,
+    pub runtime_settings: RuntimeSettings,
     pub session_tree: Vec<SessionTreeEntry>,
+    pub rewind_checkpoints: Vec<pi_harness::RewindCheckpoint>,
     pub tree_filter: TreeFilter,
     pub tree_show_timestamps: bool,
     pub pending_label_entry: Option<String>,
@@ -248,6 +313,7 @@ impl Default for AppState {
             context_limit: 200_000,
             tasks_complete: 0,
             tasks_total: 0,
+            plan_entries: Vec::new(),
             entries: Vec::new(),
             prompt: String::new(),
             cursor: 0,
@@ -268,12 +334,18 @@ impl Default for AppState {
             overlay_query: String::new(),
             overlay_selected: 0,
             pending_permission: None,
+            pending_oauth: None,
             available_models: vec![ModelInfo {
                 id: "mock".into(),
                 display_name: "Mock model".into(),
             }],
             available_sessions: Vec::new(),
+            available_files: Vec::new(),
+            runtime_commands: Vec::new(),
+            context_files: Vec::new(),
+            runtime_settings: RuntimeSettings::default(),
             session_tree: Vec::new(),
+            rewind_checkpoints: Vec::new(),
             tree_filter: TreeFilter::default(),
             tree_show_timestamps: false,
             pending_label_entry: None,
@@ -284,14 +356,19 @@ impl Default for AppState {
 }
 
 impl AppState {
-    pub fn first_slash_match(&self) -> Option<&'static str> {
+    pub fn first_slash_match(&self) -> Option<String> {
         if !self.prompt.starts_with('/') || self.prompt.contains(char::is_whitespace) {
             return None;
         }
         let query = self.prompt.to_ascii_lowercase();
         SLASH_COMMANDS
             .iter()
-            .copied()
+            .map(|command| (*command).to_string())
+            .chain(
+                self.runtime_commands
+                    .iter()
+                    .map(|command| command.name.clone()),
+            )
             .find(|command| command.starts_with(&query))
     }
 
@@ -299,7 +376,7 @@ impl AppState {
         let Some(command) = self.first_slash_match() else {
             return false;
         };
-        self.prompt = command.to_string();
+        self.prompt = command;
         self.cursor = self.prompt.chars().count();
         self.history_index = None;
         true
@@ -329,9 +406,43 @@ impl AppState {
             "/tree" => OverlayAction::LoadTree { user_only: false },
             "/fork" => OverlayAction::LoadTree { user_only: true },
             "/thinking" => OverlayAction::CycleThinking,
+            "/reload" => OverlayAction::ReloadResources,
+            "/scoped-models" => {
+                self.open_overlay(OverlayKind::ScopedModels);
+                OverlayAction::None
+            }
+            "/trust" => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
+            "/export" => OverlayAction::ExportSession(argument.map(str::to_string)),
+            "/import" if argument.is_some() => {
+                OverlayAction::ImportSession(argument.unwrap().to_string())
+            }
+            "/copy" => OverlayAction::CopyLast,
+            "/login" if argument.is_some() => {
+                OverlayAction::BeginOauth(argument.unwrap().to_string())
+            }
+            "/rewind" => OverlayAction::LoadRewinds,
+            "/plan" => {
+                self.permission_mode = PermissionMode::Plan;
+                OverlayAction::SetPermissionMode("plan".into())
+            }
+            "/trace" => OverlayAction::ExportTrace(argument.map(str::to_string)),
+            "/context" => {
+                let lines = if self.context_files.is_empty() {
+                    vec!["No Pi context files loaded".into()]
+                } else {
+                    std::iter::once("Loaded Pi context files:".into())
+                        .chain(self.context_files.iter().map(|path| format!("• {path}")))
+                        .collect()
+                };
+                self.entries.push(Entry::Assistant {
+                    lines,
+                    timestamp: String::new(),
+                });
+                OverlayAction::None
+            }
             "/mode" => {
                 self.cycle_permission_mode();
-                OverlayAction::None
+                OverlayAction::SetPermissionMode(self.permission_mode.wire_value().into())
             }
             "/settings" => {
                 self.open_overlay(OverlayKind::Settings);
@@ -355,6 +466,23 @@ impl AppState {
         Some(action)
     }
 
+    pub fn slash_suggestions(&self) -> Vec<(String, String)> {
+        let query = self.prompt.trim_start_matches('/').to_ascii_lowercase();
+        let builtins = SLASH_COMMANDS
+            .iter()
+            .map(|name| ((*name).to_string(), builtin_description(name).to_string()));
+        builtins
+            .chain(self.runtime_commands.iter().map(|command| {
+                (
+                    command.name.clone(),
+                    format!("{} · {}", command.description, command.source),
+                )
+            }))
+            .filter(|(name, _)| name.trim_start_matches('/').starts_with(&query))
+            .take(5)
+            .collect()
+    }
+
     pub fn open_overlay(&mut self, overlay: OverlayKind) {
         self.overlay = overlay;
         self.overlay_query.clear();
@@ -366,6 +494,25 @@ impl AppState {
             self.overlay = OverlayKind::None;
             self.overlay_query.clear();
             self.overlay_selected = 0;
+        }
+    }
+
+    pub fn cancel_oauth(&mut self) -> OverlayAction {
+        if !matches!(
+            self.overlay,
+            OverlayKind::OauthPrompt | OverlayKind::OauthSelect
+        ) {
+            self.close_overlay();
+            return OverlayAction::None;
+        }
+        let Some(pending) = self.pending_oauth.take() else {
+            self.close_overlay();
+            return OverlayAction::None;
+        };
+        self.close_overlay();
+        OverlayAction::OauthReply {
+            id: pending.id,
+            value: None,
         }
     }
 
@@ -387,8 +534,73 @@ impl AppState {
                 .into_iter()
                 .map(|entry| tree_label(entry, self.tree_show_timestamps))
                 .collect(),
-            OverlayKind::Settings => SETTINGS.iter().map(|item| (*item).to_string()).collect(),
+            OverlayKind::Settings => vec![
+                format!("Steering delivery: {}", self.runtime_settings.steering_mode),
+                format!(
+                    "Follow-up delivery: {}",
+                    self.runtime_settings.follow_up_mode
+                ),
+                format!(
+                    "Auto compaction: {}",
+                    if self.runtime_settings.auto_compaction {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                format!(
+                    "Default project trust: {}",
+                    self.runtime_settings.default_project_trust
+                ),
+                format!(
+                    "Current project trusted: {}",
+                    if self.runtime_settings.project_trusted {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                ),
+                format!(
+                    "Scoped models: {}",
+                    self.runtime_settings.enabled_models.len()
+                ),
+            ],
+            OverlayKind::ScopedModels => self
+                .available_models
+                .iter()
+                .map(|model| {
+                    let mark = if self.runtime_settings.enabled_models.contains(&model.id) {
+                        "✓"
+                    } else {
+                        " "
+                    };
+                    format!("[{mark}] {}", model.display_name)
+                })
+                .collect(),
+            OverlayKind::OauthPrompt => Vec::new(),
+            OverlayKind::OauthSelect => self
+                .pending_oauth
+                .as_ref()
+                .map(|pending| {
+                    pending
+                        .options
+                        .iter()
+                        .map(|option| option.label.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            OverlayKind::RewindPicker => self
+                .rewind_checkpoints
+                .iter()
+                .map(|checkpoint| {
+                    format!(
+                        "{}  · {}  · {}",
+                        checkpoint.path, checkpoint.tool, checkpoint.timestamp
+                    )
+                })
+                .collect(),
             OverlayKind::LabelEditor => Vec::new(),
+            OverlayKind::FilePicker => self.available_files.clone(),
             OverlayKind::Permission => PERMISSION_OPTIONS
                 .iter()
                 .map(|item| (*item).to_string())
@@ -426,6 +638,11 @@ impl AppState {
                 | OverlayKind::TreePicker
                 | OverlayKind::ForkPicker
                 | OverlayKind::LabelEditor
+                | OverlayKind::FilePicker
+                | OverlayKind::ScopedModels
+                | OverlayKind::OauthPrompt
+                | OverlayKind::OauthSelect
+                | OverlayKind::RewindPicker
         ) {
             self.overlay_query.push(character);
             self.overlay_selected = 0;
@@ -438,6 +655,17 @@ impl AppState {
     }
 
     pub fn activate_overlay(&mut self) -> OverlayAction {
+        if self.overlay == OverlayKind::OauthPrompt {
+            let Some(pending) = self.pending_oauth.take() else {
+                return OverlayAction::None;
+            };
+            let value = Some(self.overlay_query.clone());
+            self.close_overlay();
+            return OverlayAction::OauthReply {
+                id: pending.id,
+                value,
+            };
+        }
         if self.overlay == OverlayKind::LabelEditor {
             let Some(entry_id) = self.pending_label_entry.take() else {
                 return OverlayAction::None;
@@ -458,6 +686,9 @@ impl AppState {
                 "Cycle mode" => {
                     self.cycle_permission_mode();
                     self.close_overlay();
+                    return OverlayAction::SetPermissionMode(
+                        self.permission_mode.wire_value().into(),
+                    );
                 }
                 "Quit" => return OverlayAction::Quit,
                 _ => {}
@@ -510,7 +741,84 @@ impl AppState {
                     }
                 };
             }
-            OverlayKind::Settings => self.close_overlay(),
+            OverlayKind::Settings => {
+                let action = match self.overlay_selected {
+                    0 => OverlayAction::SetRuntimeSetting {
+                        key: "steering_mode".into(),
+                        value: serde_json::json!(if self.runtime_settings.steering_mode == "all" {
+                            "one-at-a-time"
+                        } else {
+                            "all"
+                        }),
+                    },
+                    1 => OverlayAction::SetRuntimeSetting {
+                        key: "follow_up_mode".into(),
+                        value: serde_json::json!(
+                            if self.runtime_settings.follow_up_mode == "all" {
+                                "one-at-a-time"
+                            } else {
+                                "all"
+                            }
+                        ),
+                    },
+                    2 => OverlayAction::SetRuntimeSetting {
+                        key: "auto_compaction".into(),
+                        value: serde_json::json!(!self.runtime_settings.auto_compaction),
+                    },
+                    3 => {
+                        let next = match self.runtime_settings.default_project_trust.as_str() {
+                            "ask" => "always",
+                            "always" => "never",
+                            _ => "ask",
+                        };
+                        OverlayAction::SetRuntimeSetting {
+                            key: "default_project_trust".into(),
+                            value: serde_json::json!(next),
+                        }
+                    }
+                    4 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
+                    _ => {
+                        self.open_overlay(OverlayKind::ScopedModels);
+                        return OverlayAction::None;
+                    }
+                };
+                self.apply_runtime_setting(&action);
+                self.close_overlay();
+                return action;
+            }
+            OverlayKind::ScopedModels => {
+                let models = self.runtime_settings.enabled_models.clone();
+                self.close_overlay();
+                return OverlayAction::SetScopedModels(models);
+            }
+            OverlayKind::OauthSelect => {
+                let Some(pending) = self.pending_oauth.take() else {
+                    return OverlayAction::None;
+                };
+                let value = pending
+                    .options
+                    .iter()
+                    .find(|option| option.label == item)
+                    .map(|option| option.id.clone());
+                self.close_overlay();
+                return OverlayAction::OauthReply {
+                    id: pending.id,
+                    value,
+                };
+            }
+            OverlayKind::RewindPicker => {
+                let Some(checkpoint) = self.rewind_checkpoints.iter().find(|checkpoint| {
+                    format!(
+                        "{}  · {}  · {}",
+                        checkpoint.path, checkpoint.tool, checkpoint.timestamp
+                    ) == item
+                }) else {
+                    return OverlayAction::None;
+                };
+                let id = checkpoint.id.clone();
+                self.close_overlay();
+                return OverlayAction::RewindFile(id);
+            }
             OverlayKind::Permission => {
                 let decision = match item.as_str() {
                     "Always allow" => PermissionDecision::AllowAlways,
@@ -525,9 +833,54 @@ impl AppState {
                     };
                 }
             }
-            OverlayKind::LabelEditor | OverlayKind::None => {}
+            OverlayKind::OauthPrompt | OverlayKind::LabelEditor | OverlayKind::None => {}
+            OverlayKind::FilePicker => {
+                self.insert_file_reference(&item);
+                self.close_overlay();
+            }
         }
         OverlayAction::None
+    }
+
+    pub fn toggle_scoped_model(&mut self) {
+        if self.overlay != OverlayKind::ScopedModels {
+            return;
+        }
+        let Some(model) = self.available_models.get(self.overlay_selected) else {
+            return;
+        };
+        if let Some(index) = self
+            .runtime_settings
+            .enabled_models
+            .iter()
+            .position(|id| id == &model.id)
+        {
+            self.runtime_settings.enabled_models.remove(index);
+        } else {
+            self.runtime_settings.enabled_models.push(model.id.clone());
+        }
+    }
+
+    fn apply_runtime_setting(&mut self, action: &OverlayAction) {
+        match action {
+            OverlayAction::SetRuntimeSetting { key, value } if key == "steering_mode" => {
+                self.runtime_settings.steering_mode = value.as_str().unwrap_or_default().into()
+            }
+            OverlayAction::SetRuntimeSetting { key, value } if key == "follow_up_mode" => {
+                self.runtime_settings.follow_up_mode = value.as_str().unwrap_or_default().into()
+            }
+            OverlayAction::SetRuntimeSetting { key, value } if key == "auto_compaction" => {
+                self.runtime_settings.auto_compaction = value.as_bool().unwrap_or(false)
+            }
+            OverlayAction::SetRuntimeSetting { key, value } if key == "default_project_trust" => {
+                self.runtime_settings.default_project_trust =
+                    value.as_str().unwrap_or_default().into()
+            }
+            OverlayAction::SetProjectTrust(trusted) => {
+                self.runtime_settings.project_trusted = *trusted
+            }
+            _ => {}
+        }
     }
 
     pub fn cycle_tree_filter(&mut self) {
@@ -556,6 +909,14 @@ impl AppState {
         self.overlay_query = label;
         self.overlay = OverlayKind::LabelEditor;
         self.overlay_selected = 0;
+    }
+
+    fn insert_file_reference(&mut self, path: &str) {
+        let byte = char_to_byte(&self.prompt, self.cursor);
+        self.prompt.insert_str(byte, path);
+        self.prompt.insert(byte + path.len(), ' ');
+        self.cursor += path.chars().count() + 1;
+        self.focus = Focus::Prompt;
     }
 
     pub fn activate_tree_with_summary(&mut self) -> OverlayAction {
@@ -836,6 +1197,23 @@ impl AppState {
         Some(prompt)
     }
 
+    pub fn submit_bash(&mut self) -> Option<(String, bool)> {
+        let input = self.prompt.trim();
+        if !input.starts_with('!') {
+            return None;
+        }
+        let exclude = input.starts_with("!!");
+        let command = input.trim_start_matches('!').trim().to_string();
+        if command.is_empty() {
+            return None;
+        }
+        self.prompt_history.push(self.prompt.clone());
+        self.clear_prompt();
+        self.scroll_to_bottom();
+        self.status = "running shell…".into();
+        Some((command, exclude))
+    }
+
     fn load_history(&mut self, index: usize) {
         self.prompt.clone_from(&self.prompt_history[index]);
         self.cursor = self.prompt.chars().count();
@@ -905,6 +1283,68 @@ impl AppState {
                 if count > 0 {
                     self.status = format!("{count} queued");
                 }
+            }
+            AgentEvent::ResourcesChanged { resources } => {
+                self.runtime_commands = resources.commands;
+                self.context_files = resources.context_files;
+                self.status = "resources reloaded".into();
+            }
+            AgentEvent::OauthRequest {
+                id,
+                kind,
+                message,
+                url,
+                user_code,
+                verification_uri,
+                options,
+                ..
+            } => {
+                if kind == "auth" || kind == "device_code" {
+                    let summary = if kind == "auth" {
+                        format!(
+                            "Open this URL to authenticate:\n{}",
+                            url.unwrap_or_default()
+                        )
+                    } else {
+                        format!(
+                            "Open {} and enter code {}",
+                            verification_uri.unwrap_or_default(),
+                            user_code.unwrap_or_default()
+                        )
+                    };
+                    self.entries.push(Entry::Assistant {
+                        lines: vec![summary],
+                        timestamp: String::new(),
+                    });
+                } else {
+                    self.pending_oauth = Some(PendingOauth {
+                        id,
+                        message: message.unwrap_or_else(|| "OAuth input".into()),
+                        options: options.unwrap_or_default(),
+                    });
+                    self.open_overlay(if kind == "select" {
+                        OverlayKind::OauthSelect
+                    } else {
+                        OverlayKind::OauthPrompt
+                    });
+                }
+            }
+            AgentEvent::OauthComplete { provider } => {
+                self.status = format!("logged in to {provider}");
+                self.close_overlay();
+            }
+            AgentEvent::RewindList { checkpoints } => {
+                self.rewind_checkpoints = checkpoints;
+                self.open_overlay(OverlayKind::RewindPicker);
+            }
+            AgentEvent::PlanUpdate { entries } => {
+                self.tasks_total = entries.len();
+                self.tasks_complete = entries
+                    .iter()
+                    .filter(|entry| entry.status == "completed")
+                    .count();
+                self.plan_entries = entries;
+                self.status = "plan updated".into();
             }
             AgentEvent::SessionTree { entries, user_only } => {
                 self.session_tree = entries;
@@ -1075,6 +1515,24 @@ impl AppState {
                 self.status = "error".into();
                 self.streaming = false;
             }
+            AgentEvent::Compaction {
+                phase,
+                reason,
+                summary,
+                tokens_before,
+                tokens_after,
+                error,
+            } => {
+                apply_compaction(
+                    self,
+                    phase,
+                    reason,
+                    summary,
+                    tokens_before,
+                    tokens_after,
+                    error,
+                );
+            }
             AgentEvent::PermissionRequest {
                 id, tool, reason, ..
             } => {
@@ -1083,6 +1541,38 @@ impl AppState {
             }
             _ => {}
         }
+    }
+}
+
+fn builtin_description(command: &str) -> &'static str {
+    match command {
+        "/model" => "Switch model",
+        "/resume" => "Resume a saved session",
+        "/new" => "Start a new session",
+        "/name" => "Name the current session",
+        "/session" => "Show session statistics",
+        "/clone" => "Clone the active branch",
+        "/tree" => "Navigate session history",
+        "/fork" => "Fork from an earlier prompt",
+        "/thinking" => "Cycle thinking level",
+        "/context" => "Show loaded context files",
+        "/reload" => "Reload Pi resources",
+        "/scoped-models" => "Choose models for cycling",
+        "/trust" => "Save project trust decision",
+        "/export" => "Export session to HTML",
+        "/import" => "Import a JSONL session",
+        "/copy" => "Copy last assistant message",
+        "/login" => "Log in to an OAuth provider",
+        "/rewind" => "Restore a file edit checkpoint",
+        "/plan" => "Enter Plan mode",
+        "/trace" => "Export session trace archive",
+        "/mode" => "Cycle permission mode",
+        "/settings" => "Open settings",
+        "/clear" => "Clear visible conversation",
+        "/compact" => "Compact context",
+        "/help" => "Show commands",
+        "/quit" => "Quit pi-shell",
+        _ => "Built-in command",
     }
 }
 
@@ -1147,7 +1637,8 @@ fn tool_display(name: &str, args: &serde_json::Value) -> (String, String) {
         "read" => "Read".to_string(),
         "edit" => "Edit".to_string(),
         "write" => "Write".to_string(),
-        "search" | "grep" => "Search".to_string(),
+        "search" | "grep" | "web_search" => "Search".to_string(),
+        "web_fetch" => "Fetch".to_string(),
         "agent" | "spawn_agent" => "Agent".to_string(),
         "get_subagent_result" => "Agent result".to_string(),
         _ => {
@@ -1291,4 +1782,74 @@ fn background_agent_id(result: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn apply_compaction(
+    state: &mut AppState,
+    phase: pi_harness::CompactionPhase,
+    reason: Option<String>,
+    summary: Option<String>,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    error: Option<String>,
+) {
+    let reason_label = reason
+        .as_deref()
+        .map(|value| match value {
+            "manual" => "manual",
+            "threshold" => "auto (threshold)",
+            "overflow" => "auto (overflow)",
+            "branch" => "branch summary",
+            other => other,
+        })
+        .unwrap_or("compaction");
+    match phase {
+        pi_harness::CompactionPhase::Start => {
+            state.entries.push(Entry::Compaction {
+                summary: format!("Compacting context ({reason_label})…"),
+                tokens_before,
+                tokens_after: None,
+                active: true,
+                error: None,
+            });
+            state.status = "compacting…".into();
+        }
+        pi_harness::CompactionPhase::End => {
+            let final_summary = summary.unwrap_or_else(|| match &error {
+                Some(message) => format!("Compaction failed: {message}"),
+                None => "Compaction finished without a summary.".to_string(),
+            });
+            let latest_error = error.clone();
+            if let Some(Entry::Compaction {
+                summary: slot,
+                tokens_after: slot_after,
+                active,
+                error: slot_error,
+                ..
+            }) = state.entries.iter_mut().rev().find(|entry| {
+                matches!(entry, Entry::Compaction { active: true, .. })
+            }) {
+                *slot = final_summary;
+                *slot_after = tokens_after.or(tokens_before);
+                *slot_error = error;
+                *active = false;
+            } else {
+                state.entries.push(Entry::Compaction {
+                    summary: final_summary,
+                    tokens_before,
+                    tokens_after: tokens_after.or(tokens_before),
+                    active: false,
+                    error,
+                });
+            }
+            if let Some(after) = tokens_after {
+                state.context_used = after;
+            }
+            state.status = if latest_error.is_some() {
+                "compaction failed".into()
+            } else {
+                "compacted".into()
+            };
+        }
+    }
 }

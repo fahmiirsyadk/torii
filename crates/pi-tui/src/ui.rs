@@ -49,6 +49,24 @@ pub fn tool_hit_at(
             } => {
                 row += diff_render_lines(path, lines, *expanded, width, Theme::GROK_NIGHT).len();
             }
+            Entry::Compaction {
+                summary,
+                tokens_before,
+                tokens_after,
+                active,
+                error,
+            } => {
+                row += compaction_lines(
+                    summary,
+                    *tokens_before,
+                    *tokens_after,
+                    *active,
+                    error.as_deref(),
+                    width,
+                    Theme::GROK_NIGHT,
+                )
+                .len();
+            }
             Entry::Assistant { lines, .. } => {
                 row += markdown::render(lines, width, Theme::GROK_NIGHT).len() + 1;
             }
@@ -144,6 +162,22 @@ pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
                 index += consumed.saturating_sub(1);
                 lines.len()
             }
+            Entry::Compaction {
+                summary,
+                tokens_before,
+                tokens_after,
+                active,
+                error,
+            } => compaction_lines(
+                summary,
+                *tokens_before,
+                *tokens_after,
+                *active,
+                error.as_deref(),
+                content_width,
+                Theme::GROK_NIGHT,
+            )
+            .len(),
             Entry::Assistant { lines, .. } => {
                 markdown::render(lines, content_width, Theme::GROK_NIGHT).len() + 1
             }
@@ -215,6 +249,24 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 let (rendered, consumed) = tool_group_lines(state, entry_index, width, theme);
                 lines.extend(rendered);
                 entry_index += consumed.saturating_sub(1);
+            }
+            Entry::Compaction {
+                summary,
+                tokens_before,
+                tokens_after,
+                active,
+                error,
+            } => {
+                lines.push(Line::raw(""));
+                lines.extend(compaction_lines(
+                    summary,
+                    *tokens_before,
+                    *tokens_after,
+                    *active,
+                    error.as_deref(),
+                    width,
+                    theme,
+                ));
             }
             Entry::Assistant {
                 lines: message_lines,
@@ -330,6 +382,62 @@ pub(crate) fn scrollbar_geometry(
         .saturating_mul(max_thumb_start)
         .div_ceil(max_scroll);
     Some((thumb_start, thumb_length))
+}
+
+fn compaction_lines(
+    summary: &str,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    active: bool,
+    error: Option<&str>,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let glyph = if active { "◌" } else if error.is_some() { "✕" } else { "◆" };
+    let title = if active {
+        "Compacting context…".to_string()
+    } else if error.is_some() {
+        "Compaction failed".to_string()
+    } else {
+        "Compacted context".to_string()
+    };
+    let mut header = vec![Line::from(vec![
+        Span::styled(
+            format!("{glyph} {title}"),
+            Style::default().fg(if error.is_some() { theme.error } else { theme.accent }),
+        ),
+    ])];
+    if let (Some(before), Some(after)) = (tokens_before, tokens_after) {
+        header.push(Line::from(Span::styled(
+            format!("   {} → {} tokens", compact_number(before), compact_number(after)),
+            Style::default().fg(theme.muted),
+        )));
+    } else if let Some(before) = tokens_before {
+        header.push(Line::from(Span::styled(
+            format!("   {} tokens before", compact_number(before)),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    let wrap_width = width.saturating_sub(4);
+    let body_lines: Vec<Line<'static>> = if !summary.is_empty() {
+        markdown::wrap(summary, wrap_width)
+            .into_iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    format!("   {line}"),
+                    Style::default().fg(theme.foreground),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut lines = header;
+    lines.extend(body_lines);
+    if !active {
+        lines.push(Line::raw(""));
+    }
+    lines
 }
 
 fn reasoning_lines(
@@ -813,10 +921,7 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
             " ↑/↓: scroll  │  e: reasoning  │  t: tool  │  d: diff  │  Tab: prompt"
         }
     };
-    let line = Line::from(Span::styled(
-        left,
-        Style::default().fg(theme.foreground),
-    ));
+    let line = Line::from(Span::styled(left, Style::default().fg(theme.foreground)));
     frame.render_widget(Paragraph::new(line), area);
 }
 

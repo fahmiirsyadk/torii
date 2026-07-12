@@ -91,9 +91,12 @@ cargo run -p pi-shell -- logout opencode-go
 With no provider argument, `login` shows an interactive provider chooser. API
 keys are read only from an interactive terminal, displayed as bullets, and
 persisted by Pi's `AuthStorage` in its normal `auth.json` store. They are never
-accepted as command-line arguments. OAuth providers are identified in the
-chooser but currently direct you to official Pi's `/login` flow until the
-browser/device callback bridge is implemented.
+accepted as command-line arguments.
+
+OAuth providers now use Pi's native login implementation. Browser URLs and
+device codes are shown without forcing a GUI launch; prompt and selection
+callbacks round-trip through the sidecar in both the CLI and TUI. TUI OAuth
+values are masked. Use `pi login <provider>` or `/login <provider>`.
 
 Pi's SDK creates settings lock files under `~/.pi/agent`. In restricted
 containers, that directory must be writable or Pi will load an empty settings
@@ -124,6 +127,37 @@ deletion, prompt history, and mouse/Tab focus switching. Press Enter to submit
 to the mock harness, Shift+Tab to cycle permission mode, Ctrl+C to clear the
 draft, and Ctrl+Q to quit.
 
+Typing `@` opens a fuzzy project-file picker and inserts the selected reference
+at the cursor. Inputs beginning with `!` execute immediately through Pi's bash
+executor and persist their output in model context; `!!` runs the same command
+but marks its persisted `BashExecutionMessage` as excluded from model context.
+
+Slash completion also includes Pi's live extension commands, prompt templates,
+and `/skill:name` entries. `/context` lists the project context files loaded by
+Pi, and `/reload` reloads extensions, skills, prompts, themes, and context files
+then refreshes completion without restarting pi-shell.
+The sidecar is built around Pi's `AgentSessionRuntime`, so extension command
+contexts and lifecycle hooks are rebound after resume, new, clone, fork,
+import, tree navigation, and resource reload rather than disappearing after a
+session replacement.
+
+`/settings` now edits Pi's persisted steering and follow-up delivery modes,
+automatic compaction, and default project-trust policy. `/scoped-models` selects
+the models used for cycling and persists them through Pi settings. `/trust`
+toggles the current directory in Pi's `trust.json`; as in official Pi, restart
+or reload is required before newly trusted project extensions become active.
+
+Session portability commands use Pi directly: `/export [file]` writes the
+current session as HTML, `/import <file.jsonl>` copies an imported JSONL branch
+into the current project and switches to it, and `/copy` copies the latest
+assistant text through Pi's platform clipboard helper.
+
+Package commands delegate to the pinned official Pi CLI, preserving Pi's
+package manifests, project-trust checks, npm/git installation, filtering, and
+update behavior: `pi install`, `pi remove`/`uninstall`, `pi update`, `pi list`,
+and `pi config`. Set `PI_SHELL_PI_CLI` only when using a nonstandard sidecar
+installation.
+
 While Pi is working, Enter queues a steering message and Alt+Enter queues a
 follow-up. Escape aborts the active operation, clears Pi's queue, and restores
 queued text to the composer. Ctrl+T or `/thinking` cycles the current model's
@@ -152,6 +186,32 @@ Use Ctrl+P for the searchable command palette, Ctrl+M for the model picker,
 and F2 for settings. Typing `/` opens slash-command suggestions. Permission
 requests open a blocking modal with Allow once, Always allow, and Deny choices;
 the current composer draft remains intact while overlays are open.
+An inline Pi `tool_call` extension enforces the modal: `bash`, `write`, and
+`edit` pause before execution. Deny blocks the tool, Allow once resumes it, and
+Always allow remembers the exact tool/argument pattern for the process lifetime.
+
+Successful `write` and `edit` calls also append Grok-style file checkpoints as
+Pi custom session entries. `/rewind` lists checkpoints across restarts and
+restores the exact pre-edit file contents (or removes a file created by the
+original write) without changing the conversation branch.
+
+The Grok capability extension registers `web_fetch` and `web_search` as native
+Pi tools. Fetch accepts only HTTP(S), converts HTML to bounded readable text,
+and honors cancellation. Search uses Brave when `BRAVE_SEARCH_API_KEY` is set
+and otherwise falls back to DuckDuckGo HTML results. Both flow through the
+normal grouped/timed tool renderer.
+
+MCP servers can be configured in `~/.pi/agent/mcp.json` or a trusted project's
+`.mcp.json` using the common `{ "mcpServers": { ... } }` shape. Entries may use
+`command`/`args`/`env` for stdio or `url` with optional `type: "sse"` for SSE;
+other URLs use Streamable HTTP. Discovered tools are registered as
+`mcp__<server>__<tool>`, and clients reconnect cleanly on `/reload`. Project MCP
+processes are never launched before Pi marks the project trusted.
+
+`/plan` enters an enforced read-only Plan mode. The bundled `update_plan` tool
+lets the model publish pending, in-progress, and completed steps; updates are
+stored as Pi custom entries, restored on resume, and summarized as progress in
+the header. At most one step may be in progress.
 
 The official Pi SDK is TypeScript. The next slice adds a small Node sidecar
 that converts Pi SDK events to the `AgentEvent` JSONL protocol consumed by

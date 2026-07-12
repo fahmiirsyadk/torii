@@ -13,6 +13,9 @@ use std::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if is_package_command(&args) {
+        return delegate_pi_package_command(&args);
+    }
     let headless = args.iter().any(|arg| arg == "--headless");
     let prompt = args
         .iter()
@@ -106,6 +109,12 @@ async fn main() -> Result<()> {
     } else {
         let models = harness.list_models().await.unwrap_or_default();
         let sessions = harness.list_sessions(&session).await.unwrap_or_default();
+        let files = harness.list_files(&session).await.unwrap_or_default();
+        let resources = harness
+            .runtime_resources(&session)
+            .await
+            .unwrap_or_default();
+        let settings = harness.runtime_settings(&session).await.unwrap_or_default();
         let (commands, mut submitted) = tokio::sync::mpsc::unbounded_channel();
         let command_harness = Arc::clone(&harness);
         let command_session = session.clone();
@@ -180,13 +189,121 @@ async fn main() -> Result<()> {
                         let _ = command_harness.cancel(&command_session).await;
                         let _ = command_harness.clear_queue(&command_session).await;
                     }
+                    pi_tui::UiCommand::ExecuteBash {
+                        command,
+                        exclude_from_context,
+                    } => {
+                        let _ = command_harness
+                            .execute_bash(&command_session, command, exclude_from_context)
+                            .await;
+                    }
+                    pi_tui::UiCommand::ReloadResources => {
+                        let _ = command_harness.reload_resources(&command_session).await;
+                        let _ = command_harness.runtime_resources(&command_session).await;
+                    }
+                    pi_tui::UiCommand::SetRuntimeSetting { key, value } => {
+                        let _ = command_harness
+                            .set_runtime_setting(&command_session, key, value)
+                            .await;
+                    }
+                    pi_tui::UiCommand::SetProjectTrust(trusted) => {
+                        let _ = command_harness
+                            .set_project_trust(&command_session, trusted)
+                            .await;
+                    }
+                    pi_tui::UiCommand::SetScopedModels(models) => {
+                        let _ = command_harness
+                            .set_scoped_models(&command_session, models)
+                            .await;
+                    }
+                    pi_tui::UiCommand::ExportSession(path) => {
+                        let _ = command_harness.export_session(&command_session, path).await;
+                    }
+                    pi_tui::UiCommand::ImportSession(path) => {
+                        let _ = command_harness.import_session(&command_session, path).await;
+                    }
+                    pi_tui::UiCommand::CopyLast => {
+                        let _ = command_harness.copy_last(&command_session).await;
+                    }
+                    pi_tui::UiCommand::BeginOauth(provider) => {
+                        let _ = command_harness
+                            .begin_oauth(&command_session, provider)
+                            .await;
+                    }
+                    pi_tui::UiCommand::OauthReply { id, value } => {
+                        let _ = command_harness
+                            .reply_oauth(&command_session, id, value)
+                            .await;
+                    }
+                    pi_tui::UiCommand::SetPermissionMode(mode) => {
+                        let _ = command_harness
+                            .set_permission_mode(&command_session, mode)
+                            .await;
+                    }
+                    pi_tui::UiCommand::LoadRewinds => {
+                        let _ = command_harness.list_rewinds(&command_session).await;
+                    }
+                    pi_tui::UiCommand::RewindFile(checkpoint_id) => {
+                        let _ = command_harness
+                            .rewind_file(&command_session, checkpoint_id)
+                            .await;
+                    }
+                    pi_tui::UiCommand::ExportTrace(path) => {
+                        let _ = command_harness.export_trace(&command_session, path).await;
+                    }
                 }
             }
         });
-        pi_tui::run(events, commands, models, sessions, open_resume).await?;
+        pi_tui::run(
+            events,
+            commands,
+            pi_tui::TuiBootstrap {
+                models,
+                sessions,
+                files,
+                resources,
+                settings,
+                open_resume,
+            },
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+fn is_package_command(args: &[String]) -> bool {
+    args.first().is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "install" | "remove" | "uninstall" | "update" | "list" | "config"
+        )
+    })
+}
+
+fn delegate_pi_package_command(args: &[String]) -> Result<()> {
+    let cli = std::env::var_os("PI_SHELL_PI_CLI")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../sidecar/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
+        });
+    if !cli.is_file() {
+        return Err(anyhow::anyhow!(
+            "Pi package CLI not found at {}; run npm install in sidecar/ or set PI_SHELL_PI_CLI",
+            cli.display()
+        ));
+    }
+    let status = std::process::Command::new("node")
+        .arg(cli)
+        .args(args)
+        .status()
+        .context("failed to launch Pi package manager")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Pi package command exited with {status}"))
+    }
 }
 
 async fn login(requested_provider: Option<&str>) -> Result<()> {
@@ -203,10 +320,76 @@ async fn login(requested_provider: Option<&str>) -> Result<()> {
     };
 
     if provider.auth_type == "oauth" {
-        return Err(anyhow::anyhow!(
-            "{} uses OAuth; use the official Pi /login flow until OAuth callbacks are bridged",
-            provider.display_name
-        ));
+        let mut events = harness.subscribe(&session)?;
+        harness.begin_oauth(&session, provider.id.clone()).await?;
+        loop {
+            match events.recv().await? {
+                AgentEvent::OauthRequest {
+                    id,
+                    kind,
+                    message,
+                    url,
+                    user_code,
+                    verification_uri,
+                    options,
+                    ..
+                } => match kind.as_str() {
+                    "auth" => {
+                        println!(
+                            "Open this URL to authenticate:\n{}",
+                            url.unwrap_or_default()
+                        );
+                    }
+                    "device_code" => {
+                        println!(
+                            "Open {} and enter code {}",
+                            verification_uri.unwrap_or_default(),
+                            user_code.unwrap_or_default()
+                        );
+                    }
+                    "prompt" => {
+                        print!("{} ", message.unwrap_or_else(|| "OAuth value:".into()));
+                        io::stdout().flush()?;
+                        let mut value = String::new();
+                        io::stdin().read_line(&mut value)?;
+                        harness
+                            .reply_oauth(&session, id, Some(value.trim().into()))
+                            .await?;
+                    }
+                    "select" => {
+                        println!(
+                            "{}",
+                            message.unwrap_or_else(|| "Select authentication method:".into())
+                        );
+                        let choices = options.unwrap_or_default();
+                        for (index, choice) in choices.iter().enumerate() {
+                            println!("{}. {}", index + 1, choice.label);
+                        }
+                        print!("Selection: ");
+                        io::stdout().flush()?;
+                        let mut value = String::new();
+                        io::stdin().read_line(&mut value)?;
+                        let selected = value
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|index| choices.get(index.saturating_sub(1)))
+                            .map(|choice| choice.id.clone());
+                        harness.reply_oauth(&session, id, selected).await?;
+                    }
+                    _ => {}
+                },
+                AgentEvent::OauthComplete { provider } => {
+                    println!("OAuth login complete for {provider}");
+                    return Ok(());
+                }
+                AgentEvent::Error {
+                    kind: pi_harness::AgentErrorKind::Authentication,
+                    message,
+                } => return Err(anyhow::anyhow!(message)),
+                _ => {}
+            }
+        }
     }
     let key = read_masked_key(&provider.display_name)?;
     if key.is_empty() {
@@ -395,5 +578,14 @@ mod tests {
         assert!(session_persistence(&args(&["--fork"])).is_err());
         assert!(session_persistence(&args(&["--continue", "--no-session"])).is_err());
         assert!(session_persistence(&args(&["--session", "one", "--fork", "two"])).is_err());
+    }
+
+    #[test]
+    fn recognizes_official_pi_package_commands_only() {
+        for command in ["install", "remove", "uninstall", "update", "list", "config"] {
+            assert!(is_package_command(&args(&[command])));
+        }
+        assert!(!is_package_command(&args(&["login"])));
+        assert!(!is_package_command(&args(&["--check-pi"])));
     }
 }

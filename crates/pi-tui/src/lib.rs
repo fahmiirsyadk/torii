@@ -55,6 +55,29 @@ pub enum UiCommand {
     },
     CycleThinking,
     AbortAndRestoreQueue,
+    ExecuteBash {
+        command: String,
+        exclude_from_context: bool,
+    },
+    ReloadResources,
+    SetRuntimeSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    SetProjectTrust(bool),
+    SetScopedModels(Vec<String>),
+    ExportSession(Option<String>),
+    ImportSession(String),
+    CopyLast,
+    BeginOauth(String),
+    OauthReply {
+        id: String,
+        value: Option<String>,
+    },
+    SetPermissionMode(String),
+    LoadRewinds,
+    RewindFile(String),
+    ExportTrace(Option<String>),
 }
 
 struct TerminalGuard;
@@ -74,13 +97,28 @@ impl Drop for TerminalGuard {
     }
 }
 
+pub struct TuiBootstrap {
+    pub models: Vec<pi_harness::ModelInfo>,
+    pub sessions: Vec<pi_harness::SessionInfo>,
+    pub files: Vec<String>,
+    pub resources: pi_harness::RuntimeResources,
+    pub settings: pi_harness::RuntimeSettings,
+    pub open_resume: bool,
+}
+
 pub async fn run(
     events: broadcast::Receiver<pi_harness::AgentEvent>,
     commands: mpsc::UnboundedSender<UiCommand>,
-    models: Vec<pi_harness::ModelInfo>,
-    sessions: Vec<pi_harness::SessionInfo>,
-    open_resume: bool,
+    bootstrap: TuiBootstrap,
 ) -> Result<()> {
+    let TuiBootstrap {
+        models,
+        sessions,
+        files,
+        resources,
+        settings,
+        open_resume,
+    } = bootstrap;
     let mut state = AppState::default();
     if let Ok(cwd) = std::env::current_dir() {
         state.cwd = display_path(&cwd);
@@ -90,6 +128,10 @@ pub async fn run(
         state.available_models = models;
     }
     state.available_sessions = sessions;
+    state.available_files = files;
+    state.runtime_commands = resources.commands;
+    state.context_files = resources.context_files;
+    state.runtime_settings = settings;
     if open_resume {
         state.open_overlay(OverlayKind::SessionPicker);
     }
@@ -150,9 +192,17 @@ async fn run_app(
                         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break;
                         }
-                        KeyCode::Esc => state.close_overlay(),
+                        KeyCode::Esc => {
+                            let action = state.cancel_oauth();
+                            if dispatch_overlay_action(action, &commands) {
+                                break;
+                            }
+                        }
                         KeyCode::Up => state.move_overlay_selection(-1),
                         KeyCode::Down => state.move_overlay_selection(1),
+                        KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
+                            state.toggle_scoped_model();
+                        }
                         KeyCode::Char('o')
                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                 && matches!(
@@ -221,7 +271,14 @@ async fn run_app(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.clear_prompt();
                     }
-                    KeyCode::BackTab => state.cycle_permission_mode(),
+                    KeyCode::BackTab => {
+                        state.cycle_permission_mode();
+                        if let Some(sender) = &commands {
+                            let _ = sender.send(UiCommand::SetPermissionMode(
+                                state.permission_mode.wire_value().into(),
+                            ));
+                        }
+                    }
                     KeyCode::Tab => {
                         if state.focus != Focus::Prompt || !state.complete_slash_command() {
                             state.toggle_focus();
@@ -231,6 +288,15 @@ async fn run_app(
                         if let Some(action) = state.activate_slash_command() {
                             if dispatch_overlay_action(action, &commands) {
                                 break;
+                            }
+                        } else if state.prompt.trim_start().starts_with('!') {
+                            if let Some((command, exclude_from_context)) = state.submit_bash()
+                                && let Some(sender) = &commands
+                            {
+                                let _ = sender.send(UiCommand::ExecuteBash {
+                                    command,
+                                    exclude_from_context,
+                                });
                             }
                         } else if let Some(prompt) = state.submit_prompt()
                             && let Some(sender) = &commands
@@ -303,6 +369,9 @@ async fn run_app(
                     {
                         state.focus_prompt();
                         state.insert_char(character);
+                        if character == '@' && !state.available_files.is_empty() {
+                            state.open_overlay(OverlayKind::FilePicker);
+                        }
                     }
                     _ => {}
                 },
@@ -456,6 +525,84 @@ fn dispatch_overlay_action(
             }
             false
         }
+        OverlayAction::ReloadResources => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::ReloadResources);
+            }
+            false
+        }
+        OverlayAction::SetRuntimeSetting { key, value } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetRuntimeSetting { key, value });
+            }
+            false
+        }
+        OverlayAction::SetProjectTrust(trusted) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetProjectTrust(trusted));
+            }
+            false
+        }
+        OverlayAction::SetScopedModels(models) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetScopedModels(models));
+            }
+            false
+        }
+        OverlayAction::ExportSession(path) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::ExportSession(path));
+            }
+            false
+        }
+        OverlayAction::ImportSession(path) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::ImportSession(path));
+            }
+            false
+        }
+        OverlayAction::CopyLast => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::CopyLast);
+            }
+            false
+        }
+        OverlayAction::BeginOauth(provider) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::BeginOauth(provider));
+            }
+            false
+        }
+        OverlayAction::OauthReply { id, value } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::OauthReply { id, value });
+            }
+            false
+        }
+        OverlayAction::SetPermissionMode(mode) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetPermissionMode(mode));
+            }
+            false
+        }
+        OverlayAction::LoadRewinds => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::LoadRewinds);
+            }
+            false
+        }
+        OverlayAction::RewindFile(checkpoint_id) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::RewindFile(checkpoint_id));
+            }
+            false
+        }
+        OverlayAction::ExportTrace(path) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::ExportTrace(path));
+            }
+            false
+        }
     }
 }
 
@@ -545,6 +692,31 @@ mod tests {
         state.delete();
         assert_eq!(state.prompt, "a");
         assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn file_reference_picker_and_bash_prefixes_match_pi_input_semantics() {
+        let mut state = super::AppState {
+            prompt: "inspect @".into(),
+            cursor: 9,
+            available_files: vec!["src/main.rs".into(), "README.md".into()],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::FilePicker);
+        state.overlay_query = "main".into();
+        assert_eq!(state.overlay_items(), vec!["src/main.rs"]);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.prompt, "inspect @src/main.rs ");
+
+        state.prompt = "! cargo test".into();
+        state.cursor = state.prompt.chars().count();
+        assert_eq!(state.submit_bash(), Some(("cargo test".into(), false)));
+        state.prompt = "!! git status".into();
+        state.cursor = state.prompt.chars().count();
+        assert_eq!(state.submit_bash(), Some(("git status".into(), true)));
     }
 
     #[test]
@@ -1042,14 +1214,15 @@ mod tests {
 
         assert_eq!(state.entries.len(), 1);
         match &state.entries[0] {
-            super::state::Entry::Diff { path, lines, expanded } => {
+            super::state::Entry::Diff {
+                path,
+                lines,
+                expanded,
+            } => {
                 assert_eq!(path, "src/lib.rs");
                 assert!(*expanded, "edit diffs default to expanded");
                 assert_eq!(lines.len(), 2);
-                assert!(matches!(
-                    lines[0].kind,
-                    super::state::DiffKind::Removed
-                ));
+                assert!(matches!(lines[0].kind, super::state::DiffKind::Removed));
                 assert_eq!(lines[0].text, "let border = theme.border;");
                 assert!(matches!(lines[1].kind, super::state::DiffKind::Added));
                 assert_eq!(lines[1].text, "let border = focused_border(state, theme);");
@@ -1413,6 +1586,158 @@ mod tests {
     }
 
     #[test]
+    fn pi_runtime_commands_and_context_files_feed_completion() {
+        let mut state = super::AppState {
+            prompt: "/dep".into(),
+            cursor: 4,
+            runtime_commands: vec![pi_harness::RuntimeCommand {
+                name: "/deploy".into(),
+                description: "Deploy preview".into(),
+                source: "extension".into(),
+            }],
+            context_files: vec!["/project/AGENTS.md".into()],
+            ..super::AppState::default()
+        };
+        assert!(state.complete_slash_command());
+        assert_eq!(state.prompt, "/deploy");
+
+        state.prompt = "/context".into();
+        assert!(state.activate_slash_command().is_some());
+        assert!(
+            matches!(state.entries.last(), Some(super::state::Entry::Assistant { lines, .. }) if lines.iter().any(|line| line.contains("AGENTS.md")))
+        );
+
+        state.prompt = "/reload".into();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::ReloadResources)
+        ));
+    }
+
+    #[test]
+    fn settings_and_scoped_models_return_persistent_pi_actions() {
+        let mut state = super::AppState {
+            available_models: vec![
+                pi_harness::ModelInfo {
+                    id: "one/a".into(),
+                    display_name: "Model A".into(),
+                },
+                pi_harness::ModelInfo {
+                    id: "two/b".into(),
+                    display_name: "Model B".into(),
+                },
+            ],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::Settings);
+        assert!(state.overlay_items()[0].contains("one-at-a-time"));
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::SetRuntimeSetting { key, value } if key == "steering_mode" && value == serde_json::json!("all"))
+        );
+
+        state.open_overlay(super::OverlayKind::ScopedModels);
+        state.toggle_scoped_model();
+        assert_eq!(state.runtime_settings.enabled_models, vec!["one/a"]);
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::SetScopedModels(models) if models == vec!["one/a"])
+        );
+
+        state.prompt = "/trust".into();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::SetProjectTrust(true))
+        ));
+    }
+
+    #[test]
+    fn oauth_callbacks_round_trip_through_tui_overlays() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::OauthRequest {
+            id: "oauth-1".into(),
+            kind: "select".into(),
+            message: Some("Choose a flow".into()),
+            url: None,
+            user_code: None,
+            verification_uri: None,
+            interval_seconds: None,
+            expires_in_seconds: None,
+            options: Some(vec![pi_harness::AuthChoice {
+                id: "device".into(),
+                label: "Device code".into(),
+            }]),
+        });
+        assert_eq!(state.overlay, super::OverlayKind::OauthSelect);
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::OauthReply { id, value: Some(value) } if id == "oauth-1" && value == "device")
+        );
+
+        state.apply(AgentEvent::OauthRequest {
+            id: "oauth-2".into(),
+            kind: "prompt".into(),
+            message: Some("Paste code".into()),
+            url: None,
+            user_code: None,
+            verification_uri: None,
+            interval_seconds: None,
+            expires_in_seconds: None,
+            options: None,
+        });
+        state.overlay_query = "secret".into();
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::OauthReply { id, value: Some(value) } if id == "oauth-2" && value == "secret")
+        );
+
+        state.apply(AgentEvent::OauthComplete {
+            provider: "example".into(),
+        });
+        assert_eq!(state.status, "logged in to example");
+    }
+
+    #[test]
+    fn rewind_picker_returns_persisted_checkpoint_id() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::RewindList {
+            checkpoints: vec![pi_harness::RewindCheckpoint {
+                id: "checkpoint-1".into(),
+                path: "/project/src/main.rs".into(),
+                timestamp: "2026-07-12T01:00:00Z".into(),
+                tool: "edit".into(),
+            }],
+        });
+        assert_eq!(state.overlay, super::OverlayKind::RewindPicker);
+        assert!(state.overlay_items()[0].contains("src/main.rs"));
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::RewindFile(id) if id == "checkpoint-1"
+        ));
+    }
+
+    #[test]
+    fn persisted_plan_updates_header_progress_and_plan_mode() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::PlanUpdate {
+            entries: vec![
+                pi_harness::PlanEntry {
+                    step: "Inspect".into(),
+                    status: "completed".into(),
+                },
+                pi_harness::PlanEntry {
+                    step: "Implement".into(),
+                    status: "in_progress".into(),
+                },
+            ],
+        });
+        assert_eq!((state.tasks_complete, state.tasks_total), (1, 2));
+        assert_eq!(state.plan_entries.len(), 2);
+
+        state.prompt = "/plan".into();
+        assert!(
+            matches!(state.activate_slash_command(), Some(super::state::OverlayAction::SetPermissionMode(mode)) if mode == "plan")
+        );
+        assert_eq!(state.permission_mode.label(), "plan");
+    }
+
+    #[test]
     fn scrolling_clamps_and_returns_to_tail_following() {
         let mut state = fixtures::conversation();
         let max_scroll = ui::max_scroll(&state, 100, 24);
@@ -1428,5 +1753,134 @@ mod tests {
 
         state.scroll_to_bottom();
         assert_eq!(state.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn compaction_start_pushes_active_placeholder_and_sets_status() {
+        let mut state = super::AppState::default();
+        state.context_used = 184_000;
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(184_000),
+            tokens_after: None,
+            error: None,
+        });
+
+        assert_eq!(state.entries.len(), 1);
+        assert!(matches!(
+            &state.entries[0],
+            super::state::Entry::Compaction {
+                active: true,
+                tokens_before: Some(184_000),
+                tokens_after: None,
+                error: None,
+                ..
+            }
+        ));
+        assert_eq!(state.status, "compacting…");
+    }
+
+    #[test]
+    fn compaction_end_replaces_placeholder_summary_and_drops_context() {
+        let mut state = super::AppState::default();
+        state.context_used = 184_000;
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(184_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("manual".into()),
+            summary: Some("Kept recent turns; summarized the rest.".into()),
+            tokens_before: Some(184_000),
+            tokens_after: Some(22_000),
+            error: None,
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Compaction {
+                summary,
+                active,
+                tokens_before,
+                tokens_after,
+                error,
+            } => {
+                assert_eq!(summary, "Kept recent turns; summarized the rest.");
+                assert!(!active);
+                assert_eq!(*tokens_before, Some(184_000));
+                assert_eq!(*tokens_after, Some(22_000));
+                assert!(error.is_none());
+            }
+            other => panic!("expected Compaction entry, got {other:?}"),
+        }
+        assert_eq!(state.context_used, 22_000);
+        assert_eq!(state.status, "compacted");
+    }
+
+    #[test]
+    fn compaction_end_with_error_marks_entry_and_status_as_failed() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("threshold".into()),
+            summary: None,
+            tokens_before: Some(190_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("threshold".into()),
+            summary: None,
+            tokens_before: Some(190_000),
+            tokens_after: None,
+            error: Some("model timeout".into()),
+        });
+
+        assert!(matches!(
+            &state.entries[0],
+            super::state::Entry::Compaction {
+                active: false,
+                error: Some(message),
+                ..
+            } if message == "model timeout"
+        ));
+        assert_eq!(state.status, "compaction failed");
+    }
+
+    #[test]
+    fn compaction_appears_in_render_output() {
+        let (width, height) = (100, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(180_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("manual".into()),
+            summary: Some("Recent context retained.".into()),
+            tokens_before: Some(180_000),
+            tokens_after: Some(24_000),
+            error: None,
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("Compacted context"));
+        assert!(output.contains("180K → 24K tokens"));
+        assert!(output.contains("Recent context retained."));
     }
 }

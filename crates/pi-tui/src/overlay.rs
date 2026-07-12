@@ -11,24 +11,6 @@ use crate::{
     theme::Theme,
 };
 
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/model", "Switch model"),
-    ("/resume", "Resume a saved session"),
-    ("/new", "Start a new session"),
-    ("/name", "Name the current session"),
-    ("/session", "Show current session statistics"),
-    ("/clone", "Clone the active branch"),
-    ("/tree", "Navigate session history"),
-    ("/fork", "Fork from an earlier prompt"),
-    ("/thinking", "Cycle model thinking level"),
-    ("/mode", "Cycle permission mode"),
-    ("/settings", "Open settings"),
-    ("/clear", "Start a clean conversation"),
-    ("/compact", "Compact conversation context"),
-    ("/help", "Show available commands"),
-    ("/quit", "Quit pi-shell"),
-];
-
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     if state.overlay == OverlayKind::None {
         render_slash_suggestions(frame, state);
@@ -59,6 +41,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::TreePicker => " Session tree ",
         OverlayKind::ForkPicker => " Fork from prompt ",
         OverlayKind::LabelEditor => " Entry label ",
+        OverlayKind::FilePicker => " Reference file ",
+        OverlayKind::ScopedModels => " Scoped models ",
+        OverlayKind::OauthPrompt => " OAuth input ",
+        OverlayKind::OauthSelect => " OAuth selection ",
+        OverlayKind::RewindPicker => " Rewind file edit ",
         OverlayKind::Settings => " Settings ",
         OverlayKind::Permission => " Permission required ",
         OverlayKind::None => "",
@@ -72,11 +59,18 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             | OverlayKind::TreePicker
             | OverlayKind::ForkPicker
             | OverlayKind::LabelEditor
+            | OverlayKind::FilePicker
+            | OverlayKind::ScopedModels
+            | OverlayKind::OauthPrompt
+            | OverlayKind::OauthSelect
+            | OverlayKind::RewindPicker
     ) {
         lines.push(Line::from(vec![
             Span::styled(
                 if state.overlay == OverlayKind::LabelEditor {
                     "  Label: "
+                } else if state.overlay == OverlayKind::OauthPrompt {
+                    "  Reply: "
                 } else {
                     "  Filter: "
                 },
@@ -85,12 +79,16 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             Span::styled(
                 if state.overlay_query.is_empty() {
                     if state.overlay == OverlayKind::LabelEditor {
-                        "empty clears label…"
+                        "empty clears label…".to_string()
+                    } else if state.overlay == OverlayKind::OauthPrompt {
+                        "enter OAuth value…".to_string()
                     } else {
-                        "type to search…"
+                        "type to search…".to_string()
                     }
+                } else if state.overlay == OverlayKind::OauthPrompt {
+                    "•".repeat(state.overlay_query.chars().count())
                 } else {
-                    &state.overlay_query
+                    state.overlay_query.clone()
                 },
                 Style::default().fg(theme.foreground),
             ),
@@ -119,6 +117,17 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         ]));
         lines.push(Line::from(Span::styled(
             format!("  {}", permission.reason),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if let Some(oauth) = &state.pending_oauth
+        && matches!(
+            state.overlay,
+            OverlayKind::OauthPrompt | OverlayKind::OauthSelect
+        )
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", oauth.message),
             Style::default().fg(theme.muted),
         )));
     }
@@ -160,12 +169,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
     if !state.prompt.starts_with('/') || state.prompt.contains(' ') {
         return;
     }
-    let query = state.prompt.trim_start_matches('/').to_ascii_lowercase();
-    let matches = SLASH_COMMANDS
-        .iter()
-        .filter(|(command, _)| command.trim_start_matches('/').starts_with(&query))
-        .take(5)
-        .collect::<Vec<_>>();
+    let matches = state.slash_suggestions();
     if matches.is_empty() {
         return;
     }
@@ -184,7 +188,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
                     format!("{} {command:<12}", if index == 0 { "›" } else { " " }),
                     Style::default().fg(theme.foreground),
                 ),
-                Span::styled(*description, Style::default().fg(theme.muted)),
+                Span::styled(description, Style::default().fg(theme.muted)),
             ])
         })
         .collect::<Vec<_>>();

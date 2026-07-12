@@ -12,8 +12,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use pi_harness::{
-    AgentEvent, AgentHarness, MessageDelivery, ModelInfo, PermissionDecision, SessionConfig,
-    SessionId, SessionInfo, SessionStats, SessionTreeEntry,
+    AgentEvent, AgentHarness, MessageDelivery, ModelInfo, PermissionDecision, RewindCheckpoint,
+    RuntimeResources, RuntimeSettings, SessionConfig, SessionId, SessionInfo, SessionStats,
+    SessionTreeEntry,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -68,11 +69,15 @@ enum WireMessage {
         request_id: String,
         session_id: Option<String>,
         models: Option<Vec<ModelInfo>>,
+        files: Option<Vec<String>>,
+        resources: Option<Box<RuntimeResources>>,
+        settings: Option<Box<RuntimeSettings>>,
         providers: Option<Vec<AuthProviderInfo>>,
         history: Option<Vec<AgentEvent>>,
         sessions: Option<Vec<SessionInfo>>,
-        session_info: Option<SessionStats>,
+        session_info: Option<Box<SessionStats>>,
         tree: Option<Vec<SessionTreeEntry>>,
+        rewinds: Option<Vec<RewindCheckpoint>>,
     },
     Event {
         session_id: String,
@@ -88,11 +93,15 @@ enum WireMessage {
 struct Response {
     session_id: Option<String>,
     models: Option<Vec<ModelInfo>>,
+    files: Option<Vec<String>>,
+    resources: Option<RuntimeResources>,
+    settings: Option<RuntimeSettings>,
     providers: Option<Vec<AuthProviderInfo>>,
     history: Option<Vec<AgentEvent>>,
     sessions: Option<Vec<SessionInfo>>,
     session_info: Option<SessionStats>,
     tree: Option<Vec<SessionTreeEntry>>,
+    rewinds: Option<Vec<RewindCheckpoint>>,
 }
 
 impl PiHarness {
@@ -355,6 +364,16 @@ impl AgentHarness for PiHarness {
         Ok(())
     }
 
+    async fn execute_bash(
+        &self,
+        id: &SessionId,
+        command: String,
+        exclude_from_context: bool,
+    ) -> Result<()> {
+        self.request_with_timeout(json!({ "type": "bash", "session_id": id.0, "command": command, "exclude_from_context": exclude_from_context }), None, INFERENCE_OPERATION_TIMEOUT).await?;
+        Ok(())
+    }
+
     async fn cancel(&self, id: &SessionId) -> Result<()> {
         self.request(json!({ "type": "cancel", "session_id": id.0 }), None)
             .await?;
@@ -395,6 +414,164 @@ impl AgentHarness for PiHarness {
             .await?
             .models
             .unwrap_or_default())
+    }
+
+    async fn list_files(&self, id: &SessionId) -> Result<Vec<String>> {
+        Ok(self
+            .request(json!({ "type": "list_files", "session_id": id.0 }), None)
+            .await?
+            .files
+            .unwrap_or_default())
+    }
+
+    async fn runtime_resources(&self, id: &SessionId) -> Result<RuntimeResources> {
+        let resources = self
+            .request(
+                json!({ "type": "list_resources", "session_id": id.0 }),
+                None,
+            )
+            .await?
+            .resources
+            .unwrap_or_default();
+        if let Some(sender) = self
+            .inner
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .get(id)
+        {
+            let _ = sender.send(AgentEvent::ResourcesChanged {
+                resources: resources.clone(),
+            });
+        }
+        Ok(resources)
+    }
+
+    async fn reload_resources(&self, id: &SessionId) -> Result<()> {
+        self.request_with_timeout(
+            json!({ "type": "reload_resources", "session_id": id.0 }),
+            None,
+            INFERENCE_OPERATION_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn runtime_settings(&self, id: &SessionId) -> Result<RuntimeSettings> {
+        Ok(self
+            .request(json!({ "type": "get_settings", "session_id": id.0 }), None)
+            .await?
+            .settings
+            .unwrap_or_default())
+    }
+
+    async fn set_runtime_setting(&self, id: &SessionId, key: String, value: Value) -> Result<()> {
+        self.request(
+            json!({ "type": "set_setting", "session_id": id.0, "key": key, "value": value }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_scoped_models(&self, id: &SessionId, models: Vec<String>) -> Result<()> {
+        self.request(
+            json!({ "type": "set_scoped_models", "session_id": id.0, "models": models }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_project_trust(&self, id: &SessionId, trusted: bool) -> Result<()> {
+        self.request(
+            json!({ "type": "set_project_trust", "session_id": id.0, "trusted": trusted }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn export_session(&self, id: &SessionId, path: Option<String>) -> Result<()> {
+        self.request_with_timeout(
+            json!({ "type": "export_session", "session_id": id.0, "path": path }),
+            None,
+            INFERENCE_OPERATION_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn import_session(&self, id: &SessionId, path: String) -> Result<()> {
+        self.session_replacement(
+            id,
+            json!({ "type": "import_session", "session_id": id.0, "path": path }),
+        )
+        .await
+    }
+    async fn copy_last(&self, id: &SessionId) -> Result<()> {
+        self.request(json!({ "type": "copy_last", "session_id": id.0 }), None)
+            .await?;
+        Ok(())
+    }
+    async fn begin_oauth(&self, id: &SessionId, provider: String) -> Result<()> {
+        self.request(
+            json!({ "type": "oauth_login", "session_id": id.0, "provider": provider }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn reply_oauth(
+        &self,
+        id: &SessionId,
+        oauth_id: String,
+        value: Option<String>,
+    ) -> Result<()> {
+        self.request(json!({ "type": "oauth_reply", "session_id": id.0, "oauth_id": oauth_id, "value": value }), None).await?;
+        Ok(())
+    }
+    async fn set_permission_mode(&self, id: &SessionId, mode: String) -> Result<()> {
+        self.request(
+            json!({ "type": "set_permission_mode", "session_id": id.0, "mode": mode }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn list_rewinds(&self, id: &SessionId) -> Result<Vec<RewindCheckpoint>> {
+        let checkpoints = self
+            .request(json!({ "type": "list_rewinds", "session_id": id.0 }), None)
+            .await?
+            .rewinds
+            .unwrap_or_default();
+        if let Some(sender) = self
+            .inner
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .get(id)
+        {
+            let _ = sender.send(AgentEvent::RewindList {
+                checkpoints: checkpoints.clone(),
+            });
+        }
+        Ok(checkpoints)
+    }
+    async fn rewind_file(&self, id: &SessionId, checkpoint_id: String) -> Result<()> {
+        self.request(
+            json!({ "type": "rewind_file", "session_id": id.0, "checkpoint_id": checkpoint_id }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn export_trace(&self, id: &SessionId, path: Option<String>) -> Result<()> {
+        self.request_with_timeout(
+            json!({ "type": "trace", "session_id": id.0, "path": path }),
+            None,
+            INFERENCE_OPERATION_TIMEOUT,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn list_sessions(&self, id: &SessionId) -> Result<Vec<SessionInfo>> {
@@ -514,21 +691,29 @@ async fn read_messages(inner: Arc<Inner>, mut lines: Lines<BufReader<ChildStdout
                 request_id,
                 session_id,
                 models,
+                files,
+                resources,
+                settings,
                 providers,
                 history,
                 sessions,
                 session_info,
                 tree,
+                rewinds,
             } => {
                 if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
                     let _ = sender.send(Ok(Response {
                         session_id,
                         models,
+                        files,
+                        resources: resources.map(|resources| *resources),
+                        settings: settings.map(|settings| *settings),
                         providers,
                         history,
                         sessions,
-                        session_info,
+                        session_info: session_info.map(|session_info| *session_info),
                         tree,
+                        rewinds,
                     }));
                 }
             }

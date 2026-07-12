@@ -1,6 +1,22 @@
 export type SidecarCommand =
   | { type: "health" }
   | { type: "list_models"; request_id: string }
+  | { type: "list_files"; request_id: string; session_id: string }
+  | { type: "list_resources"; request_id: string; session_id: string }
+  | { type: "reload_resources"; request_id: string; session_id: string }
+  | { type: "get_settings"; request_id: string; session_id: string }
+  | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust"; value: string | boolean }
+  | { type: "set_scoped_models"; request_id: string; session_id: string; models: string[] }
+  | { type: "set_project_trust"; request_id: string; session_id: string; trusted: boolean }
+  | { type: "export_session"; request_id: string; session_id: string; path?: string }
+  | { type: "import_session"; request_id: string; session_id: string; path: string }
+  | { type: "copy_last"; request_id: string; session_id: string }
+  | { type: "oauth_login"; request_id: string; session_id: string; provider: string }
+  | { type: "oauth_reply"; request_id: string; session_id: string; oauth_id: string; value?: string }
+  | { type: "set_permission_mode"; request_id: string; session_id: string; mode: "normal" | "plan" | "always_approve" }
+  | { type: "list_rewinds"; request_id: string; session_id: string }
+  | { type: "rewind_file"; request_id: string; session_id: string; checkpoint_id: string }
+  | { type: "trace"; request_id: string; session_id: string; path?: string }
   | { type: "list_auth_providers"; request_id: string; session_id: string }
   | {
       type: "set_api_key";
@@ -36,6 +52,7 @@ export type SidecarCommand =
   | { type: "prompt"; request_id: string; session_id: string; text: string; delivery?: "steer" | "follow_up" }
   | { type: "cycle_thinking"; request_id: string; session_id: string }
   | { type: "clear_queue"; request_id: string; session_id: string }
+  | { type: "bash"; request_id: string; session_id: string; command: string; exclude_from_context?: boolean }
   | { type: "cancel"; request_id: string; session_id: string }
   | {
       type: "permission";
@@ -53,6 +70,20 @@ export type SidecarMessage =
       session_id?: string;
       history?: AgentEvent[];
       models?: Array<{ id: string; display_name: string }>;
+      files?: string[];
+      resources?: {
+        commands: Array<{ name: string; description: string; source: string }>;
+        context_files: string[];
+      };
+      settings?: {
+        steering_mode: "all" | "one-at-a-time";
+        follow_up_mode: "all" | "one-at-a-time";
+        auto_compaction: boolean;
+        default_project_trust: "ask" | "always" | "never";
+        enabled_models: string[];
+        project_trusted: boolean;
+      };
+      rewinds?: Array<{ id: string; path: string; timestamp: string; tool: string }>;
       providers?: Array<{
         id: string;
         display_name: string;
@@ -103,9 +134,13 @@ export type AgentEvent =
   | { type: "prompt_prefill"; text: string }
   | { type: "thinking_changed"; level: string }
   | { type: "queue_changed"; steering: string[]; follow_up: string[] }
+  | { type: "oauth_request"; id: string; kind: "auth" | "device_code" | "prompt" | "select"; message?: string; url?: string; user_code?: string; verification_uri?: string; interval_seconds?: number; expires_in_seconds?: number; options?: Array<{ id: string; label: string }> }
+  | { type: "oauth_complete"; provider: string }
   | { type: "text_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
+  | { type: "permission_request"; id: string; tool: string; args: unknown; reason: string }
+  | { type: "plan_update"; entries: Array<{ step: string; status: string }> }
   | {
       type: "tool_call_result";
       id: string;
@@ -118,7 +153,16 @@ export type AgentEvent =
       usage: { input_tokens: number; output_tokens: number };
       stop_reason: string;
     }
-  | { type: "error"; kind: string; message: string };
+  | { type: "error"; kind: string; message: string }
+  | {
+      type: "compaction";
+      phase: "start" | "end";
+      reason?: string;
+      summary?: string;
+      tokens_before?: number;
+      tokens_after?: number;
+      error?: string;
+    };
 
 export function writeMessage(message: SidecarMessage): void {
   process.stdout.write(`${JSON.stringify(message)}\n`);

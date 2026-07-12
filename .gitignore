@@ -42,3 +42,6 @@ coverage/
 *.prof
 *.gcda
 *.gcno
+
+# Session trace dumps from pi-shell
+pi-trace-*.tar.gz

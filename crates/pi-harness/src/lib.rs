@@ -84,6 +84,26 @@ pub enum AgentEvent {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
+    ResourcesChanged {
+        resources: RuntimeResources,
+    },
+    OauthRequest {
+        id: String,
+        kind: String,
+        message: Option<String>,
+        url: Option<String>,
+        user_code: Option<String>,
+        verification_uri: Option<String>,
+        interval_seconds: Option<u64>,
+        expires_in_seconds: Option<u64>,
+        options: Option<Vec<AuthChoice>>,
+    },
+    OauthComplete {
+        provider: String,
+    },
+    RewindList {
+        checkpoints: Vec<RewindCheckpoint>,
+    },
     SessionTree {
         entries: Vec<SessionTreeEntry>,
         user_only: bool,
@@ -126,6 +146,21 @@ pub enum AgentEvent {
         kind: AgentErrorKind,
         message: String,
     },
+    Compaction {
+        phase: CompactionPhase,
+        reason: Option<String>,
+        summary: Option<String>,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    Start,
+    End,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,6 +221,56 @@ pub struct SessionTreeEntry {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RuntimeResources {
+    pub commands: Vec<RuntimeCommand>,
+    pub context_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeCommand {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthChoice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RewindCheckpoint {
+    pub id: String,
+    pub path: String,
+    pub timestamp: String,
+    pub tool: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeSettings {
+    pub steering_mode: String,
+    pub follow_up_mode: String,
+    pub auto_compaction: bool,
+    pub default_project_trust: String,
+    pub enabled_models: Vec<String>,
+    pub project_trusted: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            steering_mode: "one-at-a-time".into(),
+            follow_up_mode: "one-at-a-time".into(),
+            auto_compaction: true,
+            default_project_trust: "ask".into(),
+            enabled_models: Vec::new(),
+            project_trusted: false,
+        }
+    }
+}
+
 #[async_trait]
 pub trait AgentHarness: Send + Sync {
     async fn open_session(&self, config: SessionConfig) -> Result<SessionId>;
@@ -199,6 +284,12 @@ pub trait AgentHarness: Send + Sync {
     ) -> Result<()>;
     async fn cycle_thinking(&self, id: &SessionId) -> Result<()>;
     async fn clear_queue(&self, id: &SessionId) -> Result<()>;
+    async fn execute_bash(
+        &self,
+        id: &SessionId,
+        command: String,
+        exclude_from_context: bool,
+    ) -> Result<()>;
     async fn cancel(&self, id: &SessionId) -> Result<()>;
     async fn reply_permission(
         &self,
@@ -208,6 +299,27 @@ pub trait AgentHarness: Send + Sync {
     ) -> Result<()>;
     async fn set_model(&self, id: &SessionId, model: String) -> Result<()>;
     async fn list_models(&self) -> Result<Vec<ModelInfo>>;
+    async fn list_files(&self, id: &SessionId) -> Result<Vec<String>>;
+    async fn runtime_resources(&self, id: &SessionId) -> Result<RuntimeResources>;
+    async fn reload_resources(&self, id: &SessionId) -> Result<()>;
+    async fn runtime_settings(&self, id: &SessionId) -> Result<RuntimeSettings>;
+    async fn set_runtime_setting(&self, id: &SessionId, key: String, value: Value) -> Result<()>;
+    async fn set_scoped_models(&self, id: &SessionId, models: Vec<String>) -> Result<()>;
+    async fn set_project_trust(&self, id: &SessionId, trusted: bool) -> Result<()>;
+    async fn export_session(&self, id: &SessionId, path: Option<String>) -> Result<()>;
+    async fn import_session(&self, id: &SessionId, path: String) -> Result<()>;
+    async fn copy_last(&self, id: &SessionId) -> Result<()>;
+    async fn begin_oauth(&self, id: &SessionId, provider: String) -> Result<()>;
+    async fn reply_oauth(
+        &self,
+        id: &SessionId,
+        oauth_id: String,
+        value: Option<String>,
+    ) -> Result<()>;
+    async fn set_permission_mode(&self, id: &SessionId, mode: String) -> Result<()>;
+    async fn list_rewinds(&self, id: &SessionId) -> Result<Vec<RewindCheckpoint>>;
+    async fn rewind_file(&self, id: &SessionId, checkpoint_id: String) -> Result<()>;
+    async fn export_trace(&self, id: &SessionId, path: Option<String>) -> Result<()>;
     async fn list_sessions(&self, id: &SessionId) -> Result<Vec<SessionInfo>>;
     async fn resume_session(&self, id: &SessionId, target: String) -> Result<()>;
     async fn new_session(&self, id: &SessionId) -> Result<()>;
@@ -346,6 +458,29 @@ impl AgentHarness for MockHarness {
         });
         Ok(())
     }
+    async fn execute_bash(
+        &self,
+        id: &SessionId,
+        command: String,
+        _exclude_from_context: bool,
+    ) -> Result<()> {
+        let sender = self.sender(id)?;
+        let tool_id = "interactive-bash".to_string();
+        let _ = sender.send(AgentEvent::ToolCallStart {
+            id: tool_id.clone(),
+            name: "bash".into(),
+            args: json!({"command": command}),
+        });
+        let _ = sender.send(AgentEvent::ToolCallResult {
+            id: tool_id,
+            result: ToolResult {
+                content: "mock bash output".into(),
+            },
+            is_error: false,
+            duration_ms: Some(1),
+        });
+        Ok(())
+    }
 
     async fn reply_permission(
         &self,
@@ -365,6 +500,71 @@ impl AgentHarness for MockHarness {
             id: "mock".into(),
             display_name: "Mock model".into(),
         }])
+    }
+    async fn list_files(&self, _id: &SessionId) -> Result<Vec<String>> {
+        Ok(vec!["README.md".into(), "src/main.rs".into()])
+    }
+    async fn runtime_resources(&self, _id: &SessionId) -> Result<RuntimeResources> {
+        Ok(RuntimeResources::default())
+    }
+    async fn reload_resources(&self, _id: &SessionId) -> Result<()> {
+        Ok(())
+    }
+    async fn runtime_settings(&self, _id: &SessionId) -> Result<RuntimeSettings> {
+        Ok(RuntimeSettings::default())
+    }
+    async fn set_runtime_setting(
+        &self,
+        _id: &SessionId,
+        _key: String,
+        _value: Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn set_scoped_models(&self, _id: &SessionId, _models: Vec<String>) -> Result<()> {
+        Ok(())
+    }
+    async fn set_project_trust(&self, _id: &SessionId, _trusted: bool) -> Result<()> {
+        Ok(())
+    }
+    async fn export_session(&self, _id: &SessionId, _path: Option<String>) -> Result<()> {
+        Ok(())
+    }
+    async fn import_session(&self, _id: &SessionId, _path: String) -> Result<()> {
+        Ok(())
+    }
+    async fn copy_last(&self, _id: &SessionId) -> Result<()> {
+        Ok(())
+    }
+    async fn begin_oauth(&self, id: &SessionId, provider: String) -> Result<()> {
+        let _ = self
+            .sender(id)?
+            .send(AgentEvent::OauthComplete { provider });
+        Ok(())
+    }
+    async fn reply_oauth(
+        &self,
+        _id: &SessionId,
+        _oauth_id: String,
+        _value: Option<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn set_permission_mode(&self, _id: &SessionId, _mode: String) -> Result<()> {
+        Ok(())
+    }
+    async fn list_rewinds(&self, id: &SessionId) -> Result<Vec<RewindCheckpoint>> {
+        let checkpoints = Vec::new();
+        let _ = self.sender(id)?.send(AgentEvent::RewindList {
+            checkpoints: checkpoints.clone(),
+        });
+        Ok(checkpoints)
+    }
+    async fn rewind_file(&self, _id: &SessionId, _checkpoint_id: String) -> Result<()> {
+        Ok(())
+    }
+    async fn export_trace(&self, _id: &SessionId, _path: Option<String>) -> Result<()> {
+        Ok(())
     }
 
     async fn list_sessions(&self, _id: &SessionId) -> Result<Vec<SessionInfo>> {
@@ -390,7 +590,31 @@ impl AgentHarness for MockHarness {
     async fn clone_session(&self, _id: &SessionId) -> Result<()> {
         Ok(())
     }
-    async fn compact(&self, _id: &SessionId, _instructions: Option<String>) -> Result<()> {
+    async fn compact(&self, id: &SessionId, instructions: Option<String>) -> Result<()> {
+        let sender = self.sender(id)?;
+        tokio::spawn(async move {
+            let _ = sender.send(AgentEvent::Compaction {
+                phase: CompactionPhase::Start,
+                reason: Some("manual".into()),
+                summary: None,
+                tokens_before: None,
+                tokens_after: None,
+                error: None,
+            });
+            tokio::time::sleep(Duration::from_millis(240)).await;
+            let summary = match instructions {
+                Some(custom) => format!("Compacted with custom instructions: {custom}"),
+                None => "Compacted to summarize earlier context.".to_string(),
+            };
+            let _ = sender.send(AgentEvent::Compaction {
+                phase: CompactionPhase::End,
+                reason: Some("manual".into()),
+                summary: Some(summary),
+                tokens_before: Some(184_320),
+                tokens_after: Some(22_140),
+                error: None,
+            });
+        });
         Ok(())
     }
     async fn session_tree(
