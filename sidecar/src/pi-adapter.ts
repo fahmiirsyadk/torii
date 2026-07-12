@@ -1,5 +1,5 @@
 /**
- * pi-adapter.ts — single seam between pi-shell and the @earendil-works/pi-coding-agent SDK.
+ * pi-adapter.ts — single seam between Torii and the @earendil-works/pi-coding-agent SDK.
  *
  * Every call into the Pi SDK lives in this file. The rest of the sidecar (the
  * wire protocol, the command dispatcher, the readline loop) only talks to
@@ -159,7 +159,7 @@ export function permissionExtension(
 ) {
   const pendingFiles = new Map<string, { path: string; before: string | null; tool: string }>();
   return {
-    name: "pi-shell-permissions",
+    name: "torii-permissions",
     factory: (pi: ExtensionAPI) => {
       pi.on("tool_call", async (event) => {
         if (!["bash", "write", "edit"].includes(event.toolName.toLowerCase())) return;
@@ -185,7 +185,7 @@ export function permissionExtension(
         pendingFiles.delete(event.toolCallId);
         if (pending === undefined || event.isError) return;
         const after = existsSync(pending.path) ? readFileSync(pending.path, "utf8") : null;
-        pi.appendEntry("pi-shell.rewind", { path: pending.path, before: pending.before, after, tool: pending.tool });
+        pi.appendEntry("torii.rewind", { path: pending.path, before: pending.before, after, tool: pending.tool });
       });
     },
   };
@@ -212,7 +212,7 @@ export function grokToolsExtension(
   emitEvent: (event: AgentEvent) => void,
 ) {
   return {
-    name: "pi-shell-grok-tools",
+    name: "torii-grok-tools",
     factory: (pi: ExtensionAPI) => {
       pi.registerTool({
         name: "web_fetch",
@@ -222,7 +222,7 @@ export function grokToolsExtension(
         async execute(_id, params, signal) {
           const url = new URL(params.url);
           if (!new Set(["http:", "https:"]).has(url.protocol)) throw new Error("web_fetch only supports HTTP(S)");
-          const response = await fetch(url, { signal, headers: { "user-agent": "pi-shell/0.1" } });
+          const response = await fetch(url, { signal, headers: { "user-agent": "torii/0.1" } });
           if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
           const contentType = response.headers.get("content-type") ?? "";
           const raw = await response.text();
@@ -245,7 +245,7 @@ export function grokToolsExtension(
             const text = (data.web?.results ?? []).map((result, index) => `${index + 1}. ${result.title ?? "Untitled"}\n${result.url ?? ""}\n${result.description ?? ""}`).join("\n\n");
             return { content: [{ type: "text", text: text || "No results" }], details: { query: params.query, provider: "brave" } };
           }
-          const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(params.query)}`, { signal, headers: { "user-agent": "Mozilla/5.0 pi-shell" } });
+          const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(params.query)}`, { signal, headers: { "user-agent": "Mozilla/5.0 torii" } });
           if (!response.ok) throw new Error(`DuckDuckGo HTTP ${response.status}`);
           const text = htmlToText(await response.text()).slice(0, 30_000);
           return { content: [{ type: "text", text: text || "No results" }], details: { query: params.query, provider: "duckduckgo" } };
@@ -263,7 +263,7 @@ export function grokToolsExtension(
         }),
         async execute(_id, params) {
           if (params.entries.filter((entry) => entry.status === "in_progress").length > 1) throw new Error("only one plan entry may be in_progress");
-          pi.appendEntry("pi-shell.plan", { entries: params.entries });
+          pi.appendEntry("torii.plan", { entries: params.entries });
           emitEvent({ type: "plan_update", entries: params.entries });
           return { content: [{ type: "text", text: "Plan updated" }], details: { entries: params.entries } };
         },
@@ -294,7 +294,7 @@ export function mcpExtension(
   emitEvent: (event: AgentEvent) => void,
 ) {
   return {
-    name: "pi-shell-mcp",
+    name: "torii-mcp",
     factory: async (pi: ExtensionAPI) => {
       for (const [key, client] of [...mcpClients]) {
         if (!key.startsWith(`${wireSessionId}:`)) continue;
@@ -303,7 +303,7 @@ export function mcpExtension(
       }
       for (const [serverName, config] of Object.entries(loadMcpConfig(cwd, agentDir))) {
         try {
-          const client = new McpClient({ name: "pi-shell", version: "0.1.0" });
+          const client = new McpClient({ name: "torii", version: "0.1.0" });
           const transport = config.command
             ? new StdioClientTransport({ command: config.command, args: config.args, env: config.env, cwd: config.cwd ?? cwd, stderr: "pipe" })
             : config.url && config.type === "sse"
@@ -618,7 +618,9 @@ export function loadedHistory(session: AgentSession, sessionManager: SessionMana
       history.push({ type: "compaction_indicator", reason, tokens_before });
     }
   }
-  const savedPlan = [...sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-shell.plan");
+  const savedPlan = [...sessionManager.getEntries()].reverse().find((entry) =>
+    entry.type === "custom" && (entry.customType === "torii.plan" || entry.customType === "pi-shell.plan")
+  );
   if (savedPlan?.type === "custom" && typeof savedPlan.data === "object" && savedPlan.data !== null && "entries" in savedPlan.data && Array.isArray(savedPlan.data.entries)) {
     const entries = savedPlan.data.entries.flatMap((entry: unknown) => {
       if (typeof entry !== "object" || entry === null || !("step" in entry) || !("status" in entry) || typeof entry.step !== "string" || typeof entry.status !== "string") return [];
@@ -957,7 +959,7 @@ function formatTreeToolCall(name: string, args: Record<string, unknown>): string
 
 export function listRewinds(active: ActiveSession) {
   return active.session.sessionManager.getEntries().flatMap((entry) => {
-    if (entry.type !== "custom" || entry.customType !== "pi-shell.rewind") return [];
+    if (entry.type !== "custom" || (entry.customType !== "torii.rewind" && entry.customType !== "pi-shell.rewind")) return [];
     const data = entry.data;
     if (typeof data !== "object" || data === null || !("path" in data) || typeof data.path !== "string") return [];
     return [{ id: entry.id, path: data.path, timestamp: entry.timestamp, tool: "tool" in data && typeof data.tool === "string" ? data.tool : "edit" }];
@@ -966,13 +968,13 @@ export function listRewinds(active: ActiveSession) {
 
 export function rewindToCheckpoint(active: ActiveSession, checkpointId: string): string {
   const entry = active.session.sessionManager.getEntry(checkpointId);
-  if (entry?.type !== "custom" || entry.customType !== "pi-shell.rewind") throw new Error("rewind checkpoint not found");
+  if (entry?.type !== "custom" || (entry.customType !== "torii.rewind" && entry.customType !== "pi-shell.rewind")) throw new Error("rewind checkpoint not found");
   if (typeof entry.data !== "object" || entry.data === null) throw new Error("invalid rewind checkpoint");
   const data = entry.data as { path?: unknown; before?: unknown };
   if (typeof data.path !== "string" || !(typeof data.before === "string" || data.before === null)) throw new Error("invalid rewind checkpoint");
   if (data.before === null) { if (existsSync(data.path)) unlinkSync(data.path); }
   else writeFileSync(data.path, data.before, "utf8");
-  active.session.sessionManager.appendCustomEntry("pi-shell.rewind_applied", { checkpointId: entry.id, path: data.path });
+  active.session.sessionManager.appendCustomEntry("torii.rewind_applied", { checkpointId: entry.id, path: data.path });
   return data.path;
 }
 

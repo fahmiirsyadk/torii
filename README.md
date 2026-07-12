@@ -1,4 +1,4 @@
-# pi-shell
+# Torii
 
 Grok-style terminal UX on top of a runtime-neutral agent harness.
 
@@ -12,27 +12,27 @@ The first vertical slice contains:
 ## Run
 
 ```bash
-cargo run -p pi-shell
+cargo run -p torii
 ```
 
 Press `Ctrl+Q` to exit. For a non-interactive smoke test:
 
 ```bash
-cargo run -p pi-shell -- --headless
+cargo run -p torii -- --headless
 ```
 
 The mock backend remains the default. To launch the TUI against the official
 Pi SDK sidecar:
 
 ```bash
-cargo run -p pi-shell -- --backend pi
+cargo run -p torii -- --backend pi
 ```
 
 Validate Node launch, protocol health, local Pi resource loading, and in-memory
 session creation without sending an inference request:
 
 ```bash
-cargo run -p pi-shell -- --check-pi
+cargo run -p torii -- --check-pi
 ```
 
 Using `--backend pi --headless` sends the built-in headless prompt to the
@@ -46,11 +46,11 @@ Pi-backed conversations are persistent by default and use Pi's normal session
 store under `~/.pi/agent/sessions/`. Resume or open a saved session with:
 
 ```bash
-cargo run -p pi-shell -- --backend pi --continue
-cargo run -p pi-shell -- --backend pi --session <path-or-partial-id>
-cargo run -p pi-shell -- --backend pi --fork <path-or-partial-id>
-cargo run -p pi-shell -- --backend pi -r
-cargo run -p pi-shell -- --backend pi --no-session
+cargo run -p torii -- --backend pi --continue
+cargo run -p torii -- --backend pi --session <path-or-partial-id>
+cargo run -p torii -- --backend pi --fork <path-or-partial-id>
+cargo run -p torii -- --backend pi -r
+cargo run -p torii -- --backend pi --no-session
 ```
 
 `--continue` restores the latest session for the current working directory,
@@ -61,7 +61,7 @@ model. `--no-session` keeps the conversation in memory only. Login, logout, and
 Inside the TUI, enter `/resume` to open a searchable current-project session
 picker. The picker shows the session name or first prompt, last-modified time,
 message count, and a `✓ current` marker. Selecting a session replaces the
-transcript and active Pi runtime without restarting pi-shell.
+transcript and active Pi runtime without restarting Torii.
 Use `Ctrl+P` to show full session paths, `Ctrl+S` to cycle threaded/recent/fuzzy
 sorting, and `Ctrl+N` to show only named sessions. `Ctrl+R` renames the selected
 session through Pi metadata. `Ctrl+D` asks for confirmation before deleting a
@@ -72,7 +72,7 @@ fresh persistent session, `/name <name>` updates its display name, `/session`
 shows its file, message/token counts, and cost, `/clone` copies the current
 active branch into a new session file, and `/compact [instructions]` invokes
 Pi's native context compaction. Session files remain Pi's authoritative JSONL
-tree; pi-shell does not maintain a parallel conversation format.
+tree; Torii does not maintain a parallel conversation format.
 `/tree` opens the complete Pi session tree and marks entries on the active
 branch; selecting an earlier user message rewinds to its parent and places the
 message back in the composer for editing. `/fork` uses a user-message-only
@@ -87,9 +87,9 @@ summary instructions); Shift+Enter remains a direct summarize shortcut.
 Update a provider API key through Pi's credential store:
 
 ```bash
-cargo run -p pi-shell -- login
-cargo run -p pi-shell -- login opencode-go
-cargo run -p pi-shell -- logout opencode-go
+cargo run -p torii -- login
+cargo run -p torii -- login opencode-go
+cargo run -p torii -- logout opencode-go
 ```
 
 With no provider argument, `login` shows an interactive provider chooser. API
@@ -110,16 +110,16 @@ UI development uses deterministic stories modeled on captured Grok Build
 states:
 
 ```bash
-cargo run -p pi-shell -- --story conversation
-cargo run -p pi-shell -- --story streaming
-cargo run -p pi-shell -- --story markdown
-cargo run -p pi-shell -- --story tools
-cargo run -p pi-shell -- --story palette
-cargo run -p pi-shell -- --story model-picker
-cargo run -p pi-shell -- --story settings
-cargo run -p pi-shell -- --story permission
-cargo run -p pi-shell -- --story tree
-cargo run -p pi-shell -- --story fork
+cargo run -p torii -- --story conversation
+cargo run -p torii -- --story streaming
+cargo run -p torii -- --story markdown
+cargo run -p torii -- --story tools
+cargo run -p torii -- --story palette
+cargo run -p torii -- --story model-picker
+cargo run -p torii -- --story settings
+cargo run -p torii -- --story permission
+cargo run -p torii -- --story tree
+cargo run -p torii -- --story fork
 ```
 
 Add `--headless` to render a `100×32` plain-text reference frame without
@@ -141,7 +141,7 @@ but marks its persisted `BashExecutionMessage` as excluded from model context.
 Slash completion also includes Pi's live extension commands, prompt templates,
 and `/skill:name` entries. `/context` lists the project context files loaded by
 Pi, and `/reload` reloads extensions, skills, prompts, themes, and context files
-then refreshes completion without restarting pi-shell.
+then refreshes completion without restarting Torii.
 The sidecar is built around Pi's `AgentSessionRuntime`, so extension command
 contexts and lifecycle hooks are rebound after resume, new, clone, fork,
 import, tree navigation, and resource reload rather than disappearing after a

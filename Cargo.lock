@@ -912,19 +912,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pi-shell"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "pi-harness",
- "pi-harness-pi",
- "pi-tui",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "pi-tui"
 version = "0.1.0"
 dependencies = [
@@ -1504,6 +1491,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "torii"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "pi-harness",
+ "pi-harness-pi",
+ "pi-tui",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

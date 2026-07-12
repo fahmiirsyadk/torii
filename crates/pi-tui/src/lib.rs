@@ -22,7 +22,7 @@ pub use fixtures::Story;
 use futures_util::StreamExt;
 use ratatui::{DefaultTerminal, Terminal};
 use state::OverlayAction;
-pub use state::{AppState, Focus, OverlayKind};
+pub use state::{AppState, Focus, OverlayKind, View};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug)]
@@ -87,6 +87,8 @@ pub enum UiCommand {
     LoadRewinds,
     RewindFile(String),
     ExportTrace(Option<String>),
+    StopResident(String),
+    CloseResident(String),
 }
 
 enum LoopWake {
@@ -156,6 +158,7 @@ pub async fn run(
     state.runtime_commands = resources.commands;
     state.context_files = resources.context_files;
     state.runtime_settings = settings;
+    state.view = View::Dashboard;
     if open_resume {
         state.open_overlay(OverlayKind::SessionPicker);
     }
@@ -197,7 +200,12 @@ async fn run_app(
     const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
     loop {
-        let animated = state.streaming || state.active_compaction_started_at().is_some();
+        let animated = state.streaming
+            || state.active_compaction_started_at().is_some()
+            || state
+                .runtime_sessions
+                .values()
+                .any(|session| session.status == "running");
         let animation_due = animated
             && last_draw_at
                 .is_none_or(|last_draw: Instant| last_draw.elapsed() >= ANIMATION_FRAME_INTERVAL);
@@ -372,6 +380,47 @@ async fn run_app(
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Esc if state.view == View::Dashboard => {
+                    state.view = View::Transcript;
+                }
+                KeyCode::Up if state.view == View::Dashboard => {
+                    state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
+                }
+                KeyCode::Down if state.view == View::Dashboard => {
+                    state.dashboard_selected = (state.dashboard_selected + 1)
+                        .min(state.available_sessions.len().saturating_sub(1));
+                }
+                KeyCode::Enter if state.view == View::Dashboard => {
+                    if let Some(path) = state.activate_dashboard_session()
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::ResumeSession(path));
+                    }
+                    if !state.available_sessions.is_empty() {
+                        state.view = View::Transcript;
+                    }
+                }
+                KeyCode::Char('n') if state.view == View::Dashboard => {
+                    if let Some(sender) = &commands {
+                        let _ = sender.send(UiCommand::NewSession);
+                    }
+                    state.view = View::Transcript;
+                }
+                KeyCode::Char('s') if state.view == View::Dashboard => {
+                    if let Some(path) = state.dashboard_selected_path()
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::StopResident(path));
+                    }
+                }
+                KeyCode::Char('x') if state.view == View::Dashboard => {
+                    if let Some(path) = state.dashboard_selected_path()
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::CloseResident(path));
+                    }
+                }
+                _ if state.view == View::Dashboard => {}
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.open_overlay(OverlayKind::CommandPalette);
                 }
@@ -529,6 +578,47 @@ async fn run_app(
                 _ => {}
             },
             Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp if state.view == View::Dashboard => {
+                    state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown if state.view == View::Dashboard => {
+                    state.dashboard_selected = (state.dashboard_selected + 1)
+                        .min(state.available_sessions.len().saturating_sub(1));
+                }
+                MouseEventKind::Moved if state.view == View::Dashboard => {
+                    if let Some((x, y, width, height)) = state.dashboard_list_rect.get()
+                        && mouse.column >= x
+                        && mouse.column < x.saturating_add(width)
+                        && mouse.row >= y
+                        && mouse.row < y.saturating_add(height)
+                    {
+                        let row = usize::from(mouse.row - y);
+                        let visible = usize::from(height);
+                        if let Some(index) = state.dashboard_session_at_row(row, visible) {
+                            state.dashboard_selected = index;
+                        }
+                    }
+                }
+                MouseEventKind::Down(_) if state.view == View::Dashboard => {
+                    if let Some((x, y, width, height)) = state.dashboard_list_rect.get()
+                        && mouse.column >= x
+                        && mouse.column < x.saturating_add(width)
+                        && mouse.row >= y
+                        && mouse.row < y.saturating_add(height)
+                        && let Some(index) = state.dashboard_session_at_row(
+                            usize::from(mouse.row - y),
+                            usize::from(height),
+                        )
+                    {
+                        state.dashboard_selected = index;
+                        if let Some(path) = state.activate_dashboard_session()
+                            && let Some(sender) = &commands
+                        {
+                            let _ = sender.send(UiCommand::ResumeSession(path));
+                        }
+                        state.view = View::Transcript;
+                    }
+                }
                 MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
                 MouseEventKind::ScrollDown => state.scroll_down(1),
                 MouseEventKind::Moved => {
@@ -3108,5 +3198,51 @@ mod tests {
         });
         assert_eq!(state.turn_input_tokens, 2_010);
         assert!(state.turn_started_at.is_some());
+    }
+
+    #[test]
+    fn dashboard_renders_torii_version_and_truthful_session_states() {
+        let (width, height) = (100, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState {
+            view: super::View::Dashboard,
+            available_sessions: vec![
+                pi_harness::SessionInfo {
+                    id: "current".into(),
+                    path: "/tmp/current.jsonl".into(),
+                    name: Some("Active refactor".into()),
+                    first_message: String::new(),
+                    modified: "now".into(),
+                    message_count: 4,
+                    current: true,
+                    cwd: String::new(),
+                    parent_session_path: None,
+                },
+                pi_harness::SessionInfo {
+                    id: "saved".into(),
+                    path: "/tmp/saved.jsonl".into(),
+                    name: None,
+                    first_message: "Previous investigation".into(),
+                    modified: "2h ago".into(),
+                    message_count: 8,
+                    current: false,
+                    cwd: String::new(),
+                    parent_session_path: None,
+                },
+            ],
+            ..super::AppState::default()
+        };
+        state.streaming = true;
+        state.turn_started_at = Some(std::time::Instant::now());
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("T O R I I"));
+        assert!(output.contains(env!("CARGO_PKG_VERSION")));
+        assert!(output.contains("Running"));
+        assert!(output.contains("Inactive"));
+        assert!(output.contains("Active refactor"));
+        assert!(!output.contains("Messages total"));
     }
 }

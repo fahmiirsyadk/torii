@@ -1,11 +1,11 @@
 [package]
-name = "pi-shell"
+name = "torii"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pi"
+name = "torii"
 path = "src/main.rs"
 
 [dependencies]

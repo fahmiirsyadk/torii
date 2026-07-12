@@ -65,6 +65,9 @@ pub enum AgentErrorKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    RuntimeSessions {
+        sessions: Vec<RuntimeSessionInfo>,
+    },
     SessionReset,
     UserMessage {
         text: String,
@@ -166,6 +169,13 @@ pub enum AgentEvent {
         reason: String,
         tokens_before: Option<u64>,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeSessionInfo {
+    pub path: String,
+    pub status: String,
+    pub started_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +319,9 @@ pub trait AgentHarness: Send + Sync {
         exclude_from_context: bool,
     ) -> Result<()>;
     async fn cancel(&self, id: &SessionId) -> Result<()>;
+    async fn close_session(&self, id: &SessionId) -> Result<()> {
+        self.cancel(id).await
+    }
     async fn reply_permission(
         &self,
         id: &SessionId,

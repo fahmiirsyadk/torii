@@ -1,5 +1,5 @@
 /**
- * index.ts — wire-protocol entry point for pi-shell's sidecar.
+ * index.ts — wire-protocol entry point for Torii's sidecar.
  *
  * The sidecar speaks JSONL over stdin/stdout: commands in, events/responses
  * out. Every call into the Pi SDK lives in `./pi-adapter.ts`. This file
@@ -302,6 +302,14 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "cancel") {
     await pi.abortSession(active);
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "close_session") {
+    await active.runtime.dispose();
+    sessions.delete(sessionId);
+    permissionModes.delete(sessionId);
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }

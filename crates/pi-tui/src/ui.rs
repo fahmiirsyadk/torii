@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     markdown,
-    state::{AppState, DiffKind, DiffLine, Entry, Focus, ToolStatus},
+    state::{AppState, DiffKind, DiffLine, Entry, Focus, ToolStatus, View},
     theme::Theme,
 };
 
@@ -303,6 +303,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         frame.area(),
     );
 
+    if state.view == View::Dashboard {
+        render_dashboard(frame, state, theme);
+        crate::overlay::render(frame, state);
+        return;
+    }
+
     let outer = frame.area().inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -334,6 +340,195 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     render_composer(frame, areas[4], state, theme);
     render_shortcuts(frame, areas[5], state, theme);
     crate::overlay::render(frame, state);
+}
+
+const TORII: &[&str] = &[
+    "       _________________________       ",
+    "       \\_____, ,__, ,__, ,_____/       ",
+    "        _____| |__| |__| |_____        ",
+    "        \\____, ,_______, ,____/        ",
+    "             | |       | |             ",
+    " @           | |       | |           @ ",
+    " @@          | |       | |          @@ ",
+    " @@@  @  @  @| |       | |@  @  @  @@@ ",
+    "             | |       | |             ",
+];
+
+fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
+    let area = frame.area().inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let width = area.width.min(86);
+    let height = area.height.min(30);
+    let panel = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let compact = panel.height < 25 || panel.width < 68;
+    let logo_height = if compact { 5 } else { TORII.len() as u16 };
+    let chunks = Layout::vertical([
+        Constraint::Length(logo_height),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .split(panel);
+
+    let logo: Vec<Line<'_>> = if compact {
+        TORII.iter().take(5).map(|line| Line::from(*line)).collect()
+    } else {
+        TORII.iter().map(|line| Line::from(*line)).collect()
+    };
+    frame.render_widget(
+        Paragraph::new(logo)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Rgb(190, 62, 74))),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "T O R I I",
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("agent workspace  ·  v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme.muted),
+            )),
+        ])
+        .alignment(Alignment::Center),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Sessions").style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        chunks[2],
+    );
+
+    let visible = chunks[3].height as usize;
+    let selected = state
+        .dashboard_selected
+        .min(state.available_sessions.len().saturating_sub(1));
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let mut lines = Vec::new();
+    for (index, session) in state
+        .available_sessions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        let selected_here = index == selected;
+        let runtime = state.runtime_sessions.get(&session.path);
+        let running = runtime.is_some_and(|runtime| runtime.status == "running")
+            || (runtime.is_none() && session.current && state.streaming);
+        let attention = runtime.is_some_and(|runtime| runtime.status == "attention");
+        let resident_idle = runtime.is_some_and(|runtime| runtime.status == "idle");
+        let (indicator, status, color) = if running {
+            let elapsed = runtime
+                .and_then(|runtime| runtime.started_at_ms)
+                .map_or_else(
+                    || {
+                        state
+                            .turn_started_at
+                            .map_or(0, |started| started.elapsed().as_millis())
+                    },
+                    |started| unix_time_ms().saturating_sub(u128::from(started)),
+                );
+            let frame = WORKING_SPINNER[(elapsed / 80) as usize % WORKING_SPINNER.len()];
+            (
+                frame,
+                format!("Running {}", format_dashboard_elapsed(elapsed)),
+                theme.success,
+            )
+        } else if attention {
+            ("!", "Attention".into(), theme.warning)
+        } else if session.current || resident_idle {
+            ("●", "Idle".into(), theme.success)
+        } else {
+            ("○", "Inactive".into(), theme.muted)
+        };
+        let title = session
+            .name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&session.first_message);
+        let marker = if selected_here { "›" } else { " " };
+        let available = panel.width.saturating_sub(31) as usize;
+        let title = truncate_text(title, available.max(8));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker} {indicator} {status:<13} "),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!("{title:<width$}", width = available.max(8)),
+                Style::default().fg(if selected_here {
+                    theme.foreground
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                format!("  {}", session.modified),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved sessions yet",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    state.dashboard_list_rect.set(Some((
+        chunks[3].x,
+        chunks[3].y,
+        chunks[3].width,
+        chunks[3].height,
+    )));
+    frame.render_widget(Paragraph::new(lines), chunks[3]);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select   Enter open   n new   s stop   x close runtime   Esc return")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        chunks[4],
+    );
+}
+
+fn unix_time_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn format_dashboard_elapsed(milliseconds: u128) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let mut result: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() && width > 1 {
+        result.pop();
+        result.push('…');
+    }
+    result
 }
 
 pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {

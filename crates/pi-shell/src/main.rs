@@ -10,6 +10,8 @@ use std::{
     sync::Arc,
 };
 
+pub mod supervisor;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -22,7 +24,7 @@ async fn main() -> Result<()> {
         .position(|arg| arg == "--prompt")
         .and_then(|position| args.get(position + 1))
         .cloned()
-        .unwrap_or_else(|| "show the first pi-shell vertical slice".into());
+        .unwrap_or_else(|| "show the first Torii vertical slice".into());
     let requested_model = args
         .iter()
         .position(|arg| arg == "--model")
@@ -117,9 +119,34 @@ async fn main() -> Result<()> {
         let settings = harness.runtime_settings(&session).await.unwrap_or_default();
         let (commands, mut submitted) = tokio::sync::mpsc::unbounded_channel();
         let command_harness = Arc::clone(&harness);
-        let command_session = session.clone();
+        let supervisor = Arc::new(supervisor::SessionSupervisor::new(Arc::clone(&harness)));
+        let current_path = sessions
+            .iter()
+            .find(|candidate| candidate.current)
+            .map(|candidate| candidate.path.clone())
+            .unwrap_or_else(|| session.0.clone());
+        supervisor
+            .adopt(current_path, session.clone(), events)
+            .await;
+        let events = supervisor.foreground_events();
+        let command_supervisor = Arc::clone(&supervisor);
         tokio::spawn(async move {
             while let Some(command) = submitted.recv().await {
+                if let pi_tui::UiCommand::ResumeSession(target) = &command {
+                    let _ = command_supervisor.activate(target.clone(), None).await;
+                    continue;
+                }
+                if let pi_tui::UiCommand::StopResident(path) = &command {
+                    let _ = command_supervisor.stop(path).await;
+                    continue;
+                }
+                if let pi_tui::UiCommand::CloseResident(path) = &command {
+                    let _ = command_supervisor.close(path).await;
+                    continue;
+                }
+                let Ok(command_session) = command_supervisor.active_session().await else {
+                    continue;
+                };
                 match command {
                     pi_tui::UiCommand::Submit { text, delivery } => {
                         let _ = command_harness
@@ -137,10 +164,9 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::SetModel(model) => {
                         let _ = command_harness.set_model(&command_session, model).await;
                     }
-                    pi_tui::UiCommand::ResumeSession(target) => {
-                        let _ = command_harness
-                            .resume_session(&command_session, target)
-                            .await;
+                    pi_tui::UiCommand::ResumeSession(_) => unreachable!(),
+                    pi_tui::UiCommand::StopResident(_) | pi_tui::UiCommand::CloseResident(_) => {
+                        unreachable!()
                     }
                     pi_tui::UiCommand::RenameSession { target, name } => {
                         let _ = command_harness

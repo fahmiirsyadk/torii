@@ -384,6 +384,22 @@ impl AgentHarness for PiHarness {
         Ok(())
     }
 
+    async fn close_session(&self, id: &SessionId) -> Result<()> {
+        self.request(json!({ "type": "close_session", "session_id": id.0 }), None)
+            .await?;
+        self.inner
+            .sessions
+            .write()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .remove(id);
+        self.inner
+            .histories
+            .write()
+            .map_err(|_| anyhow!("Pi history map lock poisoned"))?
+            .remove(id);
+        Ok(())
+    }
+
     async fn reply_permission(
         &self,
         id: &SessionId,

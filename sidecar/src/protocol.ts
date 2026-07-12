@@ -56,6 +56,7 @@ export type SidecarCommand =
   | { type: "clear_queue"; request_id: string; session_id: string }
   | { type: "bash"; request_id: string; session_id: string; command: string; exclude_from_context?: boolean }
   | { type: "cancel"; request_id: string; session_id: string }
+  | { type: "close_session"; request_id: string; session_id: string }
   | {
       type: "permission";
       request_id: string;

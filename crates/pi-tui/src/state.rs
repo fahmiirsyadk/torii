@@ -4,7 +4,7 @@ use pi_harness::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::Instant,
 };
 
@@ -18,6 +18,7 @@ const COMMANDS: &[&str] = &[
 pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
+    "/dashboard",
     "/model",
     "/resume",
     "/new",
@@ -45,6 +46,13 @@ const SLASH_COMMANDS: &[&str] = &[
     "/help",
     "/quit",
 ];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum View {
+    Dashboard,
+    #[default]
+    Transcript,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayKind {
@@ -317,6 +325,9 @@ pub enum Focus {
 
 #[derive(Clone, Debug)]
 pub struct AppState {
+    pub view: View,
+    pub dashboard_selected: usize,
+    pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub branch: String,
     pub cwd: String,
     pub context_used: u64,
@@ -361,6 +372,7 @@ pub struct AppState {
     pub pending_oauth: Option<PendingOauth>,
     pub available_models: Vec<ModelInfo>,
     pub available_sessions: Vec<SessionInfo>,
+    pub runtime_sessions: HashMap<String, pi_harness::RuntimeSessionInfo>,
     pub session_sort: SessionSort,
     pub session_named_only: bool,
     pub session_show_path: bool,
@@ -390,8 +402,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            branch: "pi-shell".into(),
-            cwd: "~/dev/pi-shell".into(),
+            view: View::Transcript,
+            dashboard_selected: 0,
+            dashboard_list_rect: Cell::new(None),
+            branch: "torii".into(),
+            cwd: "~/dev/torii".into(),
             context_used: 0,
             context_limit: 200_000,
             tasks_complete: 0,
@@ -426,6 +441,7 @@ impl Default for AppState {
                 display_name: "Mock model".into(),
             }],
             available_sessions: Vec::new(),
+            runtime_sessions: HashMap::new(),
             session_sort: SessionSort::default(),
             session_named_only: false,
             session_show_path: false,
@@ -455,6 +471,30 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn dashboard_selected_path(&self) -> Option<String> {
+        self.available_sessions
+            .get(self.dashboard_selected)
+            .map(|session| session.path.clone())
+    }
+    pub fn dashboard_session_at_row(&self, row: usize, visible_rows: usize) -> Option<usize> {
+        let selected = self
+            .dashboard_selected
+            .min(self.available_sessions.len().saturating_sub(1));
+        let start = selected.saturating_sub(visible_rows.saturating_sub(1));
+        let index = start + row;
+        (index < self.available_sessions.len()).then_some(index)
+    }
+
+    pub fn activate_dashboard_session(&mut self) -> Option<String> {
+        let selected = self.dashboard_selected;
+        let path = self.available_sessions.get(selected)?.path.clone();
+        let already_current = self.available_sessions[selected].current;
+        for (index, session) in self.available_sessions.iter_mut().enumerate() {
+            session.current = index == selected;
+        }
+        (!already_current).then_some(path)
+    }
+
     pub fn set_hovered_transcript_target(&mut self, target: Option<(usize, String)>) -> bool {
         let (entry, target_id) = target
             .map(|(entry, id)| (Some(entry), Some(id)))
@@ -502,6 +542,15 @@ impl AppState {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let action = match command.as_str() {
+            "/dashboard" => {
+                self.view = View::Dashboard;
+                self.dashboard_selected = self
+                    .available_sessions
+                    .iter()
+                    .position(|session| session.current)
+                    .unwrap_or(0);
+                OverlayAction::None
+            }
             "/model" => {
                 self.open_overlay(OverlayKind::ModelPicker);
                 OverlayAction::None
@@ -1780,6 +1829,12 @@ impl AppState {
 
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::RuntimeSessions { sessions } => {
+                self.runtime_sessions = sessions
+                    .into_iter()
+                    .map(|session| (session.path.clone(), session))
+                    .collect();
+            }
             AgentEvent::SessionReset => {
                 self.entries.clear();
                 self.context_used = 0;
@@ -2144,6 +2199,7 @@ impl AppState {
 
 fn builtin_description(command: &str) -> &'static str {
     match command {
+        "/dashboard" => "Open the session dashboard",
         "/model" => "Switch model",
         "/resume" => "Resume a saved session",
         "/new" => "Start a new session",
@@ -2169,7 +2225,7 @@ fn builtin_description(command: &str) -> &'static str {
         "/clear" => "Clear visible conversation",
         "/compact" => "Compact context",
         "/help" => "Show commands",
-        "/quit" => "Quit pi-shell",
+        "/quit" => "Quit Torii",
         _ => "Built-in command",
     }
 }
