@@ -1101,6 +1101,49 @@ mod tests {
     }
 
     #[test]
+    fn focused_section_shows_brackets_at_both_transcript_edges() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.focused_target_id = Some("tool-group:tool-test".into());
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let row = buffer_text(terminal.backend().buffer(), width, height)
+            .lines()
+            .find(|line| line.contains("Run 3 calls"))
+            .unwrap()
+            .to_string();
+        assert_eq!(row.chars().nth(1), Some('['));
+        assert_eq!(row.chars().nth(97), Some(']'));
+    }
+
+    #[test]
+    fn focus_brackets_span_dynamic_section_height() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.focused_target_id = Some("diff:fixture-diff-2".into());
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let markers: Vec<(String, String)> = (2..height - 5)
+            .filter_map(|row| {
+                let left = buffer[(1, row)].symbol().to_string();
+                let right = buffer[(97, row)].symbol().to_string();
+                (left != " ").then_some((left, right))
+            })
+            .collect();
+        assert_eq!(markers.first(), Some(&("┌".into(), "┐".into())));
+        assert_eq!(markers.last(), Some(&("└".into(), "┘".into())));
+        assert!(markers.len() > 2);
+        assert!(
+            markers[1..markers.len() - 1]
+                .iter()
+                .all(|marker| marker == &("│".into(), "│".into()))
+        );
+    }
+
+    #[test]
     fn expanded_tool_children_are_independent_focus_stops() {
         let mut state = fixtures::tools();
         state.toggle_tool_group(1);

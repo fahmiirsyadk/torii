@@ -456,6 +456,44 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, content);
 
+    if let Some(target_id) = state.focused_target_id.as_deref()
+        && let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.id == target_id)
+        && section.end > scroll
+        && section.start < scroll.saturating_add(viewport_height)
+    {
+        let marker_style = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let visible_start = section.start.max(scroll);
+        let visible_end = section.end.min(scroll.saturating_add(viewport_height));
+        for logical_row in visible_start..visible_end {
+            let only_row = section.end.saturating_sub(section.start) == 1;
+            let (left, right) = if only_row {
+                ("[", "]")
+            } else if logical_row == section.start {
+                ("┌", "┐")
+            } else if logical_row + 1 == section.end {
+                ("└", "┘")
+            } else {
+                ("│", "│")
+            };
+            let y = content
+                .y
+                .saturating_add(logical_row.saturating_sub(scroll) as u16);
+            frame.render_widget(
+                Paragraph::new(left).style(marker_style),
+                Rect::new(area.x, y, 1, 1),
+            );
+            frame.render_widget(
+                Paragraph::new(right).style(marker_style),
+                Rect::new(area.right().saturating_sub(2), y, 1, 1),
+            );
+        }
+    }
+
     if line_count > viewport_height {
         render_scrollbar(frame, area, line_count, viewport_height, scroll, theme);
         if state.scroll_from_bottom > 0 {
