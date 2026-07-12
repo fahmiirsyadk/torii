@@ -13,14 +13,14 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+        KeyModifiers, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use fixtures::Story;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use futures_util::StreamExt;
+use ratatui::{DefaultTerminal, Terminal};
 use state::OverlayAction;
 pub use state::{AppState, Focus, OverlayKind};
 use tokio::sync::{broadcast, mpsc};
@@ -83,20 +83,35 @@ pub enum UiCommand {
     ExportTrace(Option<String>),
 }
 
+enum LoopWake {
+    Input(Option<io::Result<Event>>),
+    Agent(Result<pi_harness::AgentEvent, broadcast::error::RecvError>),
+    Animation,
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
+    fn enter() -> Result<(Self, DefaultTerminal)> {
+        let terminal = match ratatui::try_init() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                ratatui::restore();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+            ratatui::restore();
+            return Err(error.into());
+        }
+        Ok((Self, terminal))
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        ratatui::restore();
     }
 }
 
@@ -169,21 +184,13 @@ async fn run_app(
     mut events: Option<broadcast::Receiver<pi_harness::AgentEvent>>,
     commands: Option<mpsc::UnboundedSender<UiCommand>>,
 ) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let (_guard, mut terminal) = TerminalGuard::enter()?;
+    let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw_at = None;
     const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
     loop {
-        if let Some(receiver) = &mut events {
-            while let Ok(agent_event) = receiver.try_recv() {
-                state.apply(agent_event);
-                dirty = true;
-            }
-        }
-
         let animated = state.streaming || state.active_compaction_started_at().is_some();
         let animation_due = animated
             && last_draw_at
@@ -194,282 +201,322 @@ async fn run_app(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(30))? {
-            dirty = true;
-            let size = terminal.size()?;
-            let max_scroll = ui::max_scroll(&state, size.width, size.height);
-            let page = usize::from(size.height.saturating_sub(8)).max(1);
+        let animation_wait = if animated {
+            last_draw_at.map_or(Duration::ZERO, |last_draw: Instant| {
+                ANIMATION_FRAME_INTERVAL.saturating_sub(last_draw.elapsed())
+            })
+        } else {
+            Duration::from_secs(3_600)
+        };
 
-            match event::read()? {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press && state.overlay != OverlayKind::None =>
-                {
-                    match key.code {
-                        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break;
-                        }
-                        KeyCode::Esc => {
-                            let action = state.cancel_oauth();
-                            if dispatch_overlay_action(action, &commands) {
-                                break;
-                            }
-                        }
-                        KeyCode::Up => state.move_overlay_selection(-1),
-                        KeyCode::Down => state.move_overlay_selection(1),
-                        KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
-                            state.toggle_scoped_model();
-                        }
-                        KeyCode::Char('o')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && matches!(
-                                    state.overlay,
-                                    OverlayKind::TreePicker | OverlayKind::ForkPicker
-                                ) =>
-                        {
-                            state.cycle_tree_filter();
-                        }
-                        KeyCode::Char('t')
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(
-                                    state.overlay,
-                                    OverlayKind::TreePicker | OverlayKind::ForkPicker
-                                ) =>
-                        {
-                            state.toggle_tree_timestamps();
-                        }
-                        KeyCode::Char('l')
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(
-                                    state.overlay,
-                                    OverlayKind::TreePicker | OverlayKind::ForkPicker
-                                ) =>
-                        {
-                            state.begin_tree_label();
-                        }
-                        KeyCode::Backspace => state.overlay_backspace(),
-                        KeyCode::Enter => {
-                            let action = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                state.activate_tree_with_summary()
-                            } else {
-                                state.activate_overlay()
-                            };
-                            if dispatch_overlay_action(action, &commands) {
-                                break;
-                            }
-                        }
-                        KeyCode::Char(character)
-                            if !key.modifiers.intersects(
-                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                            ) =>
-                        {
-                            state.insert_overlay_char(character);
-                        }
-                        _ => {}
+        let wake = tokio::select! {
+            input_event = input.next() => LoopWake::Input(input_event),
+            agent_event = next_agent_event(&mut events) => LoopWake::Agent(agent_event),
+            _ = tokio::time::sleep(animation_wait) => LoopWake::Animation,
+        };
+        let input_event = match wake {
+            LoopWake::Input(Some(input_event)) => input_event?,
+            LoopWake::Input(None) => break,
+            LoopWake::Agent(Ok(agent_event)) => {
+                state.apply(agent_event);
+                if let Some(receiver) = &mut events {
+                    while let Ok(agent_event) = receiver.try_recv() {
+                        state.apply(agent_event);
                     }
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.open_overlay(OverlayKind::CommandPalette);
+                dirty = true;
+                continue;
+            }
+            LoopWake::Agent(Err(broadcast::error::RecvError::Lagged(_))) => {
+                dirty = true;
+                continue;
+            }
+            LoopWake::Agent(Err(broadcast::error::RecvError::Closed)) => {
+                events = None;
+                continue;
+            }
+            LoopWake::Animation => continue,
+        };
+
+        dirty = true;
+        let size = terminal.size()?;
+        let max_scroll = ui::max_scroll(&state, size.width, size.height);
+        let page = usize::from(size.height.saturating_sub(8)).max(1);
+
+        match input_event {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press && state.overlay != OverlayKind::None =>
+            {
+                match key.code {
+                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
                     }
-                    KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.open_overlay(OverlayKind::ModelPicker);
-                    }
-                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(sender) = &commands {
-                            let _ = sender.send(UiCommand::CycleThinking);
+                    KeyCode::Esc => {
+                        let action = state.cancel_oauth();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
                         }
                     }
-                    KeyCode::F(2) => state.open_overlay(OverlayKind::Settings),
-                    KeyCode::Char('?') if state.focus == Focus::Scrollback => {
-                        state.open_overlay(OverlayKind::CommandPalette);
+                    KeyCode::Up => state.move_overlay_selection(-1),
+                    KeyCode::Down => state.move_overlay_selection(1),
+                    KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
+                        state.toggle_scoped_model();
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.clear_prompt();
-                    }
-                    KeyCode::BackTab => {
-                        state.cycle_permission_mode();
-                        if let Some(sender) = &commands {
-                            let _ = sender.send(UiCommand::SetPermissionMode(
-                                state.permission_mode.wire_value().into(),
-                            ));
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if state.focus != Focus::Prompt || !state.complete_slash_command() {
-                            state.toggle_focus();
-                        }
-                    }
-                    KeyCode::Enter if state.focus == Focus::Prompt => {
-                        if let Some(action) = state.activate_slash_command() {
-                            if dispatch_overlay_action(action, &commands) {
-                                break;
-                            }
-                        } else if state.prompt.trim_start().starts_with('!') {
-                            if let Some((command, exclude_from_context)) = state.submit_bash()
-                                && let Some(sender) = &commands
-                            {
-                                let _ = sender.send(UiCommand::ExecuteBash {
-                                    command,
-                                    exclude_from_context,
-                                });
-                            }
-                        } else if let Some(prompt) = state.submit_prompt()
-                            && let Some(sender) = &commands
-                        {
-                            let delivery = state.streaming.then_some(
-                                if key.modifiers.contains(KeyModifiers::ALT) {
-                                    pi_harness::MessageDelivery::FollowUp
-                                } else {
-                                    pi_harness::MessageDelivery::Steer
-                                },
-                            );
-                            let _ = sender.send(UiCommand::Submit {
-                                text: prompt,
-                                delivery,
-                            });
-                        }
-                    }
-                    KeyCode::Backspace if state.focus == Focus::Prompt => state.backspace(),
-                    KeyCode::Delete if state.focus == Focus::Prompt => state.delete(),
-                    KeyCode::Left if state.focus == Focus::Prompt => state.move_cursor_left(),
-                    KeyCode::Right if state.focus == Focus::Prompt => state.move_cursor_right(),
-                    KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
-                    KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
-                    KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
-                    KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
-                    KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
-                    KeyCode::Down => ui::move_section_focus(&mut state, size.width, size.height, 1),
-                    KeyCode::PageUp => state.scroll_up(page, max_scroll),
-                    KeyCode::PageDown => state.scroll_down(page),
-                    KeyCode::Home => state.scroll_to_top(max_scroll),
-                    KeyCode::End => state.scroll_to_bottom(),
-                    KeyCode::Char('u')
+                    KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.focus == Focus::Scrollback =>
+                            && matches!(
+                                state.overlay,
+                                OverlayKind::TreePicker | OverlayKind::ForkPicker
+                            ) =>
                     {
-                        state.scroll_up(page / 2, max_scroll);
+                        state.cycle_tree_filter();
                     }
-                    KeyCode::Char('d')
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.focus == Focus::Scrollback =>
+                    KeyCode::Char('t')
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            && matches!(
+                                state.overlay,
+                                OverlayKind::TreePicker | OverlayKind::ForkPicker
+                            ) =>
                     {
-                        state.scroll_down(page / 2);
+                        state.toggle_tree_timestamps();
                     }
-                    KeyCode::Char('e')
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.focus == Focus::Scrollback =>
+                    KeyCode::Char('l')
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            && matches!(
+                                state.overlay,
+                                OverlayKind::TreePicker | OverlayKind::ForkPicker
+                            ) =>
                     {
-                        let expand = !state.all_reasoning_expanded();
-                        state.set_all_reasoning_expanded(expand);
+                        state.begin_tree_label();
                     }
-                    KeyCode::Char('e') if state.focus == Focus::Scrollback => {
-                        state.toggle_latest_reasoning();
-                    }
-                    KeyCode::Char('t') if state.focus == Focus::Scrollback => {
-                        state.toggle_latest_tool();
-                    }
-                    KeyCode::Char('d') if state.focus == Focus::Scrollback => {
-                        state.toggle_latest_diff();
-                    }
-                    KeyCode::Esc if state.streaming => {
-                        if let Some(sender) = &commands {
-                            let _ = sender.send(UiCommand::AbortAndRestoreQueue);
+                    KeyCode::Backspace => state.overlay_backspace(),
+                    KeyCode::Enter => {
+                        let action = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state.activate_tree_with_summary()
+                        } else {
+                            state.activate_overlay()
+                        };
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
                         }
                     }
-                    KeyCode::Esc if !state.prompt.is_empty() => state.clear_prompt(),
                     KeyCode::Char(character)
                         if !key.modifiers.intersects(
                             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                         ) =>
                     {
-                        state.focus_prompt();
-                        state.insert_char(character);
-                        if character == '@' && !state.available_files.is_empty() {
-                            state.open_overlay(OverlayKind::FilePicker);
-                        }
+                        state.insert_overlay_char(character);
                     }
                     _ => {}
-                },
-                Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
-                    MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
-                    MouseEventKind::ScrollDown => state.move_overlay_selection(1),
-                    MouseEventKind::Down(_) => {
-                        let items = state.overlay_items();
-                        let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2;
-                        let overlay_height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
-                        let overlay_y = size.height.saturating_sub(overlay_height) / 2;
-                        let query_rows = usize::from(matches!(
-                            state.overlay,
-                            OverlayKind::CommandPalette
-                                | OverlayKind::ModelPicker
-                                | OverlayKind::SessionPicker
-                        )) * 2;
-                        let items_y = overlay_y + 1 + detail_rows as u16 + query_rows as u16;
-                        let index = mouse.row.saturating_sub(items_y) as usize;
-                        if index < items.len() {
-                            state.overlay_selected = index;
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.open_overlay(OverlayKind::CommandPalette);
+                }
+                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.open_overlay(OverlayKind::ModelPicker);
+                }
+                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(sender) = &commands {
+                        let _ = sender.send(UiCommand::CycleThinking);
+                    }
+                }
+                KeyCode::F(2) => state.open_overlay(OverlayKind::Settings),
+                KeyCode::Char('?') if state.focus == Focus::Scrollback => {
+                    state.open_overlay(OverlayKind::CommandPalette);
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.clear_prompt();
+                }
+                KeyCode::BackTab => {
+                    state.cycle_permission_mode();
+                    if let Some(sender) = &commands {
+                        let _ = sender.send(UiCommand::SetPermissionMode(
+                            state.permission_mode.wire_value().into(),
+                        ));
+                    }
+                }
+                KeyCode::Tab => {
+                    if state.focus != Focus::Prompt || !state.complete_slash_command() {
+                        state.toggle_focus();
+                    }
+                }
+                KeyCode::Enter if state.focus == Focus::Prompt => {
+                    if let Some(action) = state.activate_slash_command() {
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
                         }
-                    }
-                    _ => {}
-                },
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
-                    MouseEventKind::ScrollDown => state.scroll_down(1),
-                    MouseEventKind::Moved => {
-                        let hovered = ui::section_hit_at(
-                            &state,
-                            size.width,
-                            size.height,
-                            mouse.column,
-                            mouse.row,
-                        );
-                        dirty = state
-                            .set_hovered_transcript_target(hovered.map(|hit| (hit.index, hit.id)));
-                    }
-                    MouseEventKind::Down(_) => {
-                        if mouse.row >= size.height.saturating_sub(5)
-                            && mouse.row < size.height.saturating_sub(2)
+                    } else if state.prompt.trim_start().starts_with('!') {
+                        if let Some((command, exclude_from_context)) = state.submit_bash()
+                            && let Some(sender) = &commands
                         {
-                            state.focus_prompt();
-                        } else if let Some(hit) = ui::section_hit_at(
-                            &state,
-                            size.width,
-                            size.height,
-                            mouse.column,
-                            mouse.row,
-                        ) {
-                            state.focus_scrollback();
-                            if hit.actionable {
-                                let target_id = hit.id.clone();
-                                let grouped = state.entries.get(hit.index).is_some_and(|entry| {
+                            let _ = sender.send(UiCommand::ExecuteBash {
+                                command,
+                                exclude_from_context,
+                            });
+                        }
+                    } else if let Some(prompt) = state.submit_prompt()
+                        && let Some(sender) = &commands
+                    {
+                        let delivery = state.streaming.then_some(
+                            if key.modifiers.contains(KeyModifiers::ALT) {
+                                pi_harness::MessageDelivery::FollowUp
+                            } else {
+                                pi_harness::MessageDelivery::Steer
+                            },
+                        );
+                        let _ = sender.send(UiCommand::Submit {
+                            text: prompt,
+                            delivery,
+                        });
+                    }
+                }
+                KeyCode::Backspace if state.focus == Focus::Prompt => state.backspace(),
+                KeyCode::Delete if state.focus == Focus::Prompt => state.delete(),
+                KeyCode::Left if state.focus == Focus::Prompt => state.move_cursor_left(),
+                KeyCode::Right if state.focus == Focus::Prompt => state.move_cursor_right(),
+                KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
+                KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
+                KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
+                KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
+                KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
+                KeyCode::Down => ui::move_section_focus(&mut state, size.width, size.height, 1),
+                KeyCode::PageUp => state.scroll_up(page, max_scroll),
+                KeyCode::PageDown => state.scroll_down(page),
+                KeyCode::Home => state.scroll_to_top(max_scroll),
+                KeyCode::End => state.scroll_to_bottom(),
+                KeyCode::Char('u')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && state.focus == Focus::Scrollback =>
+                {
+                    state.scroll_up(page / 2, max_scroll);
+                }
+                KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && state.focus == Focus::Scrollback =>
+                {
+                    state.scroll_down(page / 2);
+                }
+                KeyCode::Char('e')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && state.focus == Focus::Scrollback =>
+                {
+                    let expand = !state.all_reasoning_expanded();
+                    state.set_all_reasoning_expanded(expand);
+                }
+                KeyCode::Char('e') if state.focus == Focus::Scrollback => {
+                    state.toggle_latest_reasoning();
+                }
+                KeyCode::Char('t') if state.focus == Focus::Scrollback => {
+                    state.toggle_latest_tool();
+                }
+                KeyCode::Char('d') if state.focus == Focus::Scrollback => {
+                    state.toggle_latest_diff();
+                }
+                KeyCode::Esc if state.streaming => {
+                    if let Some(sender) = &commands {
+                        let _ = sender.send(UiCommand::AbortAndRestoreQueue);
+                    }
+                }
+                KeyCode::Esc if !state.prompt.is_empty() => state.clear_prompt(),
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    state.focus_prompt();
+                    state.insert_char(character);
+                    if character == '@' && !state.available_files.is_empty() {
+                        state.open_overlay(OverlayKind::FilePicker);
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
+                MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
+                MouseEventKind::ScrollDown => state.move_overlay_selection(1),
+                MouseEventKind::Down(_) => {
+                    let items = state.overlay_items();
+                    let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2;
+                    let overlay_height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
+                    let overlay_y = size.height.saturating_sub(overlay_height) / 2;
+                    let query_rows = usize::from(matches!(
+                        state.overlay,
+                        OverlayKind::CommandPalette
+                            | OverlayKind::ModelPicker
+                            | OverlayKind::SessionPicker
+                    )) * 2;
+                    let items_y = overlay_y + 1 + detail_rows as u16 + query_rows as u16;
+                    let index = mouse.row.saturating_sub(items_y) as usize;
+                    if index < items.len() {
+                        state.overlay_selected = index;
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
+                MouseEventKind::ScrollDown => state.scroll_down(1),
+                MouseEventKind::Moved => {
+                    let hovered = ui::section_hit_at(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    );
+                    dirty =
+                        state.set_hovered_transcript_target(hovered.map(|hit| (hit.index, hit.id)));
+                }
+                MouseEventKind::Down(_) => {
+                    if mouse.row >= size.height.saturating_sub(5)
+                        && mouse.row < size.height.saturating_sub(2)
+                    {
+                        state.focus_prompt();
+                    } else if let Some(hit) =
+                        ui::section_hit_at(&state, size.width, size.height, mouse.column, mouse.row)
+                    {
+                        state.focus_scrollback();
+                        if hit.actionable {
+                            let target_id = hit.id.clone();
+                            let grouped = state.entries.get(hit.index).is_some_and(|entry| {
                                     let state::Entry::Tool { label, .. } = entry else { return false; };
                                     let begins_group = hit.index == 0 || !matches!(state.entries.get(hit.index - 1), Some(state::Entry::Tool { label: previous, .. }) if previous == label);
                                     begins_group && state.entries[hit.index..].iter().take_while(|candidate| matches!(candidate, state::Entry::Tool { label: other, .. } if other == label)).count() > 1
                                 });
-                                if grouped {
-                                    state.toggle_tool_group(hit.index);
-                                } else {
-                                    state.toggle_entry_at(hit.index);
-                                }
-                                state.focused_target_id = Some(target_id);
+                            if grouped {
+                                state.toggle_tool_group(hit.index);
                             } else {
-                                state.focused_entry = Some(hit.index);
-                                state.focused_target_id = Some(hit.id);
+                                state.toggle_entry_at(hit.index);
                             }
+                            state.focused_target_id = Some(target_id);
                         } else {
-                            state.focus_scrollback();
+                            state.focused_entry = Some(hit.index);
+                            state.focused_target_id = Some(hit.id);
                         }
+                    } else {
+                        state.focus_scrollback();
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
-            }
+            },
+            _ => {}
         }
     }
 
     terminal.show_cursor()?;
     Ok(())
+}
+
+async fn next_agent_event(
+    events: &mut Option<broadcast::Receiver<pi_harness::AgentEvent>>,
+) -> Result<pi_harness::AgentEvent, broadcast::error::RecvError> {
+    match events {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn dispatch_overlay_action(
