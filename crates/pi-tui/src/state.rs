@@ -703,7 +703,18 @@ impl AppState {
     }
 
     pub fn move_overlay_selection(&mut self, delta: isize) {
-        let count = self.overlay_items().len();
+        // Tree rows are rendered directly from SessionTreeEntry. Building
+        // overlay_items() here would format every row merely to learn the
+        // count, making each arrow-key repeat noticeably expensive on long
+        // sessions.
+        let count = if matches!(
+            self.overlay,
+            OverlayKind::TreePicker | OverlayKind::ForkPicker
+        ) {
+            self.visible_tree_count()
+        } else {
+            self.overlay_items().len()
+        };
         if count == 0 {
             self.overlay_selected = 0;
             return;
@@ -1153,71 +1164,94 @@ impl AppState {
             .iter()
             .map(|entry| (entry.id.as_str(), entry))
             .collect::<std::collections::HashMap<_, _>>();
+        // Resolve folded descendants once. Walking from every entry back to
+        // its ancestors is quadratic for Pi's common long, linear sessions.
+        let hidden_by_fold = if self.tree_folded.is_empty() {
+            HashSet::new()
+        } else {
+            let mut children: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for entry in &self.session_tree {
+                if let Some(parent) = entry.parent_id.as_deref() {
+                    children.entry(parent).or_default().push(&entry.id);
+                }
+            }
+            let mut hidden = HashSet::new();
+            let mut stack = self
+                .tree_folded
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            while let Some(parent) = stack.pop() {
+                if let Some(descendants) = children.get(parent) {
+                    for descendant in descendants {
+                        if hidden.insert(*descendant) {
+                            stack.push(*descendant);
+                        }
+                    }
+                }
+            }
+            hidden
+        };
         let filtered = self
             .session_tree
             .iter()
-            .filter(|entry| {
-                if self.overlay == OverlayKind::ForkPicker {
-                    return true;
-                }
-                match self.tree_filter {
-                    TreeFilter::Default => {
-                        !matches!(
-                            entry.kind.as_str(),
-                            "custom"
-                                | "label"
-                                | "session_info"
-                                | "model_change"
-                                | "thinking_level_change"
-                        ) && !(entry.role.as_deref() == Some("assistant")
-                            && entry.text.trim().is_empty()
-                            && !entry.active)
-                    }
-                    TreeFilter::NoTools => {
-                        entry.role.as_deref() != Some("toolResult")
-                            && !matches!(
-                                entry.kind.as_str(),
-                                "custom"
-                                    | "label"
-                                    | "session_info"
-                                    | "model_change"
-                                    | "thinking_level_change"
-                            )
-                    }
-                    TreeFilter::UserOnly => entry.role.as_deref() == Some("user"),
-                    TreeFilter::LabeledOnly => entry.label.is_some(),
-                    TreeFilter::All => true,
-                }
-            })
-            .filter(|entry| {
-                query.is_empty()
-                    || entry.text.to_ascii_lowercase().contains(&query)
-                    || entry
-                        .role
-                        .as_deref()
-                        .is_some_and(|role| role.to_ascii_lowercase().contains(&query))
-                    || entry
-                        .label
-                        .as_deref()
-                        .is_some_and(|label| label.to_ascii_lowercase().contains(&query))
-            })
-            .filter(|entry| {
-                let mut parent_id = entry.parent_id.as_deref();
-                while let Some(parent) = parent_id {
-                    if self.tree_folded.contains(parent) {
-                        return false;
-                    }
-                    parent_id = by_id
-                        .get(parent)
-                        .and_then(|entry| entry.parent_id.as_deref());
-                }
-                true
-            })
+            .filter(|entry| self.tree_entry_matches_filter(entry))
+            .filter(|entry| tree_entry_matches_query(entry, &query))
+            .filter(|entry| !hidden_by_fold.contains(entry.id.as_str()))
             .collect::<Vec<_>>();
         if self.overlay == OverlayKind::ForkPicker {
             filtered
         } else {
             active_first_tree_order(filtered, &by_id)
+        }
+    }
+
+    fn visible_tree_count(&self) -> usize {
+        if self.overlay == OverlayKind::ForkPicker {
+            return self.session_tree.len();
+        }
+        // Folding requires descendant resolution; reuse the canonical view in
+        // that uncommon case. Normal navigation only needs a cheap count and
+        // must not rebuild ordering/topology for every repeated key event.
+        if !self.tree_folded.is_empty() {
+            return self.filtered_tree().len();
+        }
+        let query = self.overlay_query.trim().to_ascii_lowercase();
+        self.session_tree
+            .iter()
+            .filter(|entry| self.tree_entry_matches_filter(entry))
+            .filter(|entry| tree_entry_matches_query(entry, &query))
+            .count()
+    }
+
+    fn tree_entry_matches_filter(&self, entry: &SessionTreeEntry) -> bool {
+        if self.overlay == OverlayKind::ForkPicker {
+            return true;
+        }
+        match self.tree_filter {
+            TreeFilter::Default => {
+                !matches!(
+                    entry.kind.as_str(),
+                    "custom" | "label" | "session_info" | "model_change" | "thinking_level_change"
+                ) && !(entry.role.as_deref() == Some("assistant")
+                    && entry.text.trim().is_empty()
+                    && !entry.active)
+            }
+            TreeFilter::NoTools => {
+                entry.role.as_deref() != Some("toolResult")
+                    && !matches!(
+                        entry.kind.as_str(),
+                        "custom"
+                            | "label"
+                            | "session_info"
+                            | "model_change"
+                            | "thinking_level_change"
+                    )
+            }
+            TreeFilter::UserOnly => entry.role.as_deref() == Some("user"),
+            TreeFilter::LabeledOnly => entry.label.is_some(),
+            TreeFilter::All => true,
         }
     }
 
@@ -1998,6 +2032,19 @@ pub(crate) fn tree_label(entry: &SessionTreeEntry, show_timestamp: bool) -> Stri
         String::new()
     };
     format!("{branch} {indent}{role}: {}{label}{timestamp}", entry.text)
+}
+
+fn tree_entry_matches_query(entry: &SessionTreeEntry, query: &str) -> bool {
+    query.is_empty()
+        || entry.text.to_ascii_lowercase().contains(query)
+        || entry
+            .role
+            .as_deref()
+            .is_some_and(|role| role.to_ascii_lowercase().contains(query))
+        || entry
+            .label
+            .as_deref()
+            .is_some_and(|label| label.to_ascii_lowercase().contains(query))
 }
 
 fn active_first_tree_order<'a>(

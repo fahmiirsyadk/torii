@@ -2049,6 +2049,24 @@ mod tests {
     }
 
     #[test]
+    fn folded_tree_hides_all_descendants_without_hiding_the_fold_point() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::SessionTree {
+            entries: tree_picker_entries(),
+            user_only: false,
+        });
+        state.tree_folded.insert("answer".into());
+
+        let visible = state
+            .filtered_tree()
+            .into_iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, ["root", "answer"]);
+    }
+
+    #[test]
     fn fork_picker_is_a_dedicated_latest_user_message_selector() {
         let mut state = super::AppState::default();
         let entries = tree_picker_entries()
@@ -2086,6 +2104,41 @@ mod tests {
             state.activate_overlay(),
             super::state::OverlayAction::ForkSession { entry_id } if entry_id == "branch-b"
         ));
+    }
+
+    #[test]
+    fn long_linear_tree_navigation_stays_interactive_without_folds() {
+        let entries = (0..10_000)
+            .map(|index| pi_harness::SessionTreeEntry {
+                id: format!("entry-{index}"),
+                parent_id: (index > 0).then(|| format!("entry-{}", index - 1)),
+                kind: "message".into(),
+                role: Some(if index % 2 == 0 { "user" } else { "assistant" }.into()),
+                text: format!("message {index}"),
+                timestamp: "2026-07-11T00:00:00Z".into(),
+                label: None,
+                label_timestamp: None,
+                depth: index,
+                active: true,
+            })
+            .collect();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::SessionTree {
+            entries,
+            user_only: false,
+        });
+
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            state.move_overlay_selection(-1);
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(state.overlay_selected, 9_979);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "20 navigation steps took {elapsed:?}"
+        );
     }
 
     fn tree_picker_entries() -> Vec<pi_harness::SessionTreeEntry> {
