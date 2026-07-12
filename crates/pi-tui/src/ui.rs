@@ -610,9 +610,7 @@ fn render_section_border(
     for row in visible_start..visible_end {
         let only = section.end.saturating_sub(section.start) == 1;
         let continuation = clipped_below && row.saturating_add(3) >= visible_end;
-        let (left, right) = if preview {
-            if only { ("‹", "›") } else { ("┆", "┆") }
-        } else if continuation {
+        let (left, right) = if continuation {
             ("┊", "┊")
         } else if only {
             ("[", "]")

@@ -5,7 +5,10 @@ mod state;
 mod theme;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -170,6 +173,8 @@ async fn run_app(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut dirty = true;
+    let mut last_draw_at = None;
+    const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
     loop {
         if let Some(receiver) = &mut events {
@@ -180,8 +185,12 @@ async fn run_app(
         }
 
         let animated = state.streaming || state.active_compaction_started_at().is_some();
-        if dirty || animated {
+        let animation_due = animated
+            && last_draw_at
+                .is_none_or(|last_draw: Instant| last_draw.elapsed() >= ANIMATION_FRAME_INTERVAL);
+        if dirty || animation_due {
             terminal.draw(|frame| ui::render(frame, &state))?;
+            last_draw_at = Some(Instant::now());
             dirty = false;
         }
 
@@ -415,8 +424,8 @@ async fn run_app(
                             mouse.column,
                             mouse.row,
                         );
-                        state.hovered_entry = hovered.as_ref().map(|hit| hit.index);
-                        state.hovered_target_id = hovered.map(|hit| hit.id);
+                        dirty = state
+                            .set_hovered_transcript_target(hovered.map(|hit| (hit.index, hit.id)));
                     }
                     MouseEventKind::Down(_) => {
                         if mouse.row >= size.height.saturating_sub(5)
@@ -1109,12 +1118,21 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         let edit = output.lines().find(|line| line.contains("> Edit")).unwrap();
-        assert_eq!(edit.chars().nth(1), Some('┆'));
+        assert_eq!(edit.chars().nth(1), Some('┌'));
         assert_eq!(state.scroll_from_bottom, scroll_before);
         assert_eq!(
             state.focused_target_id.as_deref(),
             Some("tool-group:tool-test")
         );
+    }
+
+    #[test]
+    fn unchanged_hover_target_does_not_request_another_frame() {
+        let mut state = fixtures::tools();
+        assert!(state.set_hovered_transcript_target(Some((1, "tool:one".into()))));
+        assert!(!state.set_hovered_transcript_target(Some((1, "tool:one".into()))));
+        assert!(state.set_hovered_transcript_target(None));
+        assert!(!state.set_hovered_transcript_target(None));
     }
 
     #[test]

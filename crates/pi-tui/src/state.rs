@@ -405,6 +405,18 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn set_hovered_transcript_target(&mut self, target: Option<(usize, String)>) -> bool {
+        let (entry, target_id) = target
+            .map(|(entry, id)| (Some(entry), Some(id)))
+            .unwrap_or((None, None));
+        if self.hovered_entry == entry && self.hovered_target_id == target_id {
+            return false;
+        }
+        self.hovered_entry = entry;
+        self.hovered_target_id = target_id;
+        true
+    }
+
     pub fn first_slash_match(&self) -> Option<String> {
         if !self.prompt.starts_with('/') || self.prompt.contains(char::is_whitespace) {
             return None;
