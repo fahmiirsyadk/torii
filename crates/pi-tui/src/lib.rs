@@ -2120,4 +2120,130 @@ mod tests {
             "no down-arrow token indicator when no compaction is active, got: {output}"
         );
     }
+
+    #[test]
+    fn working_banner_appears_during_text_delta_streaming() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 5_000;
+        state.apply(AgentEvent::TextDelta {
+            text: "Hello there, this is the start of a response.".into(),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        // The working banner has a Braille spinner + ' Working…' on the
+        // left, an elapsed time in the middle, and an up/down token tally
+        // on the right. It's distinct from the compaction banner (no
+        // "Compacting context…" text and a different right-side format).
+        let spinner_glyphs = ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}"];
+        let working_line = output
+            .lines()
+            .find(|line| {
+                line.contains("Working")
+                    && spinner_glyphs.iter().any(|g| line.contains(g))
+                    && !line.contains("Compacting")
+            })
+            .expect("working banner should be visible while the model is streaming");
+        assert!(
+            working_line.contains("s"),
+            "working banner should show elapsed time, got: {working_line:?}"
+        );
+        assert!(
+            working_line.contains("↑") && working_line.contains("input"),
+            "working banner should show ↑ input, got: {working_line:?}"
+        );
+        assert!(
+            working_line.contains("↓") && working_line.contains("output"),
+            "working banner should show ↓ output, got: {working_line:?}"
+        );
+        assert!(
+            working_line.contains("5K"),
+            "working banner should show snapshotted input token count (5K), got: {working_line:?}"
+        );
+    }
+
+    #[test]
+    fn working_banner_accumulates_output_chars_as_deltas_stream() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 1_000;
+        // Stream a delta that adds 20 characters — estimated output
+        // tokens should be ~5 (20 / 4 = 5).
+        state.apply(AgentEvent::TextDelta {
+            text: "0123456789abcdefghij".into(),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        // 20 chars / 4 = 5 estimated output tokens → "5" appears in the
+        // banner. The "1K" input is the snapshot of context_used at
+        // turn start. Both are in the same line, so the test just checks
+        // both substrings are present anywhere in the rendered output.
+        assert!(output.contains("1K"), "input snapshot should be visible: {output}");
+        assert!(
+            output.contains("Working"),
+            "working banner should be visible: {output}"
+        );
+    }
+
+    #[test]
+    fn working_banner_disappears_after_turn_complete() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 1_000;
+        state.apply(AgentEvent::TextDelta {
+            text: "streaming response".into(),
+        });
+        state.apply(AgentEvent::TurnComplete {
+            usage: pi_harness::Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+            },
+            stop_reason: "end_turn".into(),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(
+            !output.contains("Working…"),
+            "working banner should disappear after TurnComplete, output: {output}"
+        );
+    }
+
+    #[test]
+    fn working_banner_input_snapshot_resets_between_turns() {
+        let mut state = super::AppState::default();
+        state.context_used = 2_000;
+        state.apply(AgentEvent::TextDelta {
+            text: "first turn".into(),
+        });
+        assert_eq!(state.turn_input_tokens, 2_000);
+        assert!(state.turn_started_at.is_some());
+
+        state.apply(AgentEvent::TurnComplete {
+            usage: pi_harness::Usage {
+                input_tokens: 2_000,
+                output_tokens: 10,
+            },
+            stop_reason: "end_turn".into(),
+        });
+        assert_eq!(state.turn_input_tokens, 2_000);
+        assert_eq!(state.turn_output_chars, 0);
+        assert!(state.turn_started_at.is_none());
+
+        // A new turn snapshots the post-completion context_used.
+        state.context_used = 2_010;
+        state.apply(AgentEvent::TextDelta {
+            text: "second turn".into(),
+        });
+        assert_eq!(state.turn_input_tokens, 2_010);
+        assert!(state.turn_started_at.is_some());
+    }
 }

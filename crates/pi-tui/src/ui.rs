@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
@@ -126,13 +126,16 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         vertical: 0,
     });
     let compaction_active = state.active_compaction_started_at().is_some();
-    let banner_height: u16 = if compaction_active { 1 } else { 0 };
+    let working_active = state.turn_started_at.is_some();
+    let working_height: u16 = if working_active { 1 } else { 0 };
+    let compaction_height: u16 = if compaction_active { 1 } else { 0 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(6),
-            Constraint::Length(banner_height),
+            Constraint::Length(working_height),
+            Constraint::Length(compaction_height),
             Constraint::Length(3),
             Constraint::Length(2),
         ])
@@ -140,11 +143,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 
     render_header(frame, areas[0], state, theme);
     render_transcript(frame, areas[1], state, theme);
-    if compaction_active {
-        render_compaction_banner(frame, areas[2], state, theme);
+    if working_active {
+        render_working_banner(frame, areas[2], state, theme);
     }
-    render_composer(frame, areas[3], state, theme);
-    render_shortcuts(frame, areas[4], state, theme);
+    if compaction_active {
+        render_compaction_banner(frame, areas[3], state, theme);
+    }
+    render_composer(frame, areas[4], state, theme);
+    render_shortcuts(frame, areas[5], state, theme);
     crate::overlay::render(frame, state);
 }
 
@@ -533,6 +539,90 @@ const COMPACTION_SPINNER: &[&str] = &[
     "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 ];
 
+const WORKING_SPINNER: &[&str] = &[
+    "⠋", "⠙", "⠸", "⠴", "⠦", "⠇", "⠏", "⠋",
+];
+
+fn render_working_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: Theme,
+) {
+    let started_at = state
+        .turn_started_at
+        .unwrap_or_else(std::time::Instant::now);
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let frame_index = (elapsed_ms / 100) as usize % WORKING_SPINNER.len();
+    let spinner = WORKING_SPINNER[frame_index];
+    // Estimate output tokens from the accumulated streamed characters. The
+    // rule of thumb is roughly 4 characters per token for English text; the
+    // banner shows this as a live estimate that gets replaced by the wire's
+    // real number once TurnComplete arrives.
+    let estimated_output_tokens = state.turn_output_chars / 4;
+    let elapsed_label = format_elapsed(elapsed_ms);
+    let left = format!("{spinner} Working…");
+    let tokens_label = format!(
+        "↑ {} input  ↓ {} output",
+        compact_number(state.turn_input_tokens),
+        compact_number(estimated_output_tokens),
+    );
+    render_three_column_banner(frame, area, &left, &elapsed_label, &tokens_label, theme, theme.accent, theme.muted);
+}
+
+fn render_three_column_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    left: &str,
+    center: &str,
+    right: &str,
+    theme: Theme,
+    left_color: Color,
+    right_color: Color,
+) {
+    let width = area.width as usize;
+    let left_chars = left.chars().count();
+    let center_chars = center.chars().count();
+    let right_chars = right.chars().count();
+    let min_gap = 2;
+    let needed = left_chars
+        .saturating_add(min_gap)
+        .saturating_add(center_chars)
+        .saturating_add(min_gap)
+        .saturating_add(right_chars);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if needed <= width {
+        let gap_left = (width - left_chars - center_chars - right_chars) / 2;
+        let gap_right = width - left_chars - gap_left - center_chars - right_chars;
+        spans.push(Span::styled(left.to_string(), Style::default().fg(left_color)));
+        spans.push(Span::raw(" ".repeat(gap_left)));
+        spans.push(Span::styled(center.to_string(), Style::default().fg(theme.foreground)));
+        spans.push(Span::raw(" ".repeat(gap_right)));
+        spans.push(Span::styled(right.to_string(), Style::default().fg(right_color)));
+    } else if left_chars + min_gap + right_chars <= width {
+        let gap = width - left_chars - right_chars;
+        spans.push(Span::styled(left.to_string(), Style::default().fg(left_color)));
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(right.to_string(), Style::default().fg(right_color)));
+    } else {
+        let budget = width.saturating_sub(right_chars + min_gap);
+        let truncated: String = if left.chars().count() > budget {
+            let take = budget.saturating_sub(1);
+            let mut s: String = left.chars().take(take).collect();
+            s.push('…');
+            s
+        } else {
+            left.to_string()
+        };
+        spans.push(Span::styled(truncated, Style::default().fg(left_color)));
+    }
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme.background)),
+        area,
+    );
+}
+
 fn render_compaction_banner(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -549,51 +639,14 @@ fn render_compaction_banner(
     let left = format!("{spinner} Compacting context…");
     let center = elapsed_label;
     let right = format!("↓ {} tokens", compact_number(state.context_used));
-    let width = area.width as usize;
-    let left_chars = left.chars().count();
-    let center_chars = center.chars().count();
-    let right_chars = right.chars().count();
-    let min_gap = 2;
-    let needed = left_chars
-        .saturating_add(min_gap)
-        .saturating_add(center_chars)
-        .saturating_add(min_gap)
-        .saturating_add(right_chars);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(left.clone(), Style::default().fg(theme.accent)));
-    if needed <= width {
-        // 3-column layout: left | center | right
-        let gap_left = (width - left_chars - center_chars - right_chars) / 2;
-        let gap_right =
-            width - left_chars - gap_left - center_chars - right_chars;
-        spans.push(Span::raw(" ".repeat(gap_left)));
-        spans.push(Span::styled(center, Style::default().fg(theme.foreground)));
-        spans.push(Span::raw(" ".repeat(gap_right)));
-        spans.push(Span::styled(right, Style::default().fg(theme.muted)));
-    } else if left_chars + min_gap + right_chars <= width {
-        // 2-column: left | right (drop center)
-        let gap = width - left_chars - right_chars;
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(right, Style::default().fg(theme.muted)));
+    let error_color = if state.entries.iter().rev().any(|entry| {
+        matches!(entry, Entry::Compaction { active: false, error: Some(_), .. })
+    }) {
+        theme.error
     } else {
-        // Narrow: just truncate the left text
-        let budget = width.saturating_sub(right_chars + min_gap);
-        let truncated_left: String = if left.chars().count() > budget {
-            let take = budget.saturating_sub(1);
-            let mut s: String = left.chars().take(take).collect();
-            s.push('…');
-            s
-        } else {
-            left.clone()
-        };
-        spans.clear();
-        spans.push(Span::styled(truncated_left, Style::default().fg(theme.accent)));
-    }
-    let line = Line::from(spans);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.background)),
-        area,
-    );
+        theme.muted
+    };
+    render_three_column_banner(frame, area, &left, &center, &right, theme, theme.accent, error_color);
 }
 
 fn format_elapsed(milliseconds: u64) -> String {

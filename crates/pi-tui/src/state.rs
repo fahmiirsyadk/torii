@@ -290,6 +290,20 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub status: String,
     pub streaming: bool,
+    /// Wall-clock time the LLM started the current turn (the first TextDelta
+    /// or ReasoningDelta of a turn). Used by the working banner above the
+    /// composer to render a ticking elapsed-time counter while the model is
+    /// generating. Cleared on TurnComplete, error, or compaction.
+    pub turn_started_at: Option<Instant>,
+    /// Snapshot of `context_used` (i.e. the input token count) at the
+    /// moment the current turn started. The working banner shows this as
+    /// the ↑ input figure.
+    pub turn_input_tokens: u64,
+    /// Cumulative characters streamed during the current turn. The working
+    /// banner divides this by 4 to get an approximate output-token count
+    /// and shows it as the ↓ output figure. Replaced by the wire's real
+    /// `output_tokens` on TurnComplete.
+    pub turn_output_chars: u64,
     pub thinking_level: String,
     pub queued_steering: Vec<String>,
     pub queued_follow_up: Vec<String>,
@@ -336,6 +350,9 @@ impl Default for AppState {
             permission_mode: PermissionMode::Normal,
             status: "idle".into(),
             streaming: false,
+            turn_started_at: None,
+            turn_input_tokens: 0,
+            turn_output_chars: 0,
             thinking_level: "off".into(),
             queued_steering: Vec::new(),
             queued_follow_up: Vec::new(),
@@ -1256,6 +1273,19 @@ impl AppState {
             })
     }
 
+    /// Records the start of a new LLM turn. Called by the TextDelta and
+    /// ReasoningDelta arms on the first delta of a turn. Snapshots
+    /// `context_used` as the input-token count and resets the output-char
+    /// accumulator so the working banner can show a meaningful ↑/↓ token
+    /// tally while the model is generating.
+    pub fn begin_turn_if_needed(&mut self) {
+        if self.turn_started_at.is_none() {
+            self.turn_started_at = Some(Instant::now());
+            self.turn_input_tokens = self.context_used;
+            self.turn_output_chars = 0;
+        }
+    }
+
     pub fn scroll_down(&mut self, amount: usize) {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(amount);
     }
@@ -1276,6 +1306,9 @@ impl AppState {
                 self.scroll_from_bottom = 0;
                 self.status = "session resumed".into();
                 self.streaming = false;
+                self.turn_started_at = None;
+                self.turn_input_tokens = 0;
+                self.turn_output_chars = 0;
                 self.expanded_tool_groups.clear();
                 self.focused_tool = None;
             }
@@ -1384,12 +1417,18 @@ impl AppState {
                 });
             }
             AgentEvent::TextDelta { text } => {
+                self.begin_turn_if_needed();
+                let added = text.chars().count() as u64;
                 self.apply_text_delta(text);
+                self.turn_output_chars = self.turn_output_chars.saturating_add(added);
                 self.status = "generating…".into();
                 self.streaming = true;
             }
             AgentEvent::ReasoningDelta { text } => {
+                self.begin_turn_if_needed();
+                let added = text.chars().count() as u64;
                 self.append_reasoning_text(&text);
+                self.turn_output_chars = self.turn_output_chars.saturating_add(added);
                 self.status = "thinking…".into();
                 self.streaming = true;
             }
@@ -1522,6 +1561,9 @@ impl AppState {
                 ..
             } => {
                 self.context_used = input_tokens + output_tokens;
+                self.turn_input_tokens = input_tokens;
+                self.turn_output_chars = 0;
+                self.turn_started_at = None;
                 self.status = "idle".into();
                 self.streaming = false;
                 for entry in &mut self.entries {
@@ -1543,6 +1585,7 @@ impl AppState {
                 });
                 self.status = "error".into();
                 self.streaming = false;
+                self.turn_started_at = None;
             }
             AgentEvent::Compaction {
                 phase,
