@@ -1153,6 +1153,47 @@ mod tests {
     }
 
     #[test]
+    fn oversized_focus_anchors_top_and_draws_bottom_continuation() {
+        let (width, height) = (80, 18);
+        let mut state = super::AppState {
+            entries: vec![super::state::Entry::Diff {
+                id: "long-diff".into(),
+                path: "src/long.rs".into(),
+                lines: (1..=40)
+                    .map(|number| super::state::DiffLine {
+                        number: Some(number),
+                        text: format!("changed line {number}"),
+                        kind: super::state::DiffKind::Added,
+                    })
+                    .collect(),
+                expanded: true,
+            }],
+            focus: super::Focus::Scrollback,
+            ..super::AppState::default()
+        };
+        ui::move_section_focus(&mut state, width, height, 1);
+        assert_eq!(
+            state.scroll_from_bottom,
+            ui::max_scroll(&state, width, height)
+        );
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_row: String = (0..width)
+            .map(|column| buffer[(column, 2)].symbol())
+            .collect();
+        let bottom_row = height - 6;
+        let continuation: String = (0..width)
+            .map(|column| buffer[(column, bottom_row)].symbol())
+            .collect();
+        assert!(first_row.contains("Edit src/long.rs"));
+        assert!(continuation.contains("╌╌╌╌"));
+        assert_eq!(buffer[(1, bottom_row)].symbol(), "└");
+    }
+
+    #[test]
     fn expanded_tool_children_are_independent_focus_stops() {
         let mut state = fixtures::tools();
         state.toggle_tool_group(1);

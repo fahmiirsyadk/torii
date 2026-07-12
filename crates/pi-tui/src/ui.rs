@@ -274,10 +274,9 @@ pub fn move_section_focus(state: &mut AppState, width: u16, height: u16, directi
         matches!(state.entries.get(index), Some(Entry::Tool { .. })).then_some(index);
     let max_scroll = layout.max_scroll(viewport);
     let mut top = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
-    if start < top {
+    if end.saturating_sub(start) > viewport || start < top {
         top = start;
-    }
-    if end > top.saturating_add(viewport) {
+    } else if end > top.saturating_add(viewport) {
         top = end.saturating_sub(viewport);
     }
     state.scroll_from_bottom = max_scroll.saturating_sub(top.min(max_scroll));
@@ -468,9 +467,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             .add_modifier(Modifier::BOLD);
         let visible_start = section.start.max(scroll);
         let visible_end = section.end.min(scroll.saturating_add(viewport_height));
+        let clipped_below = visible_end < section.end;
         for logical_row in visible_start..visible_end {
             let only_row = section.end.saturating_sub(section.start) == 1;
-            let (left, right) = if only_row {
+            let continuation_row = clipped_below && logical_row + 1 == visible_end;
+            let (left, right) = if continuation_row {
+                ("└", "┘")
+            } else if only_row {
                 ("[", "]")
             } else if logical_row == section.start {
                 ("┌", "┐")
@@ -482,6 +485,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             let y = content
                 .y
                 .saturating_add(logical_row.saturating_sub(scroll) as u16);
+            if continuation_row {
+                frame.render_widget(
+                    Paragraph::new("╌".repeat(area.width.saturating_sub(3) as usize))
+                        .style(Style::default().fg(theme.muted)),
+                    Rect::new(area.x.saturating_add(1), y, area.width.saturating_sub(3), 1),
+                );
+            }
             frame.render_widget(
                 Paragraph::new(left).style(marker_style),
                 Rect::new(area.x, y, 1, 1),
