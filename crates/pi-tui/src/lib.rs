@@ -405,12 +405,8 @@ async fn run_app(
                     _ => {}
                 },
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        ui::move_section_focus(&mut state, size.width, size.height, -1)
-                    }
-                    MouseEventKind::ScrollDown => {
-                        ui::move_section_focus(&mut state, size.width, size.height, 1)
-                    }
+                    MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
+                    MouseEventKind::ScrollDown => state.scroll_down(1),
                     MouseEventKind::Moved => {
                         state.hovered_entry = ui::section_hit_at(
                             &state,
@@ -1185,12 +1181,11 @@ mod tests {
             .map(|column| buffer[(column, 2)].symbol())
             .collect();
         let bottom_row = height - 6;
-        let continuation: String = (0..width)
-            .map(|column| buffer[(column, bottom_row)].symbol())
-            .collect();
         assert!(first_row.contains("Edit src/long.rs"));
-        assert!(continuation.contains("╌╌╌╌"));
-        assert_eq!(buffer[(1, bottom_row)].symbol(), "└");
+        for row in bottom_row - 2..=bottom_row {
+            assert_eq!(buffer[(1, row)].symbol(), "┊");
+            assert_eq!(buffer[(width - 3, row)].symbol(), "┊");
+        }
     }
 
     #[test]

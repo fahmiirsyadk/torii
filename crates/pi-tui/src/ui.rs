@@ -470,9 +470,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         let clipped_below = visible_end < section.end;
         for logical_row in visible_start..visible_end {
             let only_row = section.end.saturating_sub(section.start) == 1;
-            let continuation_row = clipped_below && logical_row + 1 == visible_end;
-            let (left, right) = if continuation_row {
-                ("└", "┘")
+            let continuation_rail = clipped_below && logical_row.saturating_add(3) >= visible_end;
+            let (left, right) = if continuation_rail {
+                ("┊", "┊")
             } else if only_row {
                 ("[", "]")
             } else if logical_row == section.start {
@@ -485,13 +485,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             let y = content
                 .y
                 .saturating_add(logical_row.saturating_sub(scroll) as u16);
-            if continuation_row {
-                frame.render_widget(
-                    Paragraph::new("╌".repeat(area.width.saturating_sub(3) as usize))
-                        .style(Style::default().fg(theme.muted)),
-                    Rect::new(area.x.saturating_add(1), y, area.width.saturating_sub(3), 1),
-                );
-            }
             frame.render_widget(
                 Paragraph::new(left).style(marker_style),
                 Rect::new(area.x, y, 1, 1),
