@@ -1871,7 +1871,9 @@ mod tests {
         state.apply(AgentEvent::Compaction {
             phase: pi_harness::CompactionPhase::End,
             reason: Some("manual".into()),
-            summary: Some("Recent context retained.".into()),
+            summary: Some(
+                "## Highlights\n- Retained recent user requests\n- Dropped old tool outputs".into(),
+            ),
             tokens_before: Some(180_000),
             tokens_after: Some(24_000),
             error: None,
@@ -1881,6 +1883,52 @@ mod tests {
 
         assert!(output.contains("Compacted context"));
         assert!(output.contains("180K → 24K tokens"));
-        assert!(output.contains("Recent context retained."));
+        assert!(output.contains("Highlights"), "heading should be rendered");
+        assert!(
+            output.contains("Retained recent user requests"),
+            "list item should be rendered"
+        );
+        assert!(
+            output.contains("Dropped old tool outputs"),
+            "second list item should be rendered"
+        );
+    }
+
+    #[test]
+    fn compaction_without_tokens_after_omits_the_delta_line() {
+        let (width, height) = (100, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 76_000;
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(76_000),
+            tokens_after: None,
+            error: None,
+        });
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("manual".into()),
+            summary: Some("Compaction finished.".into()),
+            tokens_before: Some(76_000),
+            tokens_after: None,
+            error: None,
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(output.contains("Compacted context"));
+        assert!(
+            !output.contains("→"),
+            "should not fake a token delta when tokens_after is unknown: {output:?}"
+        );
+        assert!(
+            !output.contains("76K → 76K"),
+            "fallback must not show the same number twice"
+        );
+        assert!(output.contains("Compaction finished."));
     }
 }

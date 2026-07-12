@@ -1830,14 +1830,14 @@ fn apply_compaction(
                 matches!(entry, Entry::Compaction { active: true, .. })
             }) {
                 *slot = final_summary;
-                *slot_after = tokens_after.or(tokens_before);
+                *slot_after = tokens_after;
                 *slot_error = error;
                 *active = false;
             } else {
                 state.entries.push(Entry::Compaction {
                     summary: final_summary,
                     tokens_before,
-                    tokens_after: tokens_after.or(tokens_before),
+                    tokens_after,
                     active: false,
                     error,
                 });

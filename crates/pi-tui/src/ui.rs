@@ -418,15 +418,18 @@ fn compaction_lines(
             Style::default().fg(theme.muted),
         )));
     }
-    let wrap_width = width.saturating_sub(4);
+    let indent: &str = "   ";
+    let indent_width = indent.chars().count();
+    let render_width = width.saturating_sub(indent_width);
     let body_lines: Vec<Line<'static>> = if !summary.is_empty() {
-        markdown::wrap(summary, wrap_width)
+        let source: Vec<String> = summary.split('\n').map(str::to_string).collect();
+        markdown::render(&source, render_width, theme)
             .into_iter()
             .map(|line| {
-                Line::from(Span::styled(
-                    format!("   {line}"),
-                    Style::default().fg(theme.foreground),
-                ))
+                let mut prefixed: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+                prefixed.push(Span::raw(indent.to_string()));
+                prefixed.extend(line.spans);
+                Line::from(prefixed)
             })
             .collect()
     } else {
