@@ -1810,12 +1810,14 @@ mod tests {
                 tokens_before,
                 tokens_after,
                 error,
+                started_at,
             } => {
                 assert_eq!(summary, "Kept recent turns; summarized the rest.");
                 assert!(!active);
                 assert_eq!(*tokens_before, Some(184_000));
                 assert_eq!(*tokens_after, Some(22_000));
                 assert!(error.is_none());
+                assert!(started_at.is_none(), "End event should clear started_at");
             }
             other => panic!("expected Compaction entry, got {other:?}"),
         }
@@ -2009,5 +2011,113 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
         assert!(output.contains("Previously compacted"));
+    }
+
+    #[test]
+    fn compaction_banner_appears_between_transcript_and_composer_while_active() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 184_000;
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(184_000),
+            tokens_after: None,
+            error: None,
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        // The banner is a single line with a Braille spinner (not the static
+        // ◌ glyph used by the in-transcript card), the elapsed time, and the
+        // current token count with a down-arrow indicator. We look for the
+        // banner by finding a line with the spinner glyph and "tokens" but
+        // NOT the static "◌" that the in-transcript card uses.
+        let spinner_glyphs = ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}"];
+        let banner_line = output
+            .lines()
+            .find(|line| {
+                line.contains("tokens")
+                    && spinner_glyphs.iter().any(|g| line.contains(g))
+                    && !line.contains("◌")
+            })
+            .expect("banner should be visible while compaction is active");
+        assert!(
+            banner_line.contains("s"),
+            "banner should show elapsed time ending in 's', got: {banner_line:?}"
+        );
+        assert!(
+            banner_line.contains("184K"),
+            "banner should show current token count (184K), got: {banner_line:?}"
+        );
+        assert!(
+            banner_line.contains("↓"),
+            "banner should show the down-arrow indicator, got: {banner_line:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_banner_disappears_once_compaction_finishes() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.context_used = 184_000;
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::Start,
+            reason: Some("manual".into()),
+            summary: None,
+            tokens_before: Some(184_000),
+            tokens_after: None,
+            error: None,
+        });
+        // Banner should be visible right after Start.
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let before = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(
+            before.lines().any(|line| line.contains("Compacting context") && line.contains("s")),
+            "banner should be visible after Start, output: {before}"
+        );
+
+        state.apply(AgentEvent::Compaction {
+            phase: pi_harness::CompactionPhase::End,
+            reason: Some("manual".into()),
+            summary: Some("All done.".into()),
+            tokens_before: Some(184_000),
+            tokens_after: Some(24_000),
+            error: None,
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let after = buffer_text(terminal.backend().buffer(), width, height);
+        let lines_with_banner = after
+            .lines()
+            .filter(|line| line.contains("Compacting context") && line.contains("↓"))
+            .count();
+        assert_eq!(
+            lines_with_banner, 0,
+            "the sticky spinner banner should disappear after End, output: {after}"
+        );
+    }
+
+    #[test]
+    fn compaction_banner_is_not_added_when_no_compaction_is_running() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = super::AppState::default();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+
+        assert!(
+            !output.contains("Compacting context"),
+            "no banner when no compaction is active, got: {output}"
+        );
+        assert!(
+            !output.contains("↓"),
+            "no down-arrow token indicator when no compaction is active, got: {output}"
+        );
     }
 }

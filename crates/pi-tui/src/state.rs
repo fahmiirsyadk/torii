@@ -196,6 +196,10 @@ pub enum Entry {
         tokens_after: Option<u64>,
         active: bool,
         error: Option<String>,
+        /// Wall-clock time the compaction entered the Start phase. Used by
+        /// the banner above the composer to render an elapsed-time counter
+        /// (e.g. "3.2s") that ticks while the compaction is running.
+        started_at: Option<Instant>,
     },
     /// A slim "this session was previously compacted" line emitted on
     /// session load for each stored compaction/branch_summary entry.
@@ -1235,6 +1239,23 @@ impl AppState {
             .min(max_scroll);
     }
 
+    /// Returns the `started_at` of the most recent active compaction, if any.
+    /// The banner above the composer uses this to render a ticking elapsed-time
+    /// counter (e.g. "3.2s") while compaction is in flight.
+    pub fn active_compaction_started_at(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::Compaction {
+                    active: true,
+                    started_at,
+                    ..
+                } => *started_at,
+                _ => None,
+            })
+    }
+
     pub fn scroll_down(&mut self, amount: usize) {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(amount);
     }
@@ -1828,6 +1849,7 @@ fn apply_compaction(
                 tokens_after: None,
                 active: true,
                 error: None,
+                started_at: Some(Instant::now()),
             });
             state.status = "compacting…".into();
         }
@@ -1842,6 +1864,7 @@ fn apply_compaction(
                 tokens_after: slot_after,
                 active,
                 error: slot_error,
+                started_at: slot_started_at,
                 ..
             }) = state.entries.iter_mut().rev().find(|entry| {
                 matches!(entry, Entry::Compaction { active: true, .. })
@@ -1850,6 +1873,7 @@ fn apply_compaction(
                 *slot_after = tokens_after;
                 *slot_error = error;
                 *active = false;
+                *slot_started_at = None;
             } else {
                 state.entries.push(Entry::Compaction {
                     summary: final_summary,
@@ -1857,6 +1881,7 @@ fn apply_compaction(
                     tokens_after,
                     active: false,
                     error,
+                    started_at: None,
                 });
             }
             if let Some(after) = tokens_after {

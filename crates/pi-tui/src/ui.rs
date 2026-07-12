@@ -55,6 +55,7 @@ pub fn tool_hit_at(
                 tokens_after,
                 active,
                 error,
+                started_at: _,
             } => {
                 row += compaction_lines(
                     summary,
@@ -124,11 +125,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         horizontal: 1,
         vertical: 0,
     });
+    let compaction_active = state.active_compaction_started_at().is_some();
+    let banner_height: u16 = if compaction_active { 1 } else { 0 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(6),
+            Constraint::Length(banner_height),
             Constraint::Length(3),
             Constraint::Length(2),
         ])
@@ -136,8 +140,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 
     render_header(frame, areas[0], state, theme);
     render_transcript(frame, areas[1], state, theme);
-    render_composer(frame, areas[2], state, theme);
-    render_shortcuts(frame, areas[3], state, theme);
+    if compaction_active {
+        render_compaction_banner(frame, areas[2], state, theme);
+    }
+    render_composer(frame, areas[3], state, theme);
+    render_shortcuts(frame, areas[4], state, theme);
     crate::overlay::render(frame, state);
 }
 
@@ -171,6 +178,7 @@ pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
                 tokens_after,
                 active,
                 error,
+                started_at: _,
             } => compaction_lines(
                 summary,
                 *tokens_before,
@@ -262,6 +270,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 tokens_after,
                 active,
                 error,
+                started_at: _,
             } => {
                 lines.push(Line::raw(""));
                 lines.extend(compaction_lines(
@@ -518,6 +527,84 @@ struct ToolRender<'a> {
     started_at: Option<std::time::Instant>,
     nested: bool,
     focused: bool,
+}
+
+const COMPACTION_SPINNER: &[&str] = &[
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+];
+
+fn render_compaction_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: Theme,
+) {
+    let started_at = state.active_compaction_started_at();
+    let elapsed_ms = started_at
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let frame_index = (elapsed_ms / 80) as usize % COMPACTION_SPINNER.len();
+    let spinner = COMPACTION_SPINNER[frame_index];
+    let elapsed_label = format_elapsed(elapsed_ms);
+    let left = format!("{spinner} Compacting context…");
+    let center = elapsed_label;
+    let right = format!("↓ {} tokens", compact_number(state.context_used));
+    let width = area.width as usize;
+    let left_chars = left.chars().count();
+    let center_chars = center.chars().count();
+    let right_chars = right.chars().count();
+    let min_gap = 2;
+    let needed = left_chars
+        .saturating_add(min_gap)
+        .saturating_add(center_chars)
+        .saturating_add(min_gap)
+        .saturating_add(right_chars);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(left.clone(), Style::default().fg(theme.accent)));
+    if needed <= width {
+        // 3-column layout: left | center | right
+        let gap_left = (width - left_chars - center_chars - right_chars) / 2;
+        let gap_right =
+            width - left_chars - gap_left - center_chars - right_chars;
+        spans.push(Span::raw(" ".repeat(gap_left)));
+        spans.push(Span::styled(center, Style::default().fg(theme.foreground)));
+        spans.push(Span::raw(" ".repeat(gap_right)));
+        spans.push(Span::styled(right, Style::default().fg(theme.muted)));
+    } else if left_chars + min_gap + right_chars <= width {
+        // 2-column: left | right (drop center)
+        let gap = width - left_chars - right_chars;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(right, Style::default().fg(theme.muted)));
+    } else {
+        // Narrow: just truncate the left text
+        let budget = width.saturating_sub(right_chars + min_gap);
+        let truncated_left: String = if left.chars().count() > budget {
+            let take = budget.saturating_sub(1);
+            let mut s: String = left.chars().take(take).collect();
+            s.push('…');
+            s
+        } else {
+            left.clone()
+        };
+        spans.clear();
+        spans.push(Span::styled(truncated_left, Style::default().fg(theme.accent)));
+    }
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme.background)),
+        area,
+    );
+}
+
+fn format_elapsed(milliseconds: u64) -> String {
+    if milliseconds < 60_000 {
+        format!("{:.1}s", milliseconds as f64 / 1000.0)
+    } else {
+        let total_seconds = milliseconds / 1000;
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn compaction_indicator_line(
