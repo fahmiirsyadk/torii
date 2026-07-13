@@ -766,6 +766,19 @@ export function loadedHistory(session: AgentSession, sessionManager: SessionMana
       history.push({ type: "compaction_indicator", reason, tokens_before });
     }
   }
+  const unfinishedTools = new Map<string, string>();
+  for (const event of history) {
+    if (event.type === "tool_call_start") unfinishedTools.set(event.id, event.name);
+    else if (event.type === "tool_call_result") unfinishedTools.delete(event.id);
+  }
+  for (const [id, name] of unfinishedTools) {
+    history.push({
+      type: "tool_call_result",
+      id,
+      result: { content: `${name} was interrupted before the session was resumed` },
+      is_error: true,
+    });
+  }
   const savedPlan = [...sessionManager.getEntries()].reverse().find((entry) =>
     entry.type === "custom" && (entry.customType === "torii.plan" || entry.customType === "pi-shell.plan")
   );
@@ -1572,53 +1585,9 @@ export function setSessionName(active: ActiveSession, name: string): void {
 }
 
 export async function compactSession(active: ActiveSession, instructions: string | undefined): Promise<void> {
-  try {
-    await active.session.compact(instructions);
-    return;
-  } catch (error) {
-    if (!isMissingCompactionModel(error)) throw error;
-
-    const originalModel = active.session.model;
-    if (originalModel === undefined) throw error;
-    const fallbackModel = await findCompactionFallback(active, originalModel);
-    if (fallbackModel === undefined) throw error;
-
-    // Pi's compactor uses the model currently held by AgentSession and does not
-    // expose a per-compaction model override. Change only the in-memory agent
-    // model here: setModel() would persist a model-change entry and overwrite the
-    // user's default even though this is only a recovery path for summarization.
-    active.session.agent.state.model = fallbackModel;
-    try {
-      await active.session.compact(instructions);
-    } finally {
-      active.session.agent.state.model = originalModel;
-    }
-  }
-}
-
-function isMissingCompactionModel(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /model (?:not found|does not exist|is unavailable)|unknown model/i.test(message);
-}
-
-async function findCompactionFallback(active: ActiveSession, originalModel: ActiveSession["session"]["model"]) {
-  const candidates: Array<NonNullable<typeof originalModel>> = [];
-  const seen = new Set<string>();
-  const add = (model: NonNullable<typeof originalModel> | undefined): void => {
-    if (model === undefined) return;
-    const key = `${model.provider}/${model.id}`;
-    if (seen.has(key) || (originalModel !== undefined && key === `${originalModel.provider}/${originalModel.id}`)) return;
-    seen.add(key);
-    candidates.push(model);
-  };
-
-  for (const reference of active.settingsManager.getEnabledModels() ?? []) {
-    const separator = reference.indexOf("/");
-    if (separator > 0) add(active.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1)));
-  }
-  for (const model of await Promise.resolve(active.modelRegistry.getAvailable())) add(model);
-
-  return candidates.find((model) => active.modelRegistry.hasConfiguredAuth(model));
+  // Match official Pi: compaction always uses the active session model and
+  // credentials. It must never silently switch providers or model IDs.
+  await active.session.compact(instructions);
 }
 
 export function setApiKey(active: ActiveSession, provider: string, key: string): void {

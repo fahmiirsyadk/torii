@@ -48,6 +48,37 @@ test("loaded history preserves Pi compaction-aware entry order", () => {
   ]);
 });
 
+test("loaded history marks an unmatched tool call as interrupted", () => {
+  const contextEntries = [
+    { role: "user", content: [{ type: "text", text: "inspect it" }] },
+    {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "orphan-bash", name: "bash", arguments: { command: "rg TODO" } }],
+      usage: {},
+      stopReason: "toolUse",
+    },
+    { role: "user", content: [{ type: "text", text: "stop" }] },
+    { role: "assistant", content: [], usage: {}, stopReason: "error", errorMessage: "Model not found" },
+  ].map((message) => ({ type: "message", message }));
+  const manager = {
+    buildContextEntries: () => contextEntries,
+    getEntries: () => contextEntries,
+  } as unknown as Parameters<typeof loadedHistory>[1];
+  const session = {
+    thinkingLevel: "medium",
+    model: undefined,
+  } as unknown as Parameters<typeof loadedHistory>[0];
+
+  const history = loadedHistory(session, manager);
+  const result = history.find((event) => event.type === "tool_call_result" && event.id === "orphan-bash");
+  assert.deepEqual(result, {
+    type: "tool_call_result",
+    id: "orphan-bash",
+    result: { content: "bash was interrupted before the session was resumed" },
+    is_error: true,
+  });
+});
+
 test("subagent role resolution layers project role over persona defaults", () => {
   const root = mkdtempSync(join(tmpdir(), "torii-role-"));
   const agentDir = join(root, "agent-home");

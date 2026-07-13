@@ -279,6 +279,8 @@ impl SessionSupervisor {
             resident.status = RuntimeStatus::Idle;
             resident.turn_running = false;
             resident.started_at = None;
+            resident.running_tools.clear();
+            resident.background_tasks.clear();
         }
         self.emit_snapshots().await;
         Ok(())
@@ -519,5 +521,39 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(supervisor.snapshots().await[0].status, RuntimeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_resident_clears_all_tracked_work() {
+        let harness: Arc<dyn AgentHarness> = Arc::new(MockHarness::default());
+        let supervisor = SessionSupervisor::new(harness);
+        let (sender, receiver) = broadcast::channel(16);
+        let id = SessionId("session-1".into());
+        supervisor
+            .adopt("/session.jsonl".into(), id, receiver)
+            .await;
+
+        sender
+            .send(AgentEvent::ToolCallStart {
+                id: "orphan-tool".into(),
+                name: "bash".into(),
+                args: serde_json::json!({}),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::SubagentUpdate {
+                task: Box::new(task("running")),
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        supervisor.stop("/session.jsonl").await.unwrap();
+
+        let residents = supervisor.residents.read().await;
+        let resident = residents.get("/session.jsonl").unwrap();
+        assert_eq!(resident.status, RuntimeStatus::Idle);
+        assert!(!resident.turn_running);
+        assert!(resident.running_tools.is_empty());
+        assert!(resident.background_tasks.is_empty());
     }
 }

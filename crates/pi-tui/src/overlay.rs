@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     state::{AppState, OverlayKind},
@@ -25,6 +26,10 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     }
     if state.overlay == OverlayKind::ForkPicker {
         render_fork_picker(frame, state);
+        return;
+    }
+    if state.overlay == OverlayKind::PasteEditor {
+        render_paste_editor(frame, state);
         return;
     }
 
@@ -50,6 +55,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::ForkPicker => " Fork from prompt ",
         OverlayKind::TreeSummaryPicker => " Summarize branch? ",
         OverlayKind::TreeSummaryEditor => " Custom summarization instructions ",
+        OverlayKind::PasteEditor => " Edit pasted text ",
         OverlayKind::LabelEditor => " Entry label ",
         OverlayKind::FilePicker => " Reference file ",
         OverlayKind::ScopedModels => " Scoped models ",
@@ -73,6 +79,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             | OverlayKind::TreePicker
             | OverlayKind::ForkPicker
             | OverlayKind::TreeSummaryEditor
+            | OverlayKind::PasteEditor
             | OverlayKind::LabelEditor
             | OverlayKind::FilePicker
             | OverlayKind::ScopedModels
@@ -260,6 +267,188 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
+    let theme = Theme::GROK_NIGHT;
+    let frame_area = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
+    let width = frame_area.width.saturating_sub(2).min(120).max(1);
+    let height = frame_area.height.saturating_sub(2).min(40).max(1);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .title(" Edit pasted text ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent).bg(theme.background))
+            .style(Style::default().fg(theme.foreground).bg(theme.background)),
+        area,
+    );
+
+    let content_width = usize::from(area.width.saturating_sub(8)).max(1);
+    let rows = paste_editor_rows(&state.overlay_query, content_width);
+    *state.paste_editor_rows.borrow_mut() = rows
+        .iter()
+        .map(|row| {
+            row.offsets
+                .iter()
+                .copied()
+                .zip(row.columns.iter().copied())
+                .collect()
+        })
+        .collect();
+    let viewport_height = usize::from(area.height.saturating_sub(5)).max(1);
+    let cursor_row = rows
+        .iter()
+        .rposition(|row| {
+            row.offsets
+                .first()
+                .is_some_and(|start| *start <= state.overlay_cursor)
+                && row
+                    .offsets
+                    .last()
+                    .is_some_and(|end| state.overlay_cursor <= *end)
+        })
+        .unwrap_or(0);
+    let max_scroll = rows.len().saturating_sub(viewport_height);
+    let mut scroll = state.paste_editor_scroll.get().min(max_scroll);
+    if state.paste_editor_follow_cursor.get() {
+        if cursor_row < scroll {
+            scroll = cursor_row;
+        } else if cursor_row >= scroll + viewport_height {
+            scroll = cursor_row + 1 - viewport_height;
+        }
+    }
+    state.paste_editor_scroll.set(scroll);
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} lines · {} characters",
+            state.overlay_query.split('\n').count(),
+            state.overlay_query.chars().count()
+        ))
+        .style(Style::default().fg(theme.muted).bg(theme.background)),
+        Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1),
+    );
+
+    let content_x = area.x + 2;
+    let content_y = area.y + 2;
+    let mut targets = Vec::new();
+    let mut cursor_position = None;
+    let lines = rows
+        .iter()
+        .skip(scroll)
+        .take(viewport_height)
+        .enumerate()
+        .map(|(screen_row, row)| {
+            let y = content_y + screen_row as u16;
+            let gutter = row
+                .line_number
+                .map_or_else(|| "     ".to_string(), |line| format!("{line:>4} "));
+            for (index, offset) in row.offsets.iter().enumerate() {
+                let x = content_x + 5 + row.columns[index] as u16;
+                targets.push((x, y, *offset));
+                if *offset == state.overlay_cursor {
+                    cursor_position = Some((x, y));
+                }
+            }
+            Line::from(vec![
+                Span::styled(
+                    gutter,
+                    Style::default().fg(theme.subtle).bg(theme.background),
+                ),
+                Span::styled(
+                    &row.text,
+                    Style::default().fg(theme.foreground).bg(theme.background),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    *state.paste_editor_targets.borrow_mut() = targets;
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.foreground).bg(theme.background)),
+        Rect::new(
+            content_x,
+            content_y,
+            area.width.saturating_sub(4),
+            viewport_height as u16,
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new("Enter newline · Ctrl+Enter apply · Esc cancel · click to position")
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        Rect::new(
+            area.x + 2,
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(4),
+            1,
+        ),
+    );
+    if let Some(position) = cursor_position {
+        frame.set_cursor_position(position);
+    }
+}
+
+struct PasteEditorRow {
+    text: String,
+    offsets: Vec<usize>,
+    columns: Vec<usize>,
+    line_number: Option<usize>,
+}
+
+fn paste_editor_rows(text: &str, width: usize) -> Vec<PasteEditorRow> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut offsets = vec![0];
+    let mut columns = vec![0];
+    let mut visual_width = 0;
+    let mut line_number = 1;
+    let mut first_visual_row = true;
+    let chars = text.chars().collect::<Vec<_>>();
+    for (offset, character) in chars.iter().copied().enumerate() {
+        if character == '\n' {
+            rows.push(PasteEditorRow {
+                text: std::mem::take(&mut current),
+                offsets: std::mem::replace(&mut offsets, vec![offset + 1]),
+                columns: std::mem::replace(&mut columns, vec![0]),
+                line_number: first_visual_row.then_some(line_number),
+            });
+            visual_width = 0;
+            line_number += 1;
+            first_visual_row = true;
+            continue;
+        }
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if visual_width > 0 && visual_width + character_width > width {
+            rows.push(PasteEditorRow {
+                text: std::mem::take(&mut current),
+                offsets: std::mem::replace(&mut offsets, vec![offset]),
+                columns: std::mem::replace(&mut columns, vec![0]),
+                line_number: first_visual_row.then_some(line_number),
+            });
+            visual_width = 0;
+            first_visual_row = false;
+        }
+        current.push(character);
+        visual_width += character_width;
+        offsets.push(offset + 1);
+        columns.push(visual_width);
+    }
+    rows.push(PasteEditorRow {
+        text: current,
+        offsets,
+        columns,
+        line_number: first_visual_row.then_some(line_number),
+    });
+    rows
 }
 
 fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
@@ -674,38 +863,30 @@ fn tree_row(
     line
 }
 
+fn truncate_overlay_text(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let mut result: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() && width > 1 {
+        result.pop();
+        result.push('…');
+    }
+    result
+}
+
 fn short_timestamp(timestamp: &str) -> String {
     timestamp.get(5..16).unwrap_or(timestamp).replace('T', " ")
 }
 
-fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, usize)> {
-    if !state.prompt.starts_with('/') || state.prompt.contains(char::is_whitespace) {
-        return None;
-    }
+fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, usize, usize)> {
     let matches = state.slash_suggestions();
     if matches.is_empty() {
         return None;
     }
-
-    let content_width = matches
-        .iter()
-        .map(|(command, description)| {
-            2 + 1 + command.chars().count() + 2 + description.chars().count()
-        })
-        .max()
-        .unwrap_or(0);
-    let width = (content_width + 2)
-        .min(72)
-        .min(usize::from(frame_area.width.saturating_sub(6).max(1))) as u16;
-    let inner_width = usize::from(width.saturating_sub(2)).max(1);
-    let rows = matches
-        .iter()
-        .map(|(command, description)| {
-            let line_width = 2 + 1 + command.chars().count() + 2 + description.chars().count();
-            line_width.div_ceil(inner_width).max(1)
-        })
-        .sum::<usize>();
-    let height = (rows + 2).min(usize::from(frame_area.height)).max(1) as u16;
+    let width = 72.min(usize::from(frame_area.width.saturating_sub(6).max(1))) as u16;
+    let capacity = usize::from(frame_area.height.saturating_sub(8)).clamp(4, 10);
+    let start = centered_window(state.overlay_selected, matches.len(), capacity);
+    let end = (start + capacity).min(matches.len());
+    let height = (end.saturating_sub(start) + 2) as u16;
     let composer_y = frame_area.bottom().saturating_sub(5);
     Some((
         Rect::new(
@@ -714,33 +895,44 @@ fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, us
             width,
             height,
         ),
-        inner_width,
+        start,
+        end,
     ))
 }
 
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
-    let Some((area, _)) = slash_suggestion_area(state, frame.area()) else {
+    let Some((area, start, end)) = slash_suggestion_area(state, frame.area()) else {
         return;
     };
     let matches = state.slash_suggestions();
     let theme = Theme::GROK_NIGHT;
-    let lines = matches
+    let mut lines = Vec::with_capacity(end.saturating_sub(start));
+    for (index, (command, description)) in matches
         .into_iter()
         .enumerate()
-        .map(|(index, (command, description))| {
-            let selected = index == state.overlay_selected;
-            let marker = if selected { "›" } else { " " };
-            let style = if selected {
-                Style::default().fg(theme.background).bg(theme.foreground)
-            } else {
-                Style::default().fg(theme.foreground)
-            };
-            Line::from(vec![
-                Span::styled(format!("{marker} {command}  "), style),
-                Span::styled(description, style.fg(theme.muted)),
-            ])
-        })
-        .collect::<Vec<_>>();
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        let selected = index == state.overlay_selected;
+        let marker = if selected { "›" } else { " " };
+        let style = if selected {
+            Style::default().fg(theme.background).bg(theme.foreground)
+        } else {
+            Style::default().fg(theme.foreground)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} {command}  "), style),
+            Span::styled(
+                truncate_overlay_text(
+                    &description,
+                    area.width
+                        .saturating_sub(command.chars().count() as u16 + 6)
+                        as usize,
+                ),
+                style.fg(theme.muted),
+            ),
+        ]));
+    }
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -754,20 +946,12 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 pub fn slash_item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<usize> {
-    let (area, inner_width) = slash_suggestion_area(state, Rect::new(0, 0, width, height))?;
-    if row < area.y || row >= area.bottom() || area.width < 3 {
+    let (area, start, end) = slash_suggestion_area(state, Rect::new(0, 0, width, height))?;
+    let item_row = row.checked_sub(area.y + 1)? as usize;
+    if row < area.y + 1 || row >= area.bottom().saturating_sub(1) {
         return None;
     }
-    let mut start = area.y + 1;
-    for (index, (command, description)) in state.slash_suggestions().iter().enumerate() {
-        let line_width = 2 + 1 + command.chars().count() + 2 + description.chars().count();
-        let rows = line_width.div_ceil(inner_width).max(1) as u16;
-        if row < start + rows {
-            return Some(index);
-        }
-        start += rows;
-    }
-    None
+    (start + item_row < end).then_some(start + item_row)
 }
 
 #[cfg(test)]

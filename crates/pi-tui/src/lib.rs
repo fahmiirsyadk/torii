@@ -13,8 +13,8 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
 };
@@ -111,7 +111,7 @@ impl TerminalGuard {
                 return Err(error.into());
             }
         };
-        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
             ratatui::restore();
             return Err(error.into());
         }
@@ -121,7 +121,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -278,6 +278,42 @@ async fn run_app(
                             break;
                         }
                     }
+                    KeyCode::Left if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_cursor(-1);
+                    }
+                    KeyCode::Right if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_cursor(1);
+                    }
+                    KeyCode::Home
+                        if state.overlay == OverlayKind::PasteEditor
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        state.overlay_cursor = 0;
+                    }
+                    KeyCode::End
+                        if state.overlay == OverlayKind::PasteEditor
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        state.overlay_cursor = state.overlay_query.chars().count();
+                    }
+                    KeyCode::Home if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_line_edge(false);
+                    }
+                    KeyCode::End if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_line_edge(true);
+                    }
+                    KeyCode::PageUp if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_vertical(-10);
+                    }
+                    KeyCode::PageDown if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_vertical(10);
+                    }
+                    KeyCode::Up if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_vertical(-1);
+                    }
+                    KeyCode::Down if state.overlay == OverlayKind::PasteEditor => {
+                        state.move_paste_editor_vertical(1);
+                    }
                     KeyCode::Up => state.move_overlay_selection(-1),
                     KeyCode::Down => state.move_overlay_selection(1),
                     KeyCode::Left
@@ -365,6 +401,21 @@ async fn run_app(
                         state.begin_tree_label();
                     }
                     KeyCode::Backspace => state.overlay_backspace(),
+                    KeyCode::Enter
+                        if state.overlay == OverlayKind::PasteEditor
+                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        state.insert_paste_editor_text("\n".into());
+                    }
+                    KeyCode::Char('j' | 'm')
+                        if state.overlay == OverlayKind::PasteEditor
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let action = state.activate_overlay();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
+                    }
                     KeyCode::Enter => {
                         let action = if key.modifiers.contains(KeyModifiers::SHIFT) {
                             state.activate_tree_with_summary()
@@ -384,6 +435,14 @@ async fn run_app(
                     }
                     _ => {}
                 }
+            }
+            Event::Paste(text) if state.overlay == OverlayKind::PasteEditor => {
+                state.insert_paste_editor_text(text);
+            }
+            Event::Paste(text)
+                if state.focus == Focus::Prompt && state.overlay == OverlayKind::None =>
+            {
+                state.insert_paste(text);
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
@@ -545,18 +604,12 @@ async fn run_app(
                 KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
                 KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
                 KeyCode::Up
-                    if state.focus == Focus::Prompt
-                        && state.prompt.starts_with('/')
-                        && !state.prompt.contains(char::is_whitespace)
-                        && !state.slash_suggestions().is_empty() =>
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
                     state.move_slash_selection(-1);
                 }
                 KeyCode::Down
-                    if state.focus == Focus::Prompt
-                        && state.prompt.starts_with('/')
-                        && !state.prompt.contains(char::is_whitespace)
-                        && !state.slash_suggestions().is_empty() =>
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
                     state.move_slash_selection(1);
                 }
@@ -616,6 +669,12 @@ async fn run_app(
                 _ => {}
             },
             Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
+                MouseEventKind::ScrollUp if state.overlay == OverlayKind::PasteEditor => {
+                    state.scroll_paste_editor(-3);
+                }
+                MouseEventKind::ScrollDown if state.overlay == OverlayKind::PasteEditor => {
+                    state.scroll_paste_editor(3);
+                }
                 MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
                 MouseEventKind::ScrollDown => state.move_overlay_selection(1),
                 MouseEventKind::Moved => {
@@ -630,6 +689,11 @@ async fn run_app(
                     }
                 }
                 MouseEventKind::Down(_) => {
+                    if state.overlay == OverlayKind::PasteEditor
+                        && state.click_paste_editor(mouse.column, mouse.row)
+                    {
+                        continue;
+                    }
                     if let Some(index) = crate::overlay::item_at_position(
                         &state,
                         size.width,
@@ -650,9 +714,7 @@ async fn run_app(
             },
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Moved
-                    if state.focus == Focus::Prompt
-                        && state.prompt.starts_with('/')
-                        && !state.prompt.contains(char::is_whitespace) =>
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
                     if let Some(index) =
                         crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
@@ -661,9 +723,7 @@ async fn run_app(
                     }
                 }
                 MouseEventKind::Down(_)
-                    if state.focus == Focus::Prompt
-                        && state.prompt.starts_with('/')
-                        && !state.prompt.contains(char::is_whitespace) =>
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
                     if let Some(index) =
                         crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
@@ -764,8 +824,18 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(kind, _, _, _)| *kind);
-                    let composer_changed = state.composer_hover != composer_hover;
+                    let paste_hover = state
+                        .paste_targets
+                        .borrow()
+                        .iter()
+                        .find(|(_, start, end, row)| {
+                            mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                        })
+                        .map(|(id, _, _, _)| *id);
+                    let composer_changed =
+                        state.composer_hover != composer_hover || state.paste_hover != paste_hover;
                     state.composer_hover = composer_hover;
+                    state.paste_hover = paste_hover;
                     let hovered = ui::section_hit_at(
                         &state,
                         size.width,
@@ -788,7 +858,17 @@ async fn run_app(
                             })
                             .map(|(kind, _, _, _)| *kind)
                     });
-                    if let Some(target) = composer_target {
+                    let paste_target = state
+                        .paste_targets
+                        .borrow()
+                        .iter()
+                        .find(|(_, start, end, row)| {
+                            mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                        })
+                        .map(|(id, _, _, _)| *id);
+                    if let Some(id) = paste_target {
+                        state.begin_paste_edit(id);
+                    } else if let Some(target) = composer_target {
                         if target == 2 {
                             state.cycle_permission_mode();
                             if let Some(sender) = &commands {
@@ -1168,6 +1248,111 @@ mod tests {
         state.prompt = "!! git status".into();
         state.cursor = state.prompt.chars().count();
         assert_eq!(state.submit_bash(), Some(("git status".into(), true)));
+    }
+
+    #[test]
+    fn multiline_paste_is_inserted_inline_and_expands_on_submit() {
+        let mut state = super::AppState {
+            prompt: "check this  some text".into(),
+            cursor: 11,
+            ..super::AppState::default()
+        };
+        state.insert_paste("one\r\ntwo\rthree".into());
+        assert_eq!(state.prompt, "check this one\ntwo\nthree some text");
+        assert_eq!(state.paste_blocks.len(), 1);
+        assert_eq!(state.paste_blocks[0].end - state.paste_blocks[0].start, 13);
+        state.delete();
+        assert_eq!(state.prompt, "check this  some text");
+        assert!(state.paste_blocks.is_empty());
+
+        state.cursor = 11;
+        state.insert_paste("one\ntwo".into());
+        assert_eq!(
+            state.submit_prompt().as_deref(),
+            Some("check this one\ntwo some text")
+        );
+        assert!(state.prompt.is_empty());
+        assert!(state.paste_blocks.is_empty());
+    }
+
+    #[test]
+    fn paste_editor_opens_with_full_content_and_applies_multiline_changes() {
+        let mut state = super::AppState::default();
+        state.insert_paste("one\ntwo".into());
+        let id = state.paste_blocks[0].id;
+
+        assert!(state.begin_paste_edit(id));
+        assert_eq!(state.overlay, super::OverlayKind::PasteEditor);
+        assert_eq!(state.overlay_query, "one\ntwo");
+        state.move_paste_editor_cursor(-3);
+        state.insert_paste_editor_text(" edited".into());
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+
+        assert_eq!(state.prompt, "one\n editedtwo");
+        assert_eq!(state.overlay, super::OverlayKind::None);
+        assert_eq!(state.paste_blocks[0].end, state.prompt.chars().count());
+    }
+
+    #[test]
+    fn paste_editor_cancel_preserves_original_content() {
+        let mut state = super::AppState::default();
+        state.insert_paste("original".into());
+        let id = state.paste_blocks[0].id;
+        assert!(state.begin_paste_edit(id));
+        state.overlay_query = "changed".into();
+
+        assert!(matches!(
+            state.cancel_oauth(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.prompt, "original");
+        assert_eq!(state.overlay, super::OverlayKind::None);
+    }
+
+    #[test]
+    fn editing_one_paste_keeps_later_paste_ranges_aligned() {
+        let mut state = super::AppState::default();
+        state.insert_paste("first".into());
+        let first = state.paste_blocks[0].id;
+        state.insert_char(' ');
+        state.insert_paste("second".into());
+        let second = state.paste_blocks[1].id;
+
+        assert!(state.replace_paste(first, "a much longer first".into()));
+        assert!(state.focus_paste(second));
+        state.delete();
+
+        assert_eq!(state.prompt, "a much longer first ");
+        assert_eq!(state.paste_blocks.len(), 1);
+    }
+
+    #[test]
+    fn paste_editor_navigates_visual_rows_and_clicks_to_position() {
+        let mut state = super::AppState::default();
+        state.insert_paste("abcd\nx".into());
+        let id = state.paste_blocks[0].id;
+        assert!(state.begin_paste_edit(id));
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+
+        state.move_paste_editor_vertical(-1);
+        assert_eq!(state.overlay_cursor, 1);
+        state.move_paste_editor_line_edge(true);
+        assert_eq!(state.overlay_cursor, 4);
+
+        let target = state
+            .paste_editor_targets
+            .borrow()
+            .iter()
+            .find(|(_, _, offset)| *offset == 0)
+            .copied()
+            .unwrap();
+        assert!(state.click_paste_editor(target.0, target.1));
+        assert_eq!(state.overlay_cursor, 0);
     }
 
     #[test]
@@ -2212,6 +2397,48 @@ mod tests {
     }
 
     #[test]
+    fn mixed_pi_edit_diff_preserves_indented_unnumbered_replacements() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "edit-mixed-numbering".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/pi-adapter.ts",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "edit-mixed-numbering".into(),
+            result: pi_harness::ToolResult {
+                content: "Edited src/pi-adapter.ts".into(),
+                details: Some(serde_json::json!({
+                    "diff": "  1578     await active.session.compact(instructions);\n-     // Pi's compactor uses the model currently held by AgentSession and does not\n-     // expose a per-compaction model override. Change only the in-memory agent\n+     // Compaction uses the active model.\n  1581     export function setApiKey(active: ActiveSession, provider: string, key: string): void {"
+                })),
+            },
+            is_error: false,
+            duration_ms: Some(10),
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Diff { lines, .. } => {
+                assert_eq!(lines.len(), 5);
+                assert_eq!(
+                    lines[1].text,
+                    "     // Pi's compactor uses the model currently held by AgentSession and does not"
+                );
+                assert_eq!(
+                    lines[2].text,
+                    "     // expose a per-compaction model override. Change only the in-memory agent"
+                );
+                assert_eq!(lines[3].text, "     // Compaction uses the active model.");
+                assert!(matches!(lines[1].kind, super::state::DiffKind::Removed));
+                assert!(matches!(lines[3].kind, super::state::DiffKind::Added));
+            }
+            other => panic!("expected diff entry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ellipsis_does_not_hide_unnumbered_replacement_lines() {
         let mut state = super::AppState::default();
         state.apply(AgentEvent::ToolCallStart {
@@ -2335,6 +2562,41 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_works_at_cursor_inside_a_prompt_and_valid_tokens_are_colored() {
+        let mut state = super::AppState {
+            prompt: "please /mo then continue".into(),
+            cursor: 10,
+            ..super::AppState::default()
+        };
+        assert!(state.complete_slash_command());
+        assert_eq!(state.prompt, "please /model then continue");
+        assert_eq!(state.cursor, 13);
+        assert!(state.is_valid_slash_command("/model"));
+
+        let mut executable = super::AppState {
+            prompt: "something /model".into(),
+            cursor: 16,
+            ..super::AppState::default()
+        };
+        assert!(matches!(
+            executable.activate_slash_command(),
+            Some(super::state::OverlayAction::None)
+        ));
+        assert_eq!(executable.overlay, super::OverlayKind::ModelPicker);
+        assert!(executable.prompt.is_empty());
+
+        assert!(state.is_valid_slash_command("/model"));
+        assert!(!state.is_valid_slash_command("/modeling"));
+
+        let (width, height) = (100, 24);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("please /model then continue"));
+    }
+
+    #[test]
     fn overlay_and_slash_suggestions_render() {
         let (width, height) = (100, 32);
         let backend = TestBackend::new(width, height);
@@ -2354,6 +2616,24 @@ mod tests {
         let suggestions = buffer_text(terminal.backend().buffer(), width, height);
         assert!(suggestions.contains("/model"));
         assert!(suggestions.contains("Switch model"));
+
+        let mut many = super::AppState {
+            prompt: "/".into(),
+            cursor: 1,
+            runtime_commands: (0..20)
+                .map(|index| pi_harness::RuntimeCommand {
+                    name: format!("/command-{index:02}"),
+                    description: format!("Runtime command {index}"),
+                    source: "test".into(),
+                })
+                .collect(),
+            ..super::AppState::default()
+        };
+        many.overlay_selected = 43;
+        terminal.draw(|frame| ui::render(frame, &many)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("/command-15"));
+        assert!(!output.contains("/command-00"));
     }
 
     #[test]
@@ -3050,12 +3330,14 @@ mod tests {
         assert_eq!(state.prompt, "/deploy");
 
         state.prompt = "/context".into();
+        state.cursor = state.prompt.chars().count();
         assert!(state.activate_slash_command().is_some());
         assert!(
             matches!(state.entries.last(), Some(super::state::Entry::Assistant { lines, .. }) if lines.iter().any(|line| line.contains("AGENTS.md")))
         );
 
         state.prompt = "/reload".into();
+        state.cursor = state.prompt.chars().count();
         assert!(matches!(
             state.activate_slash_command(),
             Some(super::state::OverlayAction::ReloadResources)

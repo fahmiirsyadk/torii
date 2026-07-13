@@ -12,3 +12,4 @@ pi-harness = { path = "../pi-harness" }
 ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true

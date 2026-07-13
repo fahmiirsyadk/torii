@@ -1889,8 +1889,17 @@ fn diff_render_lines(
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
     let available = area.width.saturating_sub(5) as usize;
-    let prompt_length = state.prompt.chars().count();
-    let start = state.cursor.saturating_sub(available.saturating_sub(1));
+    let prompt_length = if state.paste_blocks.is_empty() {
+        state.prompt.chars().count()
+    } else {
+        state.composer_display_len()
+    };
+    let display_cursor = if state.paste_blocks.is_empty() {
+        state.cursor
+    } else {
+        state.composer_display_cursor()
+    };
+    let start = display_cursor.saturating_sub(available.saturating_sub(1));
     let value = if state.prompt.is_empty() {
         state.placeholder.clone()
     } else {
@@ -1916,6 +1925,9 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
     let y = area.bottom().saturating_sub(1);
     let mut targets = state.composer_targets.borrow_mut();
     targets.clear();
+    drop(targets);
+    update_paste_targets(state, area, start);
+    let mut targets = state.composer_targets.borrow_mut();
     for (kind, label) in [(0, &model_label), (1, &thinking_label), (2, &mode_label)] {
         let end = x.saturating_add(label.chars().count() as u16);
         targets.push((kind, x, end, y));
@@ -1955,23 +1967,135 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         .border_style(Style::default().fg(border_color))
         .title_bottom(title_line)
         .title_alignment(Alignment::Right);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("▯ ", Style::default().fg(theme.foreground)),
-            Span::styled(value, value_style),
-        ]))
-        .block(block),
-        area,
-    );
+    let mut prompt_spans = vec![Span::styled("▯ ", Style::default().fg(theme.foreground))];
+    if state.prompt.is_empty() {
+        prompt_spans.push(Span::styled(value, value_style));
+    } else {
+        prompt_spans.extend(composer_prompt_spans(state, start, available, theme));
+    }
+    frame.render_widget(Paragraph::new(Line::from(prompt_spans)).block(block), area);
 
     if state.focus == Focus::Prompt {
         let cursor_offset = if prompt_length == 0 {
             0
         } else {
-            state.cursor.saturating_sub(start).min(available)
+            display_cursor.saturating_sub(start).min(available)
         };
         frame.set_cursor_position((area.x + 3 + cursor_offset as u16, area.y + 1));
     }
+}
+
+fn update_paste_targets(state: &AppState, area: Rect, start: usize) {
+    let mut targets = state.paste_targets.borrow_mut();
+    targets.clear();
+    let mut display = 0usize;
+    for block in &state.paste_blocks {
+        display += block.start.saturating_sub(
+            state
+                .paste_blocks
+                .iter()
+                .find(|candidate| candidate.end <= block.start)
+                .map_or(0, |candidate| candidate.end),
+        );
+        let label_width = format!("[paste#{}]", block.end - block.start)
+            .chars()
+            .count();
+        let left = area
+            .x
+            .saturating_add(3)
+            .saturating_add(display.saturating_sub(start) as u16);
+        targets.push((
+            block.id,
+            left,
+            left.saturating_add(label_width as u16),
+            area.y + 1,
+        ));
+        display += label_width;
+    }
+}
+
+fn composer_prompt_spans(
+    state: &AppState,
+    start: usize,
+    available: usize,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let chars = state.prompt.chars().collect::<Vec<_>>();
+    let end = (start + available).min(chars.len());
+    let mut spans = Vec::new();
+    let mut index = start;
+    if !state.paste_blocks.is_empty() {
+        return composer_paste_spans(state, &chars, theme);
+    }
+    while index < end {
+        let token_start = index;
+        while index < end && !chars[index].is_whitespace() {
+            index += 1;
+        }
+        let token = chars[token_start..index].iter().collect::<String>();
+        let valid = token.starts_with('/') && state.is_valid_slash_command(&token);
+        spans.push(Span::styled(
+            token,
+            if valid {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.foreground)
+            },
+        ));
+        if index < end {
+            let whitespace_start = index;
+            while index < end && chars[index].is_whitespace() {
+                index += 1;
+            }
+            spans.push(Span::styled(
+                chars[whitespace_start..index].iter().collect::<String>(),
+                Style::default().fg(theme.foreground),
+            ));
+        }
+    }
+    spans
+}
+
+fn composer_paste_spans(state: &AppState, chars: &[char], theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for block in &state.paste_blocks {
+        if block.start > cursor {
+            spans.push(Span::styled(
+                chars[cursor..block.start.min(chars.len())]
+                    .iter()
+                    .collect::<String>(),
+                Style::default().fg(theme.foreground),
+            ));
+        }
+        let label = format!("[paste#{}]", block.end.saturating_sub(block.start));
+        let hovered = state.paste_hover == Some(block.id);
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(if hovered {
+                    theme.background
+                } else {
+                    Color::Blue
+                })
+                .bg(if hovered {
+                    Color::Blue
+                } else {
+                    theme.code_background
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = block.end.min(chars.len());
+    }
+    if cursor < chars.len() {
+        spans.push(Span::styled(
+            chars[cursor..].iter().collect::<String>(),
+            Style::default().fg(theme.foreground),
+        ));
+    }
+    spans
 }
 
 fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {

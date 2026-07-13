@@ -69,6 +69,7 @@ pub enum OverlayKind {
     ForkPicker,
     TreeSummaryPicker,
     TreeSummaryEditor,
+    PasteEditor,
     LabelEditor,
     FilePicker,
     ScopedModels,
@@ -282,6 +283,13 @@ pub struct DiffLine {
     pub kind: DiffKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasteBlock {
+    pub id: u64,
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DiffKind {
     Context,
@@ -344,6 +352,8 @@ pub struct AppState {
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
     pub composer_hover: Option<u8>,
+    pub paste_hover: Option<u64>,
+    pub paste_targets: RefCell<Vec<(u64, u16, u16, u16)>>,
     pub branch: String,
     pub cwd: String,
     pub context_used: u64,
@@ -354,6 +364,15 @@ pub struct AppState {
     pub entries: Vec<Entry>,
     pub prompt: String,
     pub cursor: usize,
+    pub paste_blocks: Vec<PasteBlock>,
+    pub next_paste_id: u64,
+    pub pending_paste_id: Option<u64>,
+    pub overlay_cursor: usize,
+    pub paste_editor_preferred_column: Option<usize>,
+    pub paste_editor_scroll: Cell<usize>,
+    pub paste_editor_follow_cursor: Cell<bool>,
+    pub paste_editor_rows: RefCell<Vec<Vec<(usize, usize)>>>,
+    pub paste_editor_targets: RefCell<Vec<(u16, u16, usize)>>,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
     pub placeholder: String,
@@ -430,6 +449,8 @@ impl Default for AppState {
             dashboard_list_rect: Cell::new(None),
             composer_targets: RefCell::new(Vec::new()),
             composer_hover: None,
+            paste_hover: None,
+            paste_targets: RefCell::new(Vec::new()),
             branch: "torii".into(),
             cwd: "~/dev/torii".into(),
             context_used: 0,
@@ -440,6 +461,15 @@ impl Default for AppState {
             entries: Vec::new(),
             prompt: String::new(),
             cursor: 0,
+            paste_blocks: Vec::new(),
+            next_paste_id: 1,
+            pending_paste_id: None,
+            overlay_cursor: 0,
+            paste_editor_preferred_column: None,
+            paste_editor_scroll: Cell::new(0),
+            paste_editor_follow_cursor: Cell::new(true),
+            paste_editor_rows: RefCell::new(Vec::new()),
+            paste_editor_targets: RefCell::new(Vec::new()),
             prompt_history: Vec::new(),
             history_index: None,
             placeholder: "Ask anything…".into(),
@@ -584,34 +614,45 @@ impl AppState {
         true
     }
 
+    fn slash_token_range(&self) -> Option<(usize, usize, String)> {
+        let cursor = self.cursor.min(self.prompt.chars().count());
+        let before = self.prompt.chars().take(cursor).collect::<String>();
+        let start = before
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        let token = before[start..].to_string();
+        let start_chars = before[..start].chars().count();
+        token
+            .starts_with('/')
+            .then_some((start_chars, cursor, token))
+    }
+
     pub fn first_slash_match(&self) -> Option<String> {
-        if !self.prompt.starts_with('/') || self.prompt.contains(char::is_whitespace) {
-            return None;
-        }
-        let query = self.prompt.to_ascii_lowercase();
-        SLASH_COMMANDS
-            .iter()
-            .map(|command| (*command).to_string())
-            .chain(
-                self.runtime_commands
-                    .iter()
-                    .map(|command| command.name.clone()),
-            )
-            .find(|command| command.starts_with(&query))
+        let (_, _, token) = self.slash_token_range()?;
+        self.slash_command_names()
+            .into_iter()
+            .find(|command| command.starts_with(&token.to_ascii_lowercase()))
     }
 
     pub fn complete_slash_command(&mut self) -> bool {
         let Some(command) = self.first_slash_match() else {
             return false;
         };
-        self.prompt = command;
-        self.cursor = self.prompt.chars().count();
+        let Some((start, end, _)) = self.slash_token_range() else {
+            return false;
+        };
+        let start_byte = char_to_byte(&self.prompt, start);
+        let end_byte = char_to_byte(&self.prompt, end);
+        self.prompt.replace_range(start_byte..end_byte, &command);
+        self.cursor = start + command.chars().count();
         self.history_index = None;
         true
     }
 
     pub fn move_slash_selection(&mut self, delta: isize) {
-        if !self.prompt.starts_with('/') || self.prompt.contains(char::is_whitespace) {
+        if self.slash_token_range().is_none() {
             return;
         }
         let count = self.slash_suggestions().len();
@@ -629,15 +670,29 @@ impl AppState {
     }
 
     pub fn activate_slash_command(&mut self) -> Option<OverlayAction> {
-        if self.prompt.starts_with('/') && !self.prompt.contains(char::is_whitespace) {
+        if let Some((start, end, token)) = self.slash_token_range() {
             let suggestions = self.slash_suggestions();
             let exact = suggestions
                 .iter()
-                .any(|(command, _)| command == &self.prompt);
-            if !exact && let Some((command, _)) = suggestions.get(self.overlay_selected) {
-                self.prompt = command.clone();
-                self.cursor = self.prompt.chars().count();
+                .any(|(command, _)| command == &token.to_ascii_lowercase());
+            if !exact {
+                if let Some((command, _)) = suggestions.get(self.overlay_selected) {
+                    let start_byte = char_to_byte(&self.prompt, start);
+                    let end_byte = char_to_byte(&self.prompt, end);
+                    self.prompt.replace_range(start_byte..end_byte, command);
+                } else {
+                    return None;
+                }
             }
+
+            // A slash command is executable wherever it appears in the draft.
+            // Drop prose before the command so `something /model` opens the
+            // model picker instead of being sent as an ordinary prompt. Keep
+            // any text after the command as its command arguments.
+            let command_start = char_to_byte(&self.prompt, start);
+            let command_input = self.prompt[command_start..].trim().to_string();
+            self.prompt = command_input;
+            self.cursor = self.prompt.chars().count();
         }
         let input = self.prompt.trim();
         let mut parts = input.splitn(2, char::is_whitespace);
@@ -756,8 +811,29 @@ impl AppState {
         });
     }
 
+    fn slash_command_names(&self) -> Vec<String> {
+        SLASH_COMMANDS
+            .iter()
+            .map(|command| (*command).to_string())
+            .chain(
+                self.runtime_commands
+                    .iter()
+                    .map(|command| command.name.clone()),
+            )
+            .collect()
+    }
+
+    pub fn is_valid_slash_command(&self, token: &str) -> bool {
+        self.slash_command_names()
+            .iter()
+            .any(|command| command == token)
+    }
+
     pub fn slash_suggestions(&self) -> Vec<(String, String)> {
-        let query = self.prompt.trim_start_matches('/').to_ascii_lowercase();
+        let Some((_, _, token)) = self.slash_token_range() else {
+            return Vec::new();
+        };
+        let query = token.to_ascii_lowercase();
         let builtins = SLASH_COMMANDS
             .iter()
             .map(|name| ((*name).to_string(), builtin_description(name).to_string()));
@@ -768,14 +844,14 @@ impl AppState {
                     format!("{} · {}", command.description, command.source),
                 )
             }))
-            .filter(|(name, _)| name.trim_start_matches('/').starts_with(&query))
-            .take(5)
+            .filter(|(name, _)| name.starts_with(&query))
             .collect()
     }
 
     pub fn open_overlay(&mut self, overlay: OverlayKind) {
         self.overlay = overlay;
         self.overlay_query.clear();
+        self.overlay_cursor = 0;
         self.overlay_selected = 0;
     }
 
@@ -783,6 +859,8 @@ impl AppState {
         if self.overlay != OverlayKind::Permission {
             self.overlay = OverlayKind::None;
             self.overlay_query.clear();
+            self.overlay_cursor = 0;
+            self.pending_paste_id = None;
             self.overlay_selected = 0;
         }
     }
@@ -854,7 +932,7 @@ impl AppState {
                 "Summarize".into(),
                 "Summarize with custom prompt".into(),
             ],
-            OverlayKind::TreeSummaryEditor => Vec::new(),
+            OverlayKind::TreeSummaryEditor | OverlayKind::PasteEditor => Vec::new(),
             OverlayKind::Settings => vec![
                 format!("Steering delivery: {}", self.runtime_settings.steering_mode),
                 format!(
@@ -1038,6 +1116,7 @@ impl AppState {
                 | OverlayKind::SessionRename
                 | OverlayKind::TreePicker
                 | OverlayKind::TreeSummaryEditor
+                | OverlayKind::PasteEditor
                 | OverlayKind::LabelEditor
                 | OverlayKind::FilePicker
                 | OverlayKind::ScopedModels
@@ -1047,7 +1126,13 @@ impl AppState {
                 | OverlayKind::LoginProvider
                 | OverlayKind::RewindPicker
         ) {
-            self.overlay_query.push(character);
+            if self.overlay == OverlayKind::PasteEditor {
+                let byte = char_to_byte(&self.overlay_query, self.overlay_cursor);
+                self.overlay_query.insert(byte, character);
+                self.overlay_cursor += 1;
+            } else {
+                self.overlay_query.push(character);
+            }
             self.overlay_selected = 0;
             if self.overlay == OverlayKind::TreePicker {
                 self.tree_folded.clear();
@@ -1056,7 +1141,16 @@ impl AppState {
     }
 
     pub fn overlay_backspace(&mut self) {
-        self.overlay_query.pop();
+        if self.overlay == OverlayKind::PasteEditor {
+            if self.overlay_cursor > 0 {
+                let start = char_to_byte(&self.overlay_query, self.overlay_cursor - 1);
+                let end = char_to_byte(&self.overlay_query, self.overlay_cursor);
+                self.overlay_query.replace_range(start..end, "");
+                self.overlay_cursor -= 1;
+            }
+        } else {
+            self.overlay_query.pop();
+        }
         self.overlay_selected = 0;
         if self.overlay == OverlayKind::TreePicker {
             self.tree_folded.clear();
@@ -1064,6 +1158,16 @@ impl AppState {
     }
 
     pub fn activate_overlay(&mut self) -> OverlayAction {
+        if self.overlay == OverlayKind::PasteEditor {
+            let Some(id) = self.pending_paste_id else {
+                self.close_overlay();
+                return OverlayAction::None;
+            };
+            let replacement = self.overlay_query.clone();
+            self.replace_paste(id, replacement);
+            self.close_overlay();
+            return OverlayAction::None;
+        }
         if self.overlay == OverlayKind::SessionRename {
             let Some(target) = self.pending_session_path.take() else {
                 return OverlayAction::None;
@@ -1349,6 +1453,7 @@ impl AppState {
             | OverlayKind::SessionRename
             | OverlayKind::SessionDeleteConfirm
             | OverlayKind::TreeSummaryEditor
+            | OverlayKind::PasteEditor
             | OverlayKind::LabelEditor
             | OverlayKind::None => {}
             OverlayKind::FilePicker => {
@@ -1822,13 +1927,295 @@ impl AppState {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        let position = self.cursor;
         let byte = char_to_byte(&self.prompt, self.cursor);
         self.prompt.insert(byte, character);
+        for block in &mut self.paste_blocks {
+            if block.start >= position {
+                block.start += 1;
+                block.end += 1;
+            } else if block.end > position {
+                block.end += 1;
+            }
+        }
         self.cursor += 1;
         self.history_index = None;
     }
 
+    pub fn composer_display_cursor(&self) -> usize {
+        let mut display = self.cursor;
+        for block in &self.paste_blocks {
+            if self.cursor >= block.end {
+                display = display.saturating_sub(
+                    block.end.saturating_sub(block.start).saturating_sub(
+                        format!("[paste#{}]", block.end - block.start)
+                            .chars()
+                            .count(),
+                    ),
+                );
+            } else if self.cursor > block.start {
+                display = display.saturating_sub(self.cursor - block.start);
+                display += format!("[paste#{}]", block.end - block.start)
+                    .chars()
+                    .count();
+                break;
+            }
+        }
+        display
+    }
+
+    pub fn composer_display_len(&self) -> usize {
+        self.prompt.chars().count()
+            + self
+                .paste_blocks
+                .iter()
+                .map(|block| {
+                    format!("[paste#{}]", block.end - block.start)
+                        .chars()
+                        .count()
+                        .saturating_sub(block.end - block.start)
+                })
+                .sum::<usize>()
+    }
+
+    pub fn paste_at_cursor(&self) -> Option<u64> {
+        self.paste_blocks
+            .iter()
+            .find(|block| self.cursor >= block.start && self.cursor <= block.end)
+            .map(|block| block.id)
+    }
+
+    pub fn focus_paste(&mut self, id: u64) -> bool {
+        let Some(block) = self.paste_blocks.iter().find(|block| block.id == id) else {
+            return false;
+        };
+        self.cursor = block.end;
+        self.focus = Focus::Prompt;
+        self.paste_hover = Some(id);
+        true
+    }
+
+    pub fn begin_paste_edit(&mut self, id: u64) -> bool {
+        let Some(block) = self.paste_blocks.iter().find(|block| block.id == id) else {
+            return false;
+        };
+        let start = char_to_byte(&self.prompt, block.start);
+        let end = char_to_byte(&self.prompt, block.end);
+        let content = self.prompt[start..end].to_string();
+        self.open_overlay(OverlayKind::PasteEditor);
+        self.overlay_query = content;
+        self.overlay_cursor = self.overlay_query.chars().count();
+        self.paste_editor_preferred_column = None;
+        self.paste_editor_scroll.set(0);
+        self.paste_editor_follow_cursor.set(true);
+        self.pending_paste_id = Some(id);
+        true
+    }
+
+    pub fn move_paste_editor_cursor(&mut self, delta: isize) {
+        if self.overlay != OverlayKind::PasteEditor {
+            return;
+        }
+        let length = self.overlay_query.chars().count();
+        self.overlay_cursor = if delta < 0 {
+            self.overlay_cursor.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.overlay_cursor
+                .saturating_add(delta as usize)
+                .min(length)
+        };
+        self.paste_editor_preferred_column = None;
+        self.paste_editor_follow_cursor.set(true);
+    }
+
+    pub fn move_paste_editor_vertical(&mut self, delta: isize) {
+        if self.overlay != OverlayKind::PasteEditor {
+            return;
+        }
+        let rows = self.paste_editor_rows.borrow();
+        let Some(current) = rows.iter().rposition(|row| {
+            row.first()
+                .is_some_and(|(start, _)| *start <= self.overlay_cursor)
+                && row
+                    .last()
+                    .is_some_and(|(end, _)| self.overlay_cursor <= *end)
+        }) else {
+            return;
+        };
+        let column = self.paste_editor_preferred_column.unwrap_or_else(|| {
+            let position = rows[current]
+                .iter()
+                .position(|(offset, _)| *offset == self.overlay_cursor)
+                .unwrap_or(0);
+            rows[current].get(position).map_or(0, |(_, column)| *column)
+        });
+        let target = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(rows.len().saturating_sub(1))
+        };
+        if let Some((offset, _)) = rows[target]
+            .iter()
+            .min_by_key(|(_, target_column)| target_column.abs_diff(column))
+        {
+            self.overlay_cursor = *offset;
+            self.paste_editor_preferred_column = Some(column);
+            self.paste_editor_follow_cursor.set(true);
+        }
+    }
+
+    pub fn move_paste_editor_line_edge(&mut self, end: bool) {
+        let rows = self.paste_editor_rows.borrow();
+        let Some(row) = rows.iter().rfind(|row| {
+            row.first()
+                .is_some_and(|(start, _)| *start <= self.overlay_cursor)
+                && row
+                    .last()
+                    .is_some_and(|(row_end, _)| self.overlay_cursor <= *row_end)
+        }) else {
+            return;
+        };
+        if let Some((offset, _)) = if end { row.last() } else { row.first() } {
+            self.overlay_cursor = *offset;
+            self.paste_editor_preferred_column = None;
+            self.paste_editor_follow_cursor.set(true);
+        }
+    }
+
+    pub fn scroll_paste_editor(&self, delta: isize) {
+        let current = self.paste_editor_scroll.get();
+        self.paste_editor_scroll.set(if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize)
+        });
+        self.paste_editor_follow_cursor.set(false);
+    }
+
+    pub fn click_paste_editor(&mut self, column: u16, row: u16) -> bool {
+        let targets = self.paste_editor_targets.borrow();
+        let Some((_, _, offset)) = targets
+            .iter()
+            .filter(|(_, target_row, _)| *target_row == row)
+            .min_by_key(|(target_column, _, _)| target_column.abs_diff(column))
+        else {
+            return false;
+        };
+        self.overlay_cursor = *offset;
+        self.paste_editor_preferred_column = None;
+        self.paste_editor_follow_cursor.set(true);
+        true
+    }
+
+    pub fn insert_paste_editor_text(&mut self, text: String) {
+        if self.overlay != OverlayKind::PasteEditor {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let byte = char_to_byte(&self.overlay_query, self.overlay_cursor);
+        self.overlay_query.insert_str(byte, &normalized);
+        self.overlay_cursor += normalized.chars().count();
+        self.paste_editor_preferred_column = None;
+        self.paste_editor_follow_cursor.set(true);
+    }
+
+    pub fn replace_paste(&mut self, id: u64, replacement: String) -> bool {
+        let Some(block) = self
+            .paste_blocks
+            .iter()
+            .find(|block| block.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        let start_byte = char_to_byte(&self.prompt, block.start);
+        let end_byte = char_to_byte(&self.prompt, block.end);
+        self.prompt
+            .replace_range(start_byte..end_byte, &replacement);
+        let old_length = block.end - block.start;
+        let new_length = replacement.chars().count();
+        if new_length == 0 {
+            self.paste_blocks.retain(|candidate| candidate.id != id);
+        } else if let Some(candidate) = self
+            .paste_blocks
+            .iter_mut()
+            .find(|candidate| candidate.id == id)
+        {
+            candidate.end = candidate.start + new_length;
+        }
+        let delta = new_length as isize - old_length as isize;
+        for candidate in &mut self.paste_blocks {
+            if candidate.id != id && candidate.start >= block.end {
+                candidate.start = candidate.start.saturating_add_signed(delta);
+                candidate.end = candidate.end.saturating_add_signed(delta);
+            }
+        }
+        self.cursor = block.start + new_length;
+        self.paste_hover = None;
+        true
+    }
+
+    pub fn remove_paste(&mut self, id: u64) -> bool {
+        let Some(block) = self
+            .paste_blocks
+            .iter()
+            .find(|block| block.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        let start = char_to_byte(&self.prompt, block.start);
+        let end = char_to_byte(&self.prompt, block.end);
+        self.prompt.replace_range(start..end, "");
+        let length = block.end - block.start;
+        self.paste_blocks.retain(|candidate| candidate.id != id);
+        for candidate in &mut self.paste_blocks {
+            if candidate.start >= block.end {
+                candidate.start -= length;
+                candidate.end -= length;
+            }
+        }
+        self.cursor = block.start;
+        self.paste_hover = None;
+        true
+    }
+
+    pub fn insert_paste(&mut self, text: String) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        let start = self.cursor;
+        let byte = char_to_byte(&self.prompt, start);
+        self.prompt.insert_str(byte, &normalized);
+        let length = normalized.chars().count();
+        for block in &mut self.paste_blocks {
+            if block.start >= start {
+                block.start += length;
+                block.end += length;
+            } else if block.end > start {
+                block.end += length;
+            }
+        }
+        self.paste_blocks.push(PasteBlock {
+            id: self.next_paste_id,
+            start,
+            end: start + length,
+        });
+        self.next_paste_id += 1;
+        self.cursor += length;
+        self.history_index = None;
+    }
+
     pub fn backspace(&mut self) {
+        if let Some(id) = self.paste_at_cursor()
+            && self.remove_paste(id)
+        {
+            self.history_index = None;
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -1836,16 +2223,34 @@ impl AppState {
         let end = char_to_byte(&self.prompt, self.cursor);
         self.prompt.replace_range(start..end, "");
         self.cursor -= 1;
+        for block in &mut self.paste_blocks {
+            if block.start >= self.cursor + 1 {
+                block.start -= 1;
+                block.end -= 1;
+            }
+        }
         self.history_index = None;
     }
 
     pub fn delete(&mut self) {
+        if let Some(id) = self.paste_at_cursor()
+            && self.remove_paste(id)
+        {
+            self.history_index = None;
+            return;
+        }
         if self.cursor >= self.prompt.chars().count() {
             return;
         }
         let start = char_to_byte(&self.prompt, self.cursor);
         let end = char_to_byte(&self.prompt, self.cursor + 1);
         self.prompt.replace_range(start..end, "");
+        for block in &mut self.paste_blocks {
+            if block.start > self.cursor {
+                block.start -= 1;
+                block.end -= 1;
+            }
+        }
         self.history_index = None;
     }
 
@@ -1871,6 +2276,7 @@ impl AppState {
     pub fn clear_prompt(&mut self) {
         self.prompt.clear();
         self.cursor = 0;
+        self.paste_blocks.clear();
         self.history_index = None;
     }
 
@@ -2231,6 +2637,7 @@ impl AppState {
             AgentEvent::PromptPrefill { text } => {
                 self.prompt = text;
                 self.cursor = self.prompt.chars().count();
+                self.paste_blocks.clear();
                 self.focus = Focus::Prompt;
             }
             AgentEvent::ThinkingChanged { level } => self.thinking_level = level,
@@ -3051,6 +3458,20 @@ fn parse_numbered_diff_line(line: &str) -> Option<DiffLine> {
         .take_while(char::is_ascii_digit)
         .collect::<String>();
     if digits.is_empty() {
+        if matches!(marker, '+' | '-') {
+            // Compact Pi diffs number context lines but leave changed lines as
+            // `-     source` / `+     source`. Keep the source indentation;
+            // trimming it makes removed/added code appear malformed.
+            return Some(DiffLine {
+                number: None,
+                text: line[marker.len_utf8()..].to_string(),
+                kind: if marker == '+' {
+                    DiffKind::Added
+                } else {
+                    DiffKind::Removed
+                },
+            });
+        }
         let text = remainder.trim();
         return (text == "...").then(|| DiffLine {
             number: None,
