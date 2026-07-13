@@ -1,6 +1,10 @@
 # Torii
 
-A terminal interface for coding-agent sessions powered by the Pi SDK.
+A terminal interface for coding-agent sessions powered by the Pi SDK. (WIP). The Design heavy inspired from Grok Build CLI.
+
+<div align="center">
+<img width="725" height="582" alt="screenshot-20260713-145028" src="https://github.com/user-attachments/assets/1e39cff2-1f51-461d-a70c-a2b72b489008" />
+</div>
 
 ## Features
 
@@ -14,6 +18,11 @@ A terminal interface for coding-agent sessions powered by the Pi SDK.
 - Non-blocking clipboard image decoding with processing, success, and error states.
 - Project file references, shell commands, prompt history, plans, MCP tools, and package management.
 - Interactive and headless operation.
+
+## Screenshots
+<img width="1337" height="896" alt="screenshot-20260713-185523" src="https://github.com/user-attachments/assets/3512820a-733a-4439-95c0-065cf89da725" />
+<img width="930" height="590" alt="screenshot-20260713-075616" src="https://github.com/user-attachments/assets/4c43ef20-b87c-4ea0-88a0-ca70d1f01506" />
+
 
 ## Install
 
