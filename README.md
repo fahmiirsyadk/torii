@@ -35,8 +35,8 @@ Requirements:
 Install the sidecar dependencies and build the release binary:
 
 ```bash
-git clone https://github.com/fahmiirsyadk/pi-shell.git
-cd pi-shell/sidecar
+git clone https://github.com/fahmiirsyadk/torii.git
+cd torii/sidecar
 npm install
 cd ..
 cargo build --release -p torii
