@@ -35,19 +35,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
 
     let items = state.overlay_items();
-    let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2
-        + usize::from(matches!(
-            state.overlay,
-            OverlayKind::SessionPicker | OverlayKind::SessionDeleteConfirm
-        )) * 2
-        + usize::from(state.overlay == OverlayKind::SessionPicker && items.is_empty())
-        + usize::from(matches!(
-            state.overlay,
-            OverlayKind::TreePicker | OverlayKind::ForkPicker
-        )) * 2;
-    let height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
     let width = frame_area.width.saturating_sub(6).clamp(30, 72);
-    let area = centered(frame_area, width, height);
+    let (area, _, visible_start, visible_end) =
+        generic_picker_layout(state, frame_area, items.len(), width);
     frame.render_widget(Clear, area);
 
     let title = match state.overlay {
@@ -86,6 +76,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             | OverlayKind::LabelEditor
             | OverlayKind::FilePicker
             | OverlayKind::ScopedModels
+            | OverlayKind::SubagentModelPicker
             | OverlayKind::OauthPrompt
             | OverlayKind::OauthSelect
             | OverlayKind::LoginProvider
@@ -205,18 +196,33 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             Style::default().fg(theme.muted),
         )));
     }
-    for (index, item) in items.iter().enumerate() {
+    let filtered_models = state.filtered_models();
+    let subagent_inherit_visible = state.overlay == OverlayKind::SubagentModelPicker
+        && (state.overlay_query.is_empty()
+            || "inherit parent (default)".contains(&state.overlay_query.to_ascii_lowercase()));
+    for (index, item) in items
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+    {
         let selected = index == state.overlay_selected;
         let marker = if selected { "› " } else { "  " };
-        let model_current = state.overlay == OverlayKind::ModelPicker && item == &state.model;
+        let row_model = match state.overlay {
+            OverlayKind::ModelPicker | OverlayKind::ScopedModels => {
+                filtered_models.get(index).copied()
+            }
+            OverlayKind::SubagentModelPicker => index
+                .checked_sub(usize::from(subagent_inherit_visible))
+                .and_then(|model_index| filtered_models.get(model_index).copied()),
+            _ => None,
+        };
+        let model_current = state.overlay == OverlayKind::ModelPicker
+            && row_model.is_some_and(|model| model.display_name == state.model);
         let subagent_model_current = state.overlay == OverlayKind::SubagentModelPicker
             && match state.runtime_settings.subagent_model.as_deref() {
-                None => item == "Inherit parent (default)",
-                Some(id) => state
-                    .available_models
-                    .iter()
-                    .find(|model| model.id == id)
-                    .is_some_and(|model| item == &model.display_name),
+                None => row_model.is_none() && item == "Inherit parent (default)",
+                Some(id) => row_model.is_some_and(|model| model.id == id),
             };
         let session_current = state.overlay == OverlayKind::SessionPicker
             && state
@@ -233,10 +239,18 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         } else {
             Style::default().fg(theme.foreground)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{item}{current}"),
-            style,
-        )));
+        let mut spans = vec![Span::styled(format!("{marker}{item}{current}"), style)];
+        if let Some(model) = row_model {
+            let provider = model
+                .id
+                .split_once('/')
+                .map_or("unknown", |(provider, _)| provider);
+            spans.push(Span::styled(
+                format!("  {provider}"),
+                style.fg(if selected { theme.subtle } else { theme.muted }),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     let block = Block::default()
@@ -756,7 +770,18 @@ pub fn slash_item_at(state: &AppState, width: u16, height: u16, row: u16) -> Opt
     None
 }
 
+#[cfg(test)]
 pub fn item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<usize> {
+    item_at_position(state, width, height, width / 2, row)
+}
+
+pub fn item_at_position(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
     let frame_area = Rect::new(0, 0, width, height);
     let entries = state.filtered_tree();
     match state.overlay {
@@ -791,8 +816,65 @@ pub fn item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<us
             let item = offset / 3;
             (row >= first_row && item < end.saturating_sub(start)).then_some(start + item)
         }
-        _ => None,
+        _ => {
+            let items = state.overlay_items();
+            let overlay_width = frame_area.width.saturating_sub(6).clamp(30, 72);
+            let (area, first_row, start, end) =
+                generic_picker_layout(state, frame_area, items.len(), overlay_width);
+            if column <= area.x || column >= area.right().saturating_sub(1) || row < first_row {
+                return None;
+            }
+            let offset = usize::from(row - first_row);
+            (start + offset < end).then_some(start + offset)
+        }
     }
+}
+
+fn overlay_has_query(overlay: OverlayKind) -> bool {
+    matches!(
+        overlay,
+        OverlayKind::CommandPalette
+            | OverlayKind::ModelPicker
+            | OverlayKind::SessionPicker
+            | OverlayKind::SessionRename
+            | OverlayKind::TreeSummaryEditor
+            | OverlayKind::LabelEditor
+            | OverlayKind::FilePicker
+            | OverlayKind::ScopedModels
+            | OverlayKind::SubagentModelPicker
+            | OverlayKind::OauthPrompt
+            | OverlayKind::OauthSelect
+            | OverlayKind::LoginProvider
+            | OverlayKind::RewindPicker
+    )
+}
+
+fn generic_picker_layout(
+    state: &AppState,
+    frame_area: Rect,
+    item_count: usize,
+    width: u16,
+) -> (Rect, u16, usize, usize) {
+    let mut prelude_rows = usize::from(overlay_has_query(state.overlay)) * 2;
+    prelude_rows += usize::from(state.overlay == OverlayKind::Permission) * 2;
+    prelude_rows += usize::from(matches!(
+        state.overlay,
+        OverlayKind::SessionPicker | OverlayKind::SessionDeleteConfirm
+    )) * 2;
+    prelude_rows += usize::from(state.overlay == OverlayKind::SessionPicker && item_count == 0);
+    prelude_rows += usize::from(
+        state.pending_oauth.is_some()
+            && matches!(
+                state.overlay,
+                OverlayKind::OauthPrompt | OverlayKind::OauthSelect
+            ),
+    );
+    let height = (item_count + prelude_rows + 2).clamp(6, 16) as u16;
+    let area = centered(frame_area, width, height);
+    let capacity = usize::from(height).saturating_sub(prelude_rows + 2).max(1);
+    let start = centered_window(state.overlay_selected, item_count, capacity);
+    let end = (start + capacity).min(item_count);
+    (area, area.y + 1 + prelude_rows as u16, start, end)
 }
 
 fn centered(parent: Rect, width: u16, height: u16) -> Rect {

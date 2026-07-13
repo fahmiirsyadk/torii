@@ -1630,6 +1630,11 @@ export function removeAuth(active: ActiveSession, provider: string): void {
 }
 
 export async function abortSession(active: ActiveSession): Promise<void> {
+  // AgentSession.abort() only stops model/retry work. Direct shell execution,
+  // compaction, and branch summaries each own a separate abort controller.
+  active.session.abortBash();
+  active.session.abortCompaction();
+  active.session.abortBranchSummary();
   await active.session.abort();
 }
 

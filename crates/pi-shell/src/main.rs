@@ -203,9 +203,10 @@ async fn main() -> Result<()> {
                         let _ = command_harness.clone_session(&command_session).await;
                     }
                     pi_tui::UiCommand::Compact(instructions) => {
-                        let _ = command_harness
-                            .compact(&command_session, instructions)
-                            .await;
+                        let harness = Arc::clone(&command_harness);
+                        tokio::spawn(async move {
+                            let _ = harness.compact(&command_session, instructions).await;
+                        });
                     }
                     pi_tui::UiCommand::LoadTree { user_only } => {
                         let _ = command_harness
@@ -217,9 +218,12 @@ async fn main() -> Result<()> {
                         summarize,
                         instructions,
                     } => {
-                        let _ = command_harness
-                            .navigate_tree(&command_session, entry_id, summarize, instructions)
-                            .await;
+                        let harness = Arc::clone(&command_harness);
+                        tokio::spawn(async move {
+                            let _ = harness
+                                .navigate_tree(&command_session, entry_id, summarize, instructions)
+                                .await;
+                        });
                     }
                     pi_tui::UiCommand::ForkSession { entry_id } => {
                         let _ = command_harness
@@ -248,9 +252,12 @@ async fn main() -> Result<()> {
                         command,
                         exclude_from_context,
                     } => {
-                        let _ = command_harness
-                            .execute_bash(&command_session, command, exclude_from_context)
-                            .await;
+                        let harness = Arc::clone(&command_harness);
+                        tokio::spawn(async move {
+                            let _ = harness
+                                .execute_bash(&command_session, command, exclude_from_context)
+                                .await;
+                        });
                     }
                     pi_tui::UiCommand::ReloadResources => {
                         let _ = command_harness.reload_resources(&command_session).await;

@@ -87,6 +87,10 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                     .len();
                 actionable = true;
             }
+            Entry::Plan { entries, expanded } => {
+                row += plan_lines(entries, *expanded, width, Theme::GROK_NIGHT).len();
+                actionable = true;
+            }
             Entry::Tool { .. } => {
                 let Entry::Tool { label, .. } = &state.entries[index] else {
                     unreachable!()
@@ -177,6 +181,7 @@ fn section_target_id(entry: &Entry, index: usize) -> String {
         Entry::User { .. } => format!("user:{index}"),
         Entry::Reasoning { .. } => format!("reasoning:{index}"),
         Entry::Assistant { .. } => format!("assistant:{index}"),
+        Entry::Plan { .. } => format!("plan:{index}"),
         Entry::Compaction { .. } => format!("compaction:{index}"),
         Entry::CompactionIndicator { .. } => format!("compaction-indicator:{index}"),
     }
@@ -768,7 +773,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: The
     let task_status = if state.tasks_total == 0 {
         String::new()
     } else {
-        format!(" │ {}/{} ✓", state.tasks_complete, state.tasks_total)
+        format!(" │ Plan {}/{}", state.tasks_complete, state.tasks_total)
     };
     let right = format!(
         "{} / {}{}",
@@ -846,6 +851,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 lines.extend(rendered);
                 entry_index += consumed.saturating_sub(1);
             }
+            Entry::Plan { entries, expanded } => {
+                lines.extend(plan_lines(entries, *expanded, width, theme));
+            }
             Entry::Compaction {
                 summary,
                 tokens_before,
@@ -911,7 +919,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                     section.start.saturating_add(1),
                     section.end.saturating_sub(1),
                 ),
-                Entry::Reasoning { .. } | Entry::Diff { .. } => {
+                Entry::Reasoning { .. } | Entry::Diff { .. } | Entry::Plan { .. } => {
                     (section.start, section.end.saturating_sub(1))
                 }
                 Entry::Assistant { .. }
@@ -1188,6 +1196,80 @@ fn compaction_lines(
     lines
 }
 
+fn plan_lines(
+    entries: &[pi_harness::PlanEntry],
+    expanded: bool,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let completed = entries
+        .iter()
+        .filter(|entry| entry.status == "completed")
+        .count();
+    let mut header = vec![
+        Span::styled(
+            "◆ Plan",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {completed}/{}", entries.len()),
+            Style::default().fg(theme.muted),
+        ),
+    ];
+    if !expanded {
+        let summary = entries
+            .iter()
+            .find(|entry| entry.status == "in_progress")
+            .map(|entry| entry.step.as_str())
+            .or_else(|| (completed == entries.len()).then_some("completed"));
+        if let Some(summary) = summary {
+            let budget = width.saturating_sub(12);
+            header.push(Span::styled(
+                format!(" · {}", truncate(summary, budget)),
+                Style::default().fg(theme.muted),
+            ));
+        }
+    }
+
+    let mut lines = vec![Line::from(header)];
+    if expanded {
+        let body_width = width.saturating_sub(4).max(1);
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let wrapped = markdown::wrap(entry.step.trim(), body_width);
+            let wrapped = if wrapped.is_empty() {
+                vec![String::new()]
+            } else {
+                wrapped
+            };
+            for (line_index, text) in wrapped.iter().enumerate() {
+                let last = entry_index + 1 == entries.len() && line_index + 1 == wrapped.len();
+                let rail = if last { "└ " } else { "│ " };
+                let (marker, color, modifier) = match entry.status.as_str() {
+                    "completed" => ("✓ ", theme.success, Modifier::DIM),
+                    "in_progress" => ("> ", theme.accent, Modifier::BOLD),
+                    "pending" => ("· ", theme.muted, Modifier::empty()),
+                    _ => ("? ", theme.warning, Modifier::empty()),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(rail, Style::default().fg(theme.subtle)),
+                    Span::styled(
+                        if line_index == 0 { marker } else { "  " },
+                        Style::default().fg(color).add_modifier(modifier),
+                    ),
+                    Span::styled(
+                        text.clone(),
+                        Style::default().fg(color).add_modifier(modifier),
+                    ),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
 fn reasoning_lines(
     text: &str,
     active: bool,
@@ -1203,7 +1285,7 @@ fn reasoning_lines(
     let glyph = if hovered {
         ">"
     } else if active {
-        "⠹"
+        "*"
     } else {
         "◆"
     };

@@ -16,6 +16,7 @@
 import { createInterface } from "node:readline";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 
+import { dispatchCommand } from "./command-dispatch.ts";
 import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
 import * as pi from "./pi-adapter.ts";
@@ -508,16 +509,22 @@ const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of input) {
   if (line.trim() === "") continue;
 
-  let requestId: string | undefined;
+  let command: SidecarCommand;
   try {
-    const command = JSON.parse(line) as SidecarCommand;
-    requestId = "request_id" in command ? command.request_id : undefined;
-    await handleCommand(command);
+    command = JSON.parse(line) as SidecarCommand;
   } catch (error) {
     writeMessage({
       type: "error",
-      request_id: requestId,
       message: error instanceof Error ? error.message : String(error),
     });
+    continue;
   }
+
+  await dispatchCommand(command, handleCommand, (failedCommand, error) => {
+    writeMessage({
+      type: "error",
+      request_id: "request_id" in failedCommand ? failedCommand.request_id : undefined,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
 }

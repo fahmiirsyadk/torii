@@ -591,10 +591,10 @@ async fn run_app(
                     state.toggle_latest_reasoning();
                 }
                 KeyCode::Char('t') if state.focus == Focus::Scrollback => {
-                    state.toggle_latest_tool();
+                    state.toggle_all_tools();
                 }
                 KeyCode::Char('d') if state.focus == Focus::Scrollback => {
-                    state.toggle_latest_diff();
+                    state.toggle_all_diffs();
                 }
                 KeyCode::Esc if state.streaming => {
                     if let Some(sender) = &commands {
@@ -619,16 +619,24 @@ async fn run_app(
                 MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
                 MouseEventKind::ScrollDown => state.move_overlay_selection(1),
                 MouseEventKind::Moved => {
-                    if let Some(index) =
-                        crate::overlay::item_at(&state, size.width, size.height, mouse.row)
-                    {
+                    if let Some(index) = crate::overlay::item_at_position(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    ) {
                         state.overlay_selected = index;
                     }
                 }
                 MouseEventKind::Down(_) => {
-                    if let Some(index) =
-                        crate::overlay::item_at(&state, size.width, size.height, mouse.row)
-                    {
+                    if let Some(index) = crate::overlay::item_at_position(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    ) {
                         state.overlay_selected = index;
                         let action = state.activate_overlay();
                         if dispatch_overlay_action(action, &commands) {
@@ -636,27 +644,7 @@ async fn run_app(
                         }
                         continue;
                     }
-                    if matches!(
-                        state.overlay,
-                        OverlayKind::TreePicker | OverlayKind::ForkPicker
-                    ) {
-                        continue;
-                    }
-                    let items = state.overlay_items();
-                    let detail_rows = usize::from(state.overlay == OverlayKind::Permission) * 2;
-                    let overlay_height = (items.len() + detail_rows + 4).clamp(6, 16) as u16;
-                    let overlay_y = size.height.saturating_sub(overlay_height) / 2;
-                    let query_rows = usize::from(matches!(
-                        state.overlay,
-                        OverlayKind::CommandPalette
-                            | OverlayKind::ModelPicker
-                            | OverlayKind::SessionPicker
-                    )) * 2;
-                    let items_y = overlay_y + 1 + detail_rows as u16 + query_rows as u16;
-                    let index = mouse.row.saturating_sub(items_y) as usize;
-                    if index < items.len() {
-                        state.overlay_selected = index;
-                    }
+                    continue;
                 }
                 _ => {}
             },
@@ -1133,7 +1121,8 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
-        assert!(output.contains("Thinking…"));
+        assert!(output.contains("* Thinking…"));
+        assert!(!output.contains('⠹'));
         assert!(output.contains("Enter: steer"));
         assert!(output.contains("Alt+Enter: follow-up"));
         assert!(output.contains("cargo test"));
@@ -1356,6 +1345,66 @@ mod tests {
             Some(super::state::Entry::Diff { expanded, .. }) => assert!(!expanded),
             _ => panic!("expected diff entry"),
         }
+    }
+
+    #[test]
+    fn tool_and_diff_shortcuts_toggle_every_matching_entry() {
+        let mut state = fixtures::tools();
+
+        state.toggle_all_tools();
+        assert!(
+            state
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::state::Entry::Tool { expanded, .. } => Some(*expanded),
+                    _ => None,
+                })
+                .all(|expanded| expanded)
+        );
+        assert!(!state.expanded_tool_groups.is_empty());
+        state.toggle_all_tools();
+        assert!(
+            state
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::state::Entry::Tool { expanded, .. } => Some(*expanded),
+                    _ => None,
+                })
+                .all(|expanded| !expanded)
+        );
+        assert!(state.expanded_tool_groups.is_empty());
+
+        if let Some(super::state::Entry::Diff { expanded, .. }) = state
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(entry, super::state::Entry::Diff { .. }))
+        {
+            *expanded = false;
+        }
+        state.toggle_all_diffs();
+        assert!(
+            state
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::state::Entry::Diff { expanded, .. } => Some(*expanded),
+                    _ => None,
+                })
+                .all(|expanded| expanded)
+        );
+        state.toggle_all_diffs();
+        assert!(
+            state
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::state::Entry::Diff { expanded, .. } => Some(*expanded),
+                    _ => None,
+                })
+                .all(|expanded| !expanded)
+        );
     }
 
     #[test]
@@ -2126,6 +2175,43 @@ mod tests {
     }
 
     #[test]
+    fn padded_pi_edit_diff_does_not_invent_zero_based_display_numbers() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "edit-padded".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/state.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "edit-padded".into(),
+            result: pi_harness::ToolResult {
+                content: "Edited src/state.rs".into(),
+                details: Some(serde_json::json!({
+                    "diff": "      ...\n  602         self.history_index = None;\n  603         true\n+ 606     pub fn move_slash_selection(&mut self) {\n+ 607         if !self.prompt.starts_with('/') {\n      ..."
+                })),
+            },
+            is_error: false,
+            duration_ms: Some(10),
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Diff { lines, .. } => {
+                let numbers = lines
+                    .iter()
+                    .filter_map(|line| line.number)
+                    .collect::<Vec<_>>();
+                assert_eq!(numbers, vec![602, 603, 606, 607]);
+                assert!(!numbers.contains(&0));
+                assert!(matches!(lines[3].kind, super::state::DiffKind::Added));
+            }
+            other => panic!("expected diff entry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ellipsis_does_not_hide_unnumbered_replacement_lines() {
         let mut state = super::AppState::default();
         state.apply(AgentEvent::ToolCallStart {
@@ -2321,6 +2407,87 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("MiniMax-M3  ✓ current"));
         assert!(!output.contains("GLM-5.2  ✓ current"));
+    }
+
+    #[test]
+    fn long_model_picker_follows_selection_and_hover_uses_visible_rows() {
+        let (width, height) = (100, 24);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState {
+            available_models: (0..30)
+                .map(|index| pi_harness::ModelInfo {
+                    id: format!("provider-{}/model-{index:02}", index / 10),
+                    display_name: format!("Model {index:02}"),
+                })
+                .collect(),
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::ModelPicker);
+        state.overlay_selected = 25;
+
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(
+            output.contains("Model 25"),
+            "selected model must stay visible: {output}"
+        );
+        assert!(
+            !output.contains("Model 00"),
+            "viewport should follow selection: {output}"
+        );
+        let selected_row = output
+            .lines()
+            .position(|line| line.contains('›') && line.contains("Model 25"))
+            .unwrap() as u16;
+        assert_eq!(
+            overlay::item_at_position(&state, width, height, width / 2, selected_row),
+            Some(25)
+        );
+        assert_eq!(
+            overlay::item_at_position(&state, width, height, 0, selected_row),
+            None,
+            "hover outside the modal must not select a row"
+        );
+    }
+
+    #[test]
+    fn subagent_model_picker_filters_by_provider_and_groups_provider_rows() {
+        let (width, height) = (100, 24);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState {
+            available_models: vec![
+                pi_harness::ModelInfo {
+                    id: "zeta/model-b".into(),
+                    display_name: "Shared B".into(),
+                },
+                pi_harness::ModelInfo {
+                    id: "alpha/model-a".into(),
+                    display_name: "Shared A".into(),
+                },
+                pi_harness::ModelInfo {
+                    id: "alpha/model-c".into(),
+                    display_name: "Shared C".into(),
+                },
+            ],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::SubagentModelPicker);
+        for character in "alpha".chars() {
+            state.insert_overlay_char(character);
+        }
+
+        assert_eq!(state.overlay_items(), vec!["Shared A", "Shared C"]);
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        let a = output.find("Shared A  alpha").unwrap();
+        let c = output.find("Shared C  alpha").unwrap();
+        assert!(
+            a < c,
+            "models should be grouped and sorted by provider: {output}"
+        );
+        assert!(!output.contains("Shared B"));
     }
 
     #[test]
@@ -3023,7 +3190,20 @@ mod tests {
 
     #[test]
     fn persisted_plan_updates_header_progress_and_plan_mode() {
+        let (width, height) = (100, 24);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
         let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "plan-tool".into(),
+            name: "update_plan".into(),
+            args: serde_json::json!({"entries": []}),
+        });
+        assert!(
+            state.entries.is_empty(),
+            "raw update_plan tool should stay hidden"
+        );
+
         state.apply(AgentEvent::PlanUpdate {
             entries: vec![
                 pi_harness::PlanEntry {
@@ -3038,6 +3218,36 @@ mod tests {
         });
         assert_eq!((state.tasks_complete, state.tasks_total), (1, 2));
         assert_eq!(state.plan_entries.len(), 2);
+        assert!(matches!(
+            state.entries.as_slice(),
+            [super::state::Entry::Plan { expanded: true, .. }]
+        ));
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("◆ Plan  1/2"));
+        assert!(output.contains("✓ Inspect"));
+        assert!(output.contains("> Implement"));
+        assert!(output.contains("Plan 1/2"));
+
+        state.apply(AgentEvent::PlanUpdate {
+            entries: vec![
+                pi_harness::PlanEntry {
+                    step: "Inspect".into(),
+                    status: "completed".into(),
+                },
+                pi_harness::PlanEntry {
+                    step: "Implement".into(),
+                    status: "completed".into(),
+                },
+            ],
+        });
+        assert!(matches!(
+            state.entries.as_slice(),
+            [super::state::Entry::Plan {
+                expanded: false,
+                ..
+            }]
+        ));
 
         state.prompt = "/plan".into();
         assert!(

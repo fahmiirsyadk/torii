@@ -250,6 +250,10 @@ pub enum Entry {
         lines: Vec<String>,
         timestamp: String,
     },
+    Plan {
+        entries: Vec<pi_harness::PlanEntry>,
+        expanded: bool,
+    },
     Compaction {
         summary: String,
         tokens_before: Option<u64>,
@@ -830,8 +834,8 @@ impl AppState {
                 COMMANDS.iter().map(|item| (*item).to_string()).collect()
             }
             OverlayKind::ModelPicker => self
-                .available_models
-                .iter()
+                .filtered_models()
+                .into_iter()
                 .map(|model| model.display_name.clone())
                 .collect(),
             OverlayKind::SessionPicker => self
@@ -890,8 +894,8 @@ impl AppState {
                 ),
             ],
             OverlayKind::ScopedModels => self
-                .available_models
-                .iter()
+                .filtered_models()
+                .into_iter()
                 .map(|model| {
                     let mark = if self.runtime_settings.enabled_models.contains(&model.id) {
                         "✓"
@@ -901,13 +905,20 @@ impl AppState {
                     format!("[{mark}] {}", model.display_name)
                 })
                 .collect(),
-            OverlayKind::SubagentModelPicker => std::iter::once("Inherit parent (default)".into())
-                .chain(
-                    self.available_models
-                        .iter()
+            OverlayKind::SubagentModelPicker => {
+                let query = self.overlay_query.to_ascii_lowercase();
+                let inherit = "Inherit parent (default)";
+                let mut items = Vec::new();
+                if query.is_empty() || inherit.to_ascii_lowercase().contains(&query) {
+                    items.push(inherit.into());
+                }
+                items.extend(
+                    self.filtered_models()
+                        .into_iter()
                         .map(|model| model.display_name.clone()),
-                )
-                .collect(),
+                );
+                items
+            }
             OverlayKind::OauthPrompt => Vec::new(),
             OverlayKind::OauthSelect => self
                 .pending_oauth
@@ -948,11 +959,35 @@ impl AppState {
         source
             .into_iter()
             .filter(|item| {
-                self.overlay == OverlayKind::SessionPicker
-                    || query.is_empty()
+                matches!(
+                    self.overlay,
+                    OverlayKind::SessionPicker
+                        | OverlayKind::ModelPicker
+                        | OverlayKind::ScopedModels
+                        | OverlayKind::SubagentModelPicker
+                ) || query.is_empty()
                     || item.to_ascii_lowercase().contains(&query)
             })
             .collect()
+    }
+
+    pub(crate) fn filtered_models(&self) -> Vec<&ModelInfo> {
+        let query = self.overlay_query.to_ascii_lowercase();
+        let mut models = self
+            .available_models
+            .iter()
+            .filter(|model| {
+                query.is_empty()
+                    || model.display_name.to_ascii_lowercase().contains(&query)
+                    || model.id.to_ascii_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            model_provider(left)
+                .cmp(model_provider(right))
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        models
     }
 
     pub fn move_overlay_selection(&mut self, delta: isize) {
@@ -1006,6 +1041,7 @@ impl AppState {
                 | OverlayKind::LabelEditor
                 | OverlayKind::FilePicker
                 | OverlayKind::ScopedModels
+                | OverlayKind::SubagentModelPicker
                 | OverlayKind::OauthPrompt
                 | OverlayKind::OauthSelect
                 | OverlayKind::LoginProvider
@@ -1108,9 +1144,9 @@ impl AppState {
             },
             OverlayKind::ModelPicker => {
                 let Some(model) = self
-                    .available_models
-                    .iter()
-                    .find(|model| model.display_name == item)
+                    .filtered_models()
+                    .get(self.overlay_selected)
+                    .cloned()
                     .cloned()
                 else {
                     return OverlayAction::None;
@@ -1228,12 +1264,17 @@ impl AppState {
                 return OverlayAction::SetScopedModels(models);
             }
             OverlayKind::SubagentModelPicker => {
+                let inherit_visible = self.overlay_query.is_empty()
+                    || "inherit parent (default)"
+                        .contains(&self.overlay_query.to_ascii_lowercase());
                 let model = if item == "Inherit parent (default)" {
                     None
                 } else {
-                    self.available_models
-                        .iter()
-                        .find(|model| model.display_name == item)
+                    self.filtered_models()
+                        .get(
+                            self.overlay_selected
+                                .saturating_sub(usize::from(inherit_visible)),
+                        )
                         .map(|model| model.id.clone())
                 };
                 if item != "Inherit parent (default)" && model.is_none() {
@@ -1435,18 +1476,22 @@ impl AppState {
         if self.overlay != OverlayKind::ScopedModels {
             return;
         }
-        let Some(model) = self.available_models.get(self.overlay_selected) else {
+        let Some(model_id) = self
+            .filtered_models()
+            .get(self.overlay_selected)
+            .map(|model| model.id.clone())
+        else {
             return;
         };
         if let Some(index) = self
             .runtime_settings
             .enabled_models
             .iter()
-            .position(|id| id == &model.id)
+            .position(|id| id == &model_id)
         {
             self.runtime_settings.enabled_models.remove(index);
         } else {
-            self.runtime_settings.enabled_models.push(model.id.clone());
+            self.runtime_settings.enabled_models.push(model_id);
         }
     }
 
@@ -1889,6 +1934,46 @@ impl AppState {
         }
     }
 
+    pub fn toggle_all_tools(&mut self) {
+        let expand = self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Tool {
+                    expanded: false,
+                    ..
+                }
+            )
+        });
+        for entry in &mut self.entries {
+            if let Entry::Tool { expanded, .. } = entry {
+                *expanded = expand;
+            }
+        }
+
+        // A collapsed group would otherwise keep its children hidden even
+        // though their individual entries have been expanded.
+        self.expanded_tool_groups.clear();
+        if expand {
+            let mut index = 0;
+            while index < self.entries.len() {
+                let Entry::Tool { label, .. } = &self.entries[index] else {
+                    index += 1;
+                    continue;
+                };
+                let count = self.entries[index..]
+                    .iter()
+                    .take_while(
+                        |entry| matches!(entry, Entry::Tool { label: other, .. } if other == label),
+                    )
+                    .count();
+                if count > 1 {
+                    self.expanded_tool_groups.insert(index);
+                }
+                index += count;
+            }
+        }
+    }
+
     pub fn toggle_tool_at(&mut self, index: usize) {
         self.focused_entry = Some(index);
         self.focused_section = None;
@@ -1918,11 +2003,32 @@ impl AppState {
         }
     }
 
+    pub fn toggle_all_diffs(&mut self) {
+        let expand = self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Diff {
+                    expanded: false,
+                    ..
+                }
+            )
+        });
+        for entry in &mut self.entries {
+            if let Entry::Diff { expanded, .. } = entry {
+                *expanded = expand;
+            }
+        }
+    }
+
     pub fn toggle_entry_at(&mut self, index: usize) {
         self.focused_entry = Some(index);
         self.focused_section = None;
         match self.entries.get_mut(index) {
-            Some(Entry::Reasoning { expanded, .. } | Entry::Diff { expanded, .. }) => {
+            Some(
+                Entry::Reasoning { expanded, .. }
+                | Entry::Diff { expanded, .. }
+                | Entry::Plan { expanded, .. },
+            ) => {
                 *expanded = !*expanded;
             }
             Some(Entry::Tool { .. }) => self.toggle_tool_at(index),
@@ -2211,7 +2317,22 @@ impl AppState {
                     .iter()
                     .filter(|entry| entry.status == "completed")
                     .count();
-                self.plan_entries = entries;
+                self.plan_entries = entries.clone();
+                let complete = plan_entries_complete(&entries);
+                if let Some(Entry::Plan {
+                    entries: current,
+                    expanded,
+                }) = self.entries.iter_mut().rev().find(|entry| {
+                    matches!(entry, Entry::Plan { entries, .. } if !plan_entries_complete(entries))
+                }) {
+                    *current = entries;
+                    *expanded = !complete;
+                } else if !entries.is_empty() {
+                    self.entries.push(Entry::Plan {
+                        entries,
+                        expanded: !complete,
+                    });
+                }
                 self.status = "plan updated".into();
             }
             AgentEvent::SessionTree { entries, user_only } => {
@@ -2250,6 +2371,9 @@ impl AppState {
                 self.streaming = true;
             }
             AgentEvent::ToolCallStart { id, name, args } => {
+                if name.eq_ignore_ascii_case("update_plan") {
+                    return;
+                }
                 if name.eq_ignore_ascii_case("spawn_subagent") {
                     self.status = "starting subagent…".into();
                     return;
@@ -2514,6 +2638,17 @@ impl AppState {
             _ => {}
         }
     }
+}
+
+fn plan_entries_complete(entries: &[pi_harness::PlanEntry]) -> bool {
+    !entries.is_empty() && entries.iter().all(|entry| entry.status == "completed")
+}
+
+fn model_provider(model: &ModelInfo) -> &str {
+    model
+        .id
+        .split_once('/')
+        .map_or("unknown", |(provider, _)| provider)
 }
 
 fn builtin_description(command: &str) -> &'static str {
@@ -2908,7 +3043,9 @@ fn parse_numbered_diff_line(line: &str) -> Option<DiffLine> {
     if !matches!(marker, ' ' | '+' | '-') {
         return None;
     }
-    let remainder = &line[marker.len_utf8()..];
+    // Pi pads its compact diff columns (`  602`, `- 602`, `+ 606`). The
+    // padding is presentation, not another line-number column.
+    let remainder = line[marker.len_utf8()..].trim_start();
     let digits = remainder
         .chars()
         .take_while(char::is_ascii_digit)
