@@ -16,9 +16,9 @@
  * never import from `@earendil-works/pi-coding-agent` directly.
  */
 
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, relative, resolve } from "node:path";
-import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { execFile, spawn as spawnProcess } from "node:child_process";
 import { promisify } from "node:util";
 
 import {
@@ -57,6 +57,13 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
 import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
+import {
+  type CapabilityMode,
+  type LaunchContext,
+  NativeSubagentCoordinator,
+  type SubagentRecord,
+  taskOutput,
+} from "./subagents.ts";
 
 // -----------------------------------------------------------------------------
 // Active session — the bridge between wire state and the SDK session.
@@ -72,7 +79,6 @@ export interface ActiveSession {
   agentDir: string;
   lastCompletion?: Extract<AgentEvent, { type: "turn_complete" }>;
   toolStarted: Map<string, number>;
-  subagentStarted: Map<string, number>;
 }
 
 // -----------------------------------------------------------------------------
@@ -89,11 +95,14 @@ export function runtimeFactory(
   unregisterPermissionReply: (id: string) => void,
   nextPermissionId: () => number,
   emitFor: (wireSessionId: string) => (event: AgentEvent) => void,
+  subagents?: NativeSubagentCoordinator,
+  depth = 0,
+  inherited?: { model?: { provider: string; id: string }; thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; capabilityMode?: CapabilityMode; tools?: string[] },
 ) {
   return async ({ cwd, agentDir, sessionManager, sessionStartEvent }: { cwd: string; agentDir: string; sessionManager: SessionManager; sessionStartEvent?: Parameters<typeof createAgentSessionFromServices>[0]["sessionStartEvent"] }) => {
     const services = await createAgentSessionServices({ cwd, agentDir, resourceLoaderOptions: { extensionFactories: [
       permissionExtension(wireSessionId, cwd, nextPermissionId, () => modeLookup(wireSessionId), alwaysAllowedLookup, rememberAlwaysAllowed, registerPermissionReply, unregisterPermissionReply, emitFor(wireSessionId)),
-      grokToolsExtension(wireSessionId, emitFor(wireSessionId)),
+      grokToolsExtension(wireSessionId, cwd, sessionManager.getSessionFile(), emitFor(wireSessionId), subagents, depth),
       mcpExtension(wireSessionId, cwd, agentDir, mcpClients, emitFor(wireSessionId)),
     ] } });
     const context = sessionManager.buildSessionContext();
@@ -107,7 +116,21 @@ export function runtimeFactory(
       const model = separator < 1 ? undefined : services.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1));
       return model === undefined ? [] : [{ model }];
     });
-    const created = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: saved ?? fallback, scopedModels });
+    const inheritedModel = inherited?.model === undefined
+      ? undefined
+      : services.modelRegistry.find(inherited.model.provider, inherited.model.id);
+    const tools = inherited?.tools ?? (inherited?.capabilityMode === undefined || inherited.capabilityMode === "all"
+      ? undefined
+      : capabilityTools(inherited.capabilityMode));
+    const created = await createAgentSessionFromServices({
+      services,
+      sessionManager,
+      sessionStartEvent,
+      model: inheritedModel ?? saved ?? fallback,
+      thinkingLevel: inherited?.thinkingLevel,
+      scopedModels,
+      tools,
+    });
     return { ...created, services, diagnostics: services.diagnostics };
   };
 }
@@ -123,7 +146,6 @@ export async function bindRuntime(
     active.settingsManager = active.runtime.services.settingsManager;
     active.agentDir = active.runtime.services.agentDir;
     active.toolStarted.clear();
-    active.subagentStarted.clear();
     active.session.subscribe((event) => handlePiEvent(active, event, emitEvent));
     await active.session.bindExtensions({
       mode: "json",
@@ -162,7 +184,7 @@ export function permissionExtension(
     name: "torii-permissions",
     factory: (pi: ExtensionAPI) => {
       pi.on("tool_call", async (event) => {
-        if (!["bash", "write", "edit"].includes(event.toolName.toLowerCase())) return;
+        if (!["bash", "write", "edit", "apply_subagent_worktree", "remove_subagent_worktree"].includes(event.toolName.toLowerCase())) return;
         if (["write", "edit"].includes(event.toolName.toLowerCase())) {
           const input = event.input as Record<string, unknown>;
           const candidate = typeof input.path === "string" ? resolve(cwd, input.path) : undefined;
@@ -207,9 +229,21 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+function capabilityTools(mode: CapabilityMode): string[] {
+  const read = ["read", "grep", "find", "ls", "web_fetch", "web_search"];
+  if (mode === "read-only") return read;
+  if (mode === "read-write") return [...read, "write", "edit"];
+  if (mode === "execute") return [...read, "bash"];
+  return [];
+}
+
 export function grokToolsExtension(
   wireSessionId: string,
+  cwd: string,
+  parentSessionPath: string | undefined,
   emitEvent: (event: AgentEvent) => void,
+  subagents?: NativeSubagentCoordinator,
+  depth = 0,
 ) {
   return {
     name: "torii-grok-tools",
@@ -268,8 +302,144 @@ export function grokToolsExtension(
           return { content: [{ type: "text", text: "Plan updated" }], details: { entries: params.entries } };
         },
       });
+      if (subagents !== undefined) {
+        const taskForParent = (taskId: string) => {
+          const record = subagents.get(taskId);
+          return record !== undefined && record.parentSessionId === wireSessionId && record.parentSessionPath === parentSessionPath
+            ? record
+            : undefined;
+        };
+        pi.registerTool({
+          name: "spawn_subagent",
+          label: "Agent",
+          description: depth > 0
+            ? "Unavailable: subagents cannot spawn nested subagents."
+            : "Start an independent child session for a bounded task. The child has its own context and persisted transcript.",
+          parameters: Type.Object({
+            prompt: Type.String({ description: "Complete task prompt for the child" }),
+            description: Type.String({ description: "Short 3-5 word task label" }),
+            subagent_type: Type.Optional(Type.String({ default: "general-purpose" })),
+            background: Type.Optional(Type.Boolean({ default: false })),
+            capability_mode: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("read-write"), Type.Literal("execute"), Type.Literal("all")])),
+            isolation: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("worktree")], { default: "none" })),
+            resume_from: Type.Optional(Type.String()),
+            cwd: Type.Optional(Type.String()),
+          }),
+          async execute(_id, params, signal) {
+            if (depth > 0) throw new Error("subagent depth limit exceeded: a child session cannot spawn another child");
+            const record = await subagents.spawn(wireSessionId, parentSessionPath, {
+              prompt: params.prompt,
+              description: params.description,
+              subagentType: params.subagent_type ?? "general-purpose",
+              background: params.background ?? false,
+              capabilityMode: params.capability_mode,
+              isolation: params.isolation ?? "none",
+              resumeFrom: params.resume_from,
+              cwd: params.cwd,
+            });
+            if (record.background) {
+              return { content: [{ type: "text", text: `Subagent started in background. Task ID: ${record.taskId}` }], details: subagents.snapshot(record) };
+            }
+            const abort = () => { void subagents.kill(record.taskId); };
+            if (signal?.aborted) abort();
+            else signal?.addEventListener("abort", abort, { once: true });
+            const [finished] = await subagents.wait([record.taskId], "wait_all", 24 * 60 * 60 * 1000, signal);
+            signal?.removeEventListener("abort", abort);
+            return { content: [{ type: "text", text: finished.output ?? finished.error ?? taskOutput(subagents, finished) }], details: subagents.snapshot(finished) };
+          },
+        });
+        pi.registerTool({
+          name: "get_command_or_subagent_output",
+          label: "Agent output",
+          description: "Get the current status/output for a background task, optionally waiting for completion.",
+          parameters: Type.Object({
+            task_id: Type.String(),
+            timeout_ms: Type.Optional(Type.Number({ minimum: 0, maximum: 300000, default: 0 })),
+          }),
+          async execute(_id, params, signal) {
+            if (taskForParent(params.task_id) === undefined) throw new Error(`unknown task: ${params.task_id}`);
+            const [record] = await subagents.wait([params.task_id], "wait_all", params.timeout_ms ?? 0, signal);
+            return { content: [{ type: "text", text: taskOutput(subagents, record) }], details: subagents.snapshot(record) };
+          },
+        });
+        pi.registerTool({
+          name: "wait_commands_or_subagents",
+          label: "Wait tasks",
+          description: "Wait for any or all listed background tasks (maximum 20).",
+          parameters: Type.Object({
+            task_ids: Type.Array(Type.String(), { minItems: 1, maxItems: 20 }),
+            mode: Type.Optional(Type.Union([Type.Literal("wait_any"), Type.Literal("wait_all")], { default: "wait_all" })),
+            timeout_ms: Type.Optional(Type.Number({ minimum: 0, maximum: 300000, default: 30000 })),
+          }),
+          async execute(_id, params, signal) {
+            for (const taskId of params.task_ids) {
+              if (taskForParent(taskId) === undefined) throw new Error(`unknown task: ${taskId}`);
+            }
+            const records = await subagents.wait(params.task_ids, params.mode ?? "wait_all", params.timeout_ms ?? 30000, signal);
+            const text = records.map((record) => taskOutput(subagents, record)).join("\n\n");
+            return { content: [{ type: "text", text }], details: { tasks: records.map((record) => subagents.snapshot(record)) } };
+          },
+        });
+        pi.registerTool({
+          name: "kill_command_or_subagent",
+          label: "Kill task",
+          description: "Cancel a running subagent task. Succeeds when the task has already stopped.",
+          parameters: Type.Object({ task_id: Type.String() }),
+          async execute(_id, params) {
+            if (taskForParent(params.task_id) === undefined) throw new Error(`unknown task: ${params.task_id}`);
+            const record = await subagents.kill(params.task_id);
+            return { content: [{ type: "text", text: taskOutput(subagents, record) }], details: subagents.snapshot(record) };
+          },
+        });
+        if (depth === 0) {
+          pi.registerTool({
+            name: "apply_subagent_worktree",
+            label: "Apply worktree",
+            description: "Explicitly apply a completed isolated subagent's Git diff to the parent workspace. This never runs automatically.",
+            parameters: Type.Object({ task_id: Type.String() }),
+            async execute(_id, params) {
+              const record = taskForParent(params.task_id);
+              if (record === undefined) throw new Error(`unknown task: ${params.task_id}`);
+              if (record.status === "running") throw new Error("cannot apply a running subagent worktree");
+              if (record.worktreePath === undefined) throw new Error("task has no worktree");
+              const base = (await execFileAsync("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim();
+              const patch = (await execFileAsync("git", ["-C", record.worktreePath, "diff", "--binary", base])).stdout;
+              if (patch.trim() === "") return { content: [{ type: "text", text: "Worktree has no changes to apply." }], details: { task_id: record.taskId, worktree_path: record.worktreePath } };
+              await gitApplyPatch(cwd, patch);
+              return { content: [{ type: "text", text: `Applied worktree changes from ${record.worktreePath}` }], details: { task_id: record.taskId, worktree_path: record.worktreePath } };
+            },
+          });
+          pi.registerTool({
+            name: "remove_subagent_worktree",
+            label: "Remove worktree",
+            description: "Remove a stopped subagent's Git worktree. Dirty worktrees require force=true.",
+            parameters: Type.Object({ task_id: Type.String(), force: Type.Optional(Type.Boolean({ default: false })) }),
+            async execute(_id, params) {
+              const record = taskForParent(params.task_id);
+              if (record === undefined) throw new Error(`unknown task: ${params.task_id}`);
+              if (record.status === "running") throw new Error("cannot remove a running subagent worktree");
+              if (record.worktreePath === undefined) return { content: [{ type: "text", text: "Task worktree is already removed." }], details: { task_id: record.taskId } };
+              await execFileAsync("git", ["-C", cwd, "worktree", "remove", ...(params.force ? ["--force"] : []), record.worktreePath]);
+              const removed = record.worktreePath;
+              subagents.worktreeRemoved(record.taskId);
+              return { content: [{ type: "text", text: `Removed worktree ${removed}` }], details: { task_id: record.taskId } };
+            },
+          });
+        }
+      }
     },
   };
+}
+
+async function gitApplyPatch(cwd: string, patch: string): Promise<void> {
+  await new Promise<void>((resolvePromise, reject) => {
+    const child = spawnProcess("git", ["-C", cwd, "apply", "--3way", "-"], { stdio: ["pipe", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolvePromise() : reject(new Error(stderr.trim() || `git apply exited ${code}`)));
+    child.stdin.end(patch);
+  });
 }
 
 type McpServerConfig = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string; url?: string; type?: "http" | "sse" };
@@ -385,11 +555,6 @@ export function resultText(result: unknown): string {
     .join("\n");
 }
 
-export function backgroundAgentId(result: string): string | undefined {
-  const match = result.match(/Agent ID:\s*([\w-]+)/i) ?? result.match(/"agent_id"\s*:\s*"([^"]+)"/);
-  return match?.[1];
-}
-
 export function textContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -411,7 +576,6 @@ export function textContent(content: unknown): string {
 export function sessionHistory(messages: readonly unknown[]): AgentEvent[] {
   const history: AgentEvent[] = [];
   const toolStarted = new Map<string, number>();
-  const subagentStarted = new Map<string, number>();
   for (const value of messages) {
     if (typeof value !== "object" || value === null || !("role" in value)) continue;
     const message = value as { role: string; content?: unknown };
@@ -436,8 +600,7 @@ export function sessionHistory(messages: readonly unknown[]): AgentEvent[] {
             typeof item.arguments === "object" && item.arguments !== null
               ? (item.arguments as Record<string, unknown>)
               : {};
-          const agentId = name.toLowerCase() === "get_subagent_result" ? String(args.agent_id ?? "") : "";
-          toolStarted.set(id, subagentStarted.get(agentId) ?? messageTimestamp);
+          toolStarted.set(id, messageTimestamp);
           history.push({
             type: "tool_call_start",
             id,
@@ -467,10 +630,6 @@ export function sessionHistory(messages: readonly unknown[]): AgentEvent[] {
       const completedAt = Number(item.timestamp ?? 0);
       const startedAt = toolStarted.get(id);
       const content = resultText(message);
-      if (String(item.toolName ?? "").toLowerCase() === "agent") {
-        const agentId = backgroundAgentId(content);
-        if (agentId !== undefined && startedAt !== undefined) subagentStarted.set(agentId, startedAt);
-      }
       history.push({
         type: "tool_call_result",
         id,
@@ -508,14 +667,7 @@ export function handlePiEvent(
       break;
     }
     case "tool_execution_start": {
-      const agentId =
-        event.toolName.toLowerCase() === "get_subagent_result" &&
-        typeof event.args === "object" &&
-        event.args !== null &&
-        "agent_id" in event.args
-          ? String((event.args as Record<string, unknown>).agent_id)
-          : "";
-      active.toolStarted.set(event.toolCallId, active.subagentStarted.get(agentId) ?? Date.now());
+      active.toolStarted.set(event.toolCallId, Date.now());
       emitEvent(sessionId, {
         type: "tool_call_start",
         id: event.toolCallId,
@@ -528,10 +680,6 @@ export function handlePiEvent(
       const startedAt = active.toolStarted.get(event.toolCallId);
       active.toolStarted.delete(event.toolCallId);
       const content = resultText(event.result);
-      if (event.toolName.toLowerCase() === "agent") {
-        const agentId = backgroundAgentId(content);
-        if (agentId !== undefined && startedAt !== undefined) active.subagentStarted.set(agentId, startedAt);
-      }
       emitEvent(sessionId, {
         type: "tool_call_result",
         id: event.toolCallId,
@@ -635,7 +783,10 @@ export function loadedHistory(session: AgentSession, sessionManager: SessionMana
       display_name: session.model.name,
     });
   }
-  history.unshift({ type: "thinking_changed", level: session.thinkingLevel });
+  history.unshift(
+    { type: "thinking_options", levels: session.getAvailableThinkingLevels?.() ?? ["off"] },
+    { type: "thinking_changed", level: session.thinkingLevel },
+  );
   return history;
 }
 
@@ -675,6 +826,23 @@ export async function resolveSessionTarget(target: string): Promise<string> {
   return matches[0].path;
 }
 
+export function loadPersistedSubagentTranscript(path: string): AgentEvent[] {
+  if (!existsSync(path)) return [];
+  const manager = SessionManager.open(path);
+  const history: AgentEvent[] = [];
+  for (const entry of manager.buildContextEntries()) {
+    if (entry.type === "message") history.push(...sessionHistory([entry.message]));
+    else if (entry.type === "compaction" || entry.type === "branch_summary") {
+      history.push({
+        type: "compaction_indicator",
+        reason: entry.type === "branch_summary" ? "branch" : "manual",
+        tokens_before: entry.type === "compaction" ? entry.tokensBefore : undefined,
+      });
+    }
+  }
+  return history;
+}
+
 export interface OpenSessionHooks {
   emitEvent: (wireSessionId: string, event: AgentEvent) => void;
   getNextPermissionId: () => number;
@@ -684,6 +852,7 @@ export interface OpenSessionHooks {
   registerPermissionReply: (id: string, reply: (decision: "allow_once" | "allow_always" | "deny") => void) => void;
   unregisterPermissionReply: (id: string) => void;
   mcpClients: Map<string, McpClient>;
+  subagents?: NativeSubagentCoordinator;
 }
 
 export async function openSession(
@@ -713,6 +882,7 @@ export async function openSession(
       hooks.unregisterPermissionReply,
       hooks.getNextPermissionId,
       (id) => (event) => hooks.emitEvent(id, event),
+      hooks.subagents,
     ),
     {
       cwd,
@@ -731,11 +901,211 @@ export async function openSession(
     settingsManager: services.settingsManager,
     agentDir: services.agentDir,
     toolStarted: new Map(),
-    subagentStarted: new Map(),
   };
   const history = loadedHistory(session, sessionManager);
   await bindRuntime(active, hooks.emitEvent);
   return { active, history };
+}
+
+function finalAssistantOutcome(session: AgentSession): { text: string; stopReason?: string; error?: string } {
+  for (let index = session.messages.length - 1; index >= 0; index--) {
+    const message = session.messages[index] as unknown as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string };
+    if (message.role !== "assistant") continue;
+    const text = textContent(message.content);
+    return { text: text || "(subagent completed without a text response)", stopReason: message.stopReason, error: message.errorMessage };
+  }
+  return { text: "(subagent completed without a text response)" };
+}
+
+function childActivity(event: AgentEvent): string | undefined {
+  if (event.type === "reasoning_delta") return "Thinking";
+  if (event.type === "text_delta") return "Responding";
+  if (event.type === "compaction" && event.phase === "start") return "Compacting";
+  if (event.type === "permission_request") return `Waiting for permission: ${event.tool}`;
+  if (event.type === "tool_call_start") {
+    const args = typeof event.args === "object" && event.args !== null ? event.args as Record<string, unknown> : {};
+    const target = typeof args.path === "string" ? args.path : typeof args.command === "string" ? args.command : "";
+    const preview = target.length > 72 ? `${target.slice(0, 69)}...` : target;
+    return preview === "" ? `Running: ${event.name}` : `Running: ${event.name} ${preview}`;
+  }
+  return undefined;
+}
+
+interface ResolvedSubagentRole {
+  instructions: string;
+  model?: { provider: string; id: string };
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  tools?: string[];
+}
+
+function parseAgentDefinition(source: string): { fields: Record<string, string>; body: string } {
+  if (!source.startsWith("---\n")) return { fields: {}, body: source.trim() };
+  const end = source.indexOf("\n---", 4);
+  if (end < 0) return { fields: {}, body: source.trim() };
+  const fields: Record<string, string> = {};
+  for (const line of source.slice(4, end).split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator > 0) fields[line.slice(0, separator).trim()] = line.slice(separator + 1).trim().replace(/^['"]|['"]$/g, "");
+  }
+  return { fields, body: source.slice(end + 4).trim() };
+}
+
+function parsePersona(source: string, baseDir: string): ResolvedSubagentRole | undefined {
+  const stringField = (name: string): string | undefined => {
+    const triple = source.match(new RegExp(`${name}\\s*=\\s*"""([\\s\\S]*?)"""`));
+    if (triple) return triple[1].trim();
+    const single = source.match(new RegExp(`^\\s*${name}\\s*=\\s*["']([^"']*)["']\\s*$`, "m"));
+    return single?.[1].trim();
+  };
+  let instructions = stringField("instructions") ?? "";
+  const instructionFile = stringField("instructions_file");
+  if (instructionFile !== undefined) {
+    const path = resolve(baseDir, instructionFile);
+    if (!existsSync(path)) throw new Error(`persona instructions_file does not exist: ${path}`);
+    instructions = `${instructions}\n\n${readFileSync(path, "utf8").trim()}`.trim();
+  }
+  if (instructions === "") return undefined;
+  const modelParts = stringField("model")?.split("/", 2);
+  const thinking = stringField("reasoning_effort") ?? stringField("thinking");
+  const validThinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  return {
+    instructions,
+    model: modelParts?.length === 2 ? { provider: modelParts[0], id: modelParts[1] } : undefined,
+    thinkingLevel: validThinking.has(thinking ?? "") ? thinking as ResolvedSubagentRole["thinkingLevel"] : undefined,
+  };
+}
+
+export function resolveSubagentRole(cwd: string, agentDir: string, subagentType: string): ResolvedSubagentRole {
+  const builtins: Record<string, string> = {
+    "general-purpose": "You are a general-purpose implementation agent. Complete the bounded task autonomously and return a concise evidence-backed summary.",
+    explore: "You are an exploration agent. Investigate using read/search/command tools, do not modify files, and report concrete file and line-level evidence.",
+    plan: "You are a planning agent. Inspect the codebase without modifying it and return a structured, implementation-ready plan grounded in specific files.",
+  };
+  const candidates = [join(cwd, ".pi", "agents", `${subagentType}.md`), join(agentDir, "agents", `${subagentType}.md`)];
+  const custom = candidates.find(existsSync);
+  if (custom === undefined) return { instructions: builtins[subagentType] ?? builtins["general-purpose"] };
+  const { fields, body } = parseAgentDefinition(readFileSync(custom, "utf8"));
+  const personaName = fields.persona;
+  const personaPath = personaName === undefined
+    ? undefined
+    : [join(cwd, ".pi", "personas", `${personaName}.toml`), join(agentDir, "personas", `${personaName}.toml`)].find(existsSync);
+  if (personaName !== undefined && personaPath === undefined) throw new Error(`subagent persona not found: ${personaName}`);
+  const persona = personaPath === undefined ? undefined : parsePersona(readFileSync(personaPath, "utf8"), dirname(personaPath));
+  if (personaName !== undefined && persona === undefined) throw new Error(`subagent persona has no instructions: ${personaName}`);
+  const modelParts = fields.model?.split("/", 2);
+  const thinking = fields.thinking;
+  const validThinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  return {
+    instructions: `${body}${persona === undefined ? "" : `\n\n${persona.instructions}`}`,
+    model: modelParts?.length === 2 ? { provider: modelParts[0], id: modelParts[1] } : persona?.model,
+    thinkingLevel: validThinking.has(thinking) ? thinking as ResolvedSubagentRole["thinkingLevel"] : persona?.thinkingLevel,
+    tools: fields.tools?.split(",").map((tool) => tool.trim()).filter(Boolean),
+  };
+}
+
+export async function launchNativeSubagent(
+  context: LaunchContext,
+  hooks: OpenSessionHooks,
+  coordinator: NativeSubagentCoordinator,
+  parent: ActiveSession,
+): Promise<import("./subagents.ts").ChildRuntimeHandle> {
+  let worktreePath = context.source?.worktreePath;
+  let cwd = context.source?.childSessionPath !== undefined
+    ? context.source.cwd ?? worktreePath ?? parent.cwd
+    : resolve(context.request.cwd ?? parent.cwd);
+  if (context.source === undefined && context.request.isolation === "worktree") {
+    const root = (await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"])).stdout.trim();
+    const safeParent = context.parentSessionId.replace(/[^a-zA-Z0-9_-]/g, "-");
+    worktreePath = resolve(parent.agentDir, "worktrees", `${safeParent}-${context.taskId}`);
+    mkdirSync(dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["-C", root, "worktree", "add", "--detach", worktreePath, "HEAD"]);
+    cwd = worktreePath;
+  }
+  const parentPath = parent.session.sessionFile;
+  const role = resolveSubagentRole(cwd, parent.agentDir, context.request.subagentType);
+  const forwardChildEvent = (event: AgentEvent) => {
+    hooks.emitEvent(context.parentSessionId, { type: "subagent_transcript", task_id: context.taskId, event });
+    if (event.type === "permission_request") hooks.emitEvent(context.parentSessionId, event);
+    const activity = childActivity(event);
+    if (activity !== undefined) context.update(activity);
+    if (event.type === "text_delta") context.outputUpdate(event.text);
+  };
+  const manager = context.source?.childSessionPath !== undefined
+    ? SessionManager.forkFrom(context.source.childSessionPath, cwd, undefined, { parentSession: parentPath })
+    : SessionManager.create(cwd, undefined, { parentSession: parentPath });
+  const sourceModelParts = context.source?.model?.split("/", 2);
+  const sourceModel = sourceModelParts?.length === 2 ? { provider: sourceModelParts[0], id: sourceModelParts[1] } : undefined;
+  const model = sourceModel ?? role.model ?? (parent.session.model === undefined ? undefined : { provider: parent.session.model.provider, id: parent.session.model.id });
+  const sourceThinking = context.source?.thinkingLevel;
+  const validThinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  const thinkingLevel = validThinking.has(sourceThinking ?? "")
+    ? sourceThinking as ResolvedSubagentRole["thinkingLevel"]
+    : role.thinkingLevel ?? parent.session.thinkingLevel;
+  const capability = context.request.capabilityMode ?? "all";
+  const capabilityAllowlist = capability === "all" ? undefined : capabilityTools(capability);
+  const tools = role.tools === undefined
+    ? capabilityAllowlist
+    : capabilityAllowlist === undefined
+      ? role.tools
+      : role.tools.filter((tool) => capabilityAllowlist.includes(tool));
+  const runtime = await createAgentSessionRuntime(
+    runtimeFactory(
+      manager.getSessionId(),
+      hooks.mcpClients,
+      hooks.getMode,
+      hooks.isAlwaysAllowed,
+      hooks.rememberAlwaysAllowed,
+      hooks.registerPermissionReply,
+      hooks.unregisterPermissionReply,
+      hooks.getNextPermissionId,
+      () => forwardChildEvent,
+      coordinator,
+      1,
+      {
+        model,
+        thinkingLevel,
+        capabilityMode: context.request.capabilityMode,
+        tools,
+      },
+    ),
+    { cwd, agentDir: parent.agentDir, sessionManager: manager },
+  );
+  const child: ActiveSession = {
+    session: runtime.session,
+    runtime,
+    wireSessionId: runtime.session.sessionId,
+    cwd,
+    modelRegistry: runtime.services.modelRegistry,
+    settingsManager: runtime.services.settingsManager,
+    agentDir: runtime.services.agentDir,
+    toolStarted: new Map(),
+  };
+  await bindRuntime(child, (_childId, event) => forwardChildEvent(event));
+  forwardChildEvent({ type: "user_message", text: context.request.prompt });
+
+  const prompt = `<system-reminder>\n${role.instructions}\n\nYou are a depth-1 child session and cannot delegate to more subagents.\n</system-reminder>\n\nTask: ${context.request.prompt}`;
+  void child.session.prompt(prompt).then(async () => {
+    await child.session.waitForIdle();
+    const outcome = finalAssistantOutcome(child.session);
+    if (outcome.stopReason === "aborted") context.cancelled();
+    else if (outcome.stopReason === "error") context.fail(outcome.error ?? outcome.text);
+    else context.complete(outcome.text);
+    await child.runtime.dispose();
+  }).catch((error) => {
+    if (child.session.isIdle) context.fail(error instanceof Error ? error.message : String(error));
+    else context.cancelled();
+  });
+
+  return {
+    childSessionId: child.session.sessionId,
+    childSessionPath: child.session.sessionFile,
+    model: child.session.model === undefined ? undefined : `${child.session.model.provider}/${child.session.model.id}`,
+    thinkingLevel: child.session.thinkingLevel,
+    worktreePath,
+    cwd,
+    abort: () => child.session.abort(),
+    dispose: () => child.runtime.dispose(),
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -1000,6 +1370,18 @@ export async function setModel(active: ActiveSession, modelId: string): Promise<
 
 export function cycleThinkingLevel(active: ActiveSession): string | undefined {
   return active.session.cycleThinkingLevel();
+}
+
+export function currentThinkingLevel(active: ActiveSession): string {
+  return active.session.thinkingLevel;
+}
+
+export function availableThinkingLevels(active: ActiveSession): string[] {
+  return active.session.getAvailableThinkingLevels();
+}
+
+export function setThinkingLevel(active: ActiveSession, level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void {
+  active.session.setThinkingLevel(level);
 }
 
 export function clearQueue(active: ActiveSession): { restoredText: string } {

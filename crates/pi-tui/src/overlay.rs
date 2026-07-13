@@ -65,6 +65,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::ScopedModels => " Scoped models ",
         OverlayKind::OauthPrompt => " OAuth input ",
         OverlayKind::OauthSelect => " OAuth selection ",
+        OverlayKind::LoginProvider => " Login provider ",
+        OverlayKind::ThinkingPicker => " Thinking effort ",
         OverlayKind::RewindPicker => " Rewind file edit ",
         OverlayKind::Settings => " Settings ",
         OverlayKind::Permission => " Permission required ",
@@ -85,6 +87,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             | OverlayKind::ScopedModels
             | OverlayKind::OauthPrompt
             | OverlayKind::OauthSelect
+            | OverlayKind::LoginProvider
             | OverlayKind::RewindPicker
     ) {
         lines.push(Line::from(vec![

@@ -110,6 +110,10 @@ async fn main() -> Result<()> {
         }
     } else {
         let models = harness.list_models().await.unwrap_or_default();
+        let auth_providers = harness
+            .list_auth_providers(&session)
+            .await
+            .unwrap_or_default();
         let sessions = harness.list_sessions(&session).await.unwrap_or_default();
         let files = harness.list_files(&session).await.unwrap_or_default();
         let resources = harness
@@ -144,11 +148,16 @@ async fn main() -> Result<()> {
                     let _ = command_supervisor.close(path).await;
                     continue;
                 }
+                if matches!(command, pi_tui::UiCommand::NewSession) {
+                    let _ = command_supervisor.create(None).await;
+                    continue;
+                }
                 let Ok(command_session) = command_supervisor.active_session().await else {
                     continue;
                 };
                 match command {
                     pi_tui::UiCommand::Submit { text, delivery } => {
+                        command_supervisor.mark_running(&command_session).await;
                         let _ = command_harness
                             .deliver_message(&command_session, text, delivery)
                             .await;
@@ -178,9 +187,7 @@ async fn main() -> Result<()> {
                             .delete_session(&command_session, target)
                             .await;
                     }
-                    pi_tui::UiCommand::NewSession => {
-                        let _ = command_harness.new_session(&command_session).await;
-                    }
+                    pi_tui::UiCommand::NewSession => unreachable!(),
                     pi_tui::UiCommand::NameSession(name) => {
                         let _ = command_harness.name_session(&command_session, name).await;
                     }
@@ -222,9 +229,15 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::CycleThinking => {
                         let _ = command_harness.cycle_thinking(&command_session).await;
                     }
+                    pi_tui::UiCommand::SetThinking(level) => {
+                        let _ = command_harness.set_thinking(&command_session, level).await;
+                    }
                     pi_tui::UiCommand::AbortAndRestoreQueue => {
                         let _ = command_harness.cancel(&command_session).await;
                         let _ = command_harness.clear_queue(&command_session).await;
+                    }
+                    pi_tui::UiCommand::KillTask(task_id) => {
+                        let _ = command_harness.kill_task(&command_session, task_id).await;
                     }
                     pi_tui::UiCommand::ExecuteBash {
                         command,
@@ -296,6 +309,7 @@ async fn main() -> Result<()> {
             commands,
             pi_tui::TuiBootstrap {
                 models,
+                auth_providers,
                 sessions,
                 files,
                 resources,
@@ -346,7 +360,7 @@ fn delegate_pi_package_command(args: &[String]) -> Result<()> {
 async fn login(requested_provider: Option<&str>) -> Result<()> {
     let harness = PiHarness::spawn_default().await?;
     let session = harness.open_session(ephemeral_session()).await?;
-    let providers = harness.list_auth_providers(&session).await?;
+    let providers = harness.auth_provider_details(&session).await?;
     let provider = match requested_provider {
         Some(id) => providers
             .iter()

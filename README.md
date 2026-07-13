@@ -73,6 +73,11 @@ shows its file, message/token counts, and cost, `/clone` copies the current
 active branch into a new session file, and `/compact [instructions]` invokes
 Pi's native context compaction. Session files remain Pi's authoritative JSONL
 tree; Torii does not maintain a parallel conversation format.
+
+The dashboard supports `r` to rename and `d` to delete the selected saved
+session. Deletion always opens a confirmation dialog and uses the platform
+trash command when available. Active or resident sessions must be closed or
+switched away from before their session file can be deleted.
 `/tree` opens the complete Pi session tree and marks entries on the active
 branch; selecting an earlier user message rewinds to its parent and places the
 message back in the composer for editing. `/fork` uses a user-message-only
@@ -182,10 +187,12 @@ User prompt cards use vertical padding and remain pinned at the top after their
 original transcript position scrolls out of view.
 Tool headers follow Grok's compact `◆ Read`, `◆ Edit`, and `◆ Run` treatment.
 Running calls animate and count elapsed milliseconds; completed and restored
-calls show Pi's measured duration. Background `Agent` calls remain active until
-their matching `get_subagent_result` report arrives, so their label describes
-the assigned scout work and their timer covers the full task lifetime rather
-than only the spawn request. Literal `<think>` output is
+calls show Pi's measured duration. Native `spawn_subagent` calls create real,
+persistent Pi child sessions with independent context and transcripts. Their
+activity and timer remain live until the child runtime settles, even after the
+parent turn ends. Press `Ctrl+B` for the task pane; Enter or a mouse click opens
+the framed child transcript, `k` cancels a running child, and Esc returns to the
+parent. Literal `<think>` output is
 converted into foldable reasoning instead of being shown as raw tags.
 
 Use Ctrl+P for the searchable command palette, Ctrl+M for the model picker,
@@ -207,6 +214,14 @@ and honors cancellation. Search uses Brave when `BRAVE_SEARCH_API_KEY` is set
 and otherwise falls back to DuckDuckGo HTML results. Both flow through the
 normal grouped/timed tool renderer.
 
+Subagent orchestration is owned by Torii's sidecar rather than a global Pi
+extension. The model receives `spawn_subagent`,
+`get_command_or_subagent_output`, `wait_commands_or_subagents`, and
+`kill_command_or_subagent`. Children inherit or resolve their model, thinking,
+role/persona, capability allowlist, and working directory; nesting stops at one
+level. Optional worktree isolation is detached and never auto-merged—applying
+or removing it requires a separate permission-gated tool call.
+
 MCP servers can be configured in `~/.pi/agent/mcp.json` or a trusted project's
 `.mcp.json` using the common `{ "mcpServers": { ... } }` shape. Entries may use
 `command`/`args`/`env` for stdio or `url` with optional `type: "sse"` for SSE;
@@ -219,9 +234,8 @@ lets the model publish pending, in-progress, and completed steps; updates are
 stored as Pi custom entries, restored on resume, and summarized as progress in
 the header. At most one step may be in progress.
 
-The official Pi SDK is TypeScript. The next slice adds a small Node sidecar
-that converts Pi SDK events to the `AgentEvent` JSONL protocol consumed by
-the Rust harness.
+The official Pi SDK is TypeScript. A small Node sidecar converts Pi SDK events
+to the `AgentEvent` JSONL protocol consumed by the Rust harness.
 
 ## Pi SDK sidecar
 

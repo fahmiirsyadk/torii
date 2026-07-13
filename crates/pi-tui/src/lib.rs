@@ -63,6 +63,7 @@ pub enum UiCommand {
         label: Option<String>,
     },
     CycleThinking,
+    SetThinking(String),
     AbortAndRestoreQueue,
     ExecuteBash {
         command: String,
@@ -89,6 +90,7 @@ pub enum UiCommand {
     ExportTrace(Option<String>),
     StopResident(String),
     CloseResident(String),
+    KillTask(String),
 }
 
 enum LoopWake {
@@ -125,6 +127,7 @@ impl Drop for TerminalGuard {
 
 pub struct TuiBootstrap {
     pub models: Vec<pi_harness::ModelInfo>,
+    pub auth_providers: Vec<pi_harness::ModelInfo>,
     pub sessions: Vec<pi_harness::SessionInfo>,
     pub files: Vec<String>,
     pub resources: pi_harness::RuntimeResources,
@@ -139,6 +142,7 @@ pub async fn run(
 ) -> Result<()> {
     let TuiBootstrap {
         models,
+        auth_providers,
         sessions,
         files,
         resources,
@@ -154,6 +158,7 @@ pub async fn run(
         state.available_models = models;
     }
     state.available_sessions = sessions;
+    state.available_auth_providers = auth_providers;
     state.available_files = files;
     state.runtime_commands = resources.commands;
     state.context_files = resources.context_files;
@@ -202,6 +207,7 @@ async fn run_app(
     loop {
         let animated = state.streaming
             || state.active_compaction_started_at().is_some()
+            || state.has_background_work()
             || state
                 .runtime_sessions
                 .values()
@@ -380,6 +386,36 @@ async fn run_app(
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.view = if state.view == View::Tasks {
+                        View::Transcript
+                    } else {
+                        View::Tasks
+                    };
+                }
+                KeyCode::Esc | KeyCode::Char('q') if state.view == View::Subagent => {
+                    state.view = View::Tasks;
+                    state.scroll_from_bottom = 0;
+                }
+                KeyCode::Esc if state.view == View::Tasks => {
+                    state.view = View::Transcript;
+                }
+                KeyCode::Up if state.view == View::Tasks => {
+                    state.task_selected = state.task_selected.saturating_sub(1);
+                }
+                KeyCode::Down if state.view == View::Tasks => {
+                    state.task_selected =
+                        (state.task_selected + 1).min(state.subagent_tasks.len().saturating_sub(1));
+                }
+                KeyCode::Enter if state.view == View::Tasks => state.open_selected_subagent(),
+                KeyCode::Char('k') if state.view == View::Tasks => {
+                    if let Some(task_id) = state.selected_subagent_id()
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::KillTask(task_id));
+                    }
+                }
+                _ if state.view == View::Tasks => {}
                 KeyCode::Esc if state.view == View::Dashboard => {
                     state.view = View::Transcript;
                 }
@@ -405,6 +441,12 @@ async fn run_app(
                         let _ = sender.send(UiCommand::NewSession);
                     }
                     state.view = View::Transcript;
+                }
+                KeyCode::Char('r') if state.view == View::Dashboard => {
+                    state.begin_dashboard_rename();
+                }
+                KeyCode::Char('d') if state.view == View::Dashboard => {
+                    state.begin_dashboard_delete();
                 }
                 KeyCode::Char('s') if state.view == View::Dashboard => {
                     if let Some(path) = state.dashboard_selected_path()
@@ -482,6 +524,19 @@ async fn run_app(
                         });
                     }
                 }
+                KeyCode::Enter if state.focus == Focus::Scrollback => {
+                    if let Some(index) = state.focused_entry {
+                        if state
+                            .focused_target_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with("tool-group:"))
+                        {
+                            state.toggle_tool_group(index);
+                        } else {
+                            state.activate_entry_at(index);
+                        }
+                    }
+                }
                 KeyCode::Backspace if state.focus == Focus::Prompt => state.backspace(),
                 KeyCode::Delete if state.focus == Focus::Prompt => state.delete(),
                 KeyCode::Left if state.focus == Focus::Prompt => state.move_cursor_left(),
@@ -546,11 +601,22 @@ async fn run_app(
             Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
                 MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
                 MouseEventKind::ScrollDown => state.move_overlay_selection(1),
+                MouseEventKind::Moved => {
+                    if let Some(index) =
+                        crate::overlay::item_at(&state, size.width, size.height, mouse.row)
+                    {
+                        state.overlay_selected = index;
+                    }
+                }
                 MouseEventKind::Down(_) => {
                     if let Some(index) =
                         crate::overlay::item_at(&state, size.width, size.height, mouse.row)
                     {
                         state.overlay_selected = index;
+                        let action = state.activate_overlay();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
                         continue;
                     }
                     if matches!(
@@ -578,6 +644,32 @@ async fn run_app(
                 _ => {}
             },
             Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp if state.view == View::Tasks => {
+                    state.task_selected = state.task_selected.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown if state.view == View::Tasks => {
+                    state.task_selected =
+                        (state.task_selected + 1).min(state.subagent_tasks.len().saturating_sub(1));
+                }
+                MouseEventKind::Moved if state.view == View::Tasks => {
+                    let first_row = 3_u16;
+                    if mouse.row >= first_row {
+                        let index = usize::from(mouse.row - first_row) / 2;
+                        if index < state.subagent_tasks.len() {
+                            state.task_selected = index;
+                        }
+                    }
+                }
+                MouseEventKind::Down(_) if state.view == View::Tasks => {
+                    let first_row = 3_u16;
+                    if mouse.row >= first_row {
+                        let index = usize::from(mouse.row - first_row) / 2;
+                        if index < state.subagent_tasks.len() {
+                            state.task_selected = index;
+                            state.open_selected_subagent();
+                        }
+                    }
+                }
                 MouseEventKind::ScrollUp if state.view == View::Dashboard => {
                     state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
                 }
@@ -619,9 +711,29 @@ async fn run_app(
                         state.view = View::Transcript;
                     }
                 }
+                MouseEventKind::Down(_)
+                    if state.view == View::Subagent
+                        && mouse.row == 1
+                        && mouse.column >= size.width.saturating_sub(6) =>
+                {
+                    state.view = View::Tasks;
+                    state.scroll_from_bottom = 0;
+                }
+                MouseEventKind::Moved | MouseEventKind::Down(_) if state.view == View::Subagent => {
+                }
                 MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
                 MouseEventKind::ScrollDown => state.scroll_down(1),
                 MouseEventKind::Moved => {
+                    let composer_hover = state
+                        .composer_targets
+                        .borrow()
+                        .iter()
+                        .find(|(_, start, end, row)| {
+                            mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                        })
+                        .map(|(kind, _, _, _)| *kind);
+                    let composer_changed = state.composer_hover != composer_hover;
+                    state.composer_hover = composer_hover;
                     let hovered = ui::section_hit_at(
                         &state,
                         size.width,
@@ -629,11 +741,37 @@ async fn run_app(
                         mouse.column,
                         mouse.row,
                     );
-                    dirty =
+                    let transcript_changed =
                         state.set_hovered_transcript_target(hovered.map(|hit| (hit.index, hit.id)));
+                    dirty = composer_changed || transcript_changed;
                 }
                 MouseEventKind::Down(_) => {
-                    if mouse.row >= size.height.saturating_sub(5)
+                    let composer_target = state.composer_hover.or_else(|| {
+                        state
+                            .composer_targets
+                            .borrow()
+                            .iter()
+                            .find(|(_, start, end, row)| {
+                                mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                            })
+                            .map(|(kind, _, _, _)| *kind)
+                    });
+                    if let Some(target) = composer_target {
+                        if target == 2 {
+                            state.cycle_permission_mode();
+                            if let Some(sender) = &commands {
+                                let _ = sender.send(UiCommand::SetPermissionMode(
+                                    state.permission_mode.wire_value().into(),
+                                ));
+                            }
+                        } else {
+                            state.open_overlay(if target == 0 {
+                                OverlayKind::ModelPicker
+                            } else {
+                                OverlayKind::ThinkingPicker
+                            });
+                        }
+                    } else if mouse.row >= size.height.saturating_sub(5)
                         && mouse.row < size.height.saturating_sub(2)
                     {
                         state.focus_prompt();
@@ -651,7 +789,7 @@ async fn run_app(
                             if grouped {
                                 state.toggle_tool_group(hit.index);
                             } else {
-                                state.toggle_entry_at(hit.index);
+                                state.activate_entry_at(hit.index);
                             }
                             state.focused_target_id = Some(target_id);
                         } else {
@@ -789,6 +927,12 @@ fn dispatch_overlay_action(
         OverlayAction::CycleThinking => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::CycleThinking);
+            }
+            false
+        }
+        OverlayAction::SetThinking(level) => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetThinking(level));
             }
             false
         }
@@ -939,7 +1083,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
-        assert!(output.contains("Thinking"));
+        assert!(output.contains("Reasoning"));
         assert!(output.contains("Enter: steer"));
         assert!(output.contains("Alt+Enter: follow-up"));
         assert!(output.contains("cargo test"));
@@ -1574,56 +1718,72 @@ mod tests {
     }
 
     #[test]
-    fn background_agent_timer_runs_until_its_report_arrives() {
+    fn native_subagent_updates_one_live_lifecycle_entry_and_keeps_child_transcript() {
         let mut state = super::AppState::default();
-        state.apply(AgentEvent::ToolCallStart {
-            id: "spawn-call".into(),
-            name: "agent".into(),
-            args: serde_json::json!({"description": "Scout session persistence"}),
+        let mut task = pi_harness::SubagentTask {
+            task_id: "task-native".into(),
+            parent_session_id: "parent".into(),
+            child_session_id: Some("child".into()),
+            child_session_path: Some("/tmp/child.jsonl".into()),
+            description: "Inspect modal".into(),
+            subagent_type: "explore".into(),
+            capability_mode: "execute".into(),
+            isolation: "none".into(),
+            background: true,
+            status: "running".into(),
+            activity: "Thinking".into(),
+            started_at_ms: 1,
+            completed_at_ms: None,
+            duration_ms: 25,
+            output: None,
+            error: None,
+            model: Some("test/model".into()),
+            thinking_level: Some("high".into()),
+            worktree_path: None,
+            cwd: None,
+        };
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(task.clone()),
         });
-        state.apply(AgentEvent::ToolCallResult {
-            id: "spawn-call".into(),
-            result: pi_harness::ToolResult {
-                content: "Agent started in background. Agent ID: scout-123".into(),
-                details: None,
-            },
-            is_error: false,
-            duration_ms: Some(55),
+        state.apply(AgentEvent::SubagentTranscript {
+            task_id: task.task_id.clone(),
+            event: Box::new(AgentEvent::TextDelta {
+                text: "evidence".into(),
+            }),
         });
-        assert!(matches!(
-            &state.entries[0],
-            super::state::Entry::Tool {
-                status: super::state::ToolStatus::Running,
-                duration: None,
-                started_at: Some(_),
-                ..
-            }
-        ));
+        task.status = "completed".into();
+        task.activity = "Completed".into();
+        task.duration_ms = 200;
+        task.output = Some("report".into());
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(task),
+        });
 
-        state.apply(AgentEvent::ToolCallStart {
-            id: "result-call".into(),
-            name: "get_subagent_result".into(),
-            args: serde_json::json!({"agent_id": "scout-123"}),
-        });
-        state.apply(AgentEvent::ToolCallResult {
-            id: "result-call".into(),
-            result: pi_harness::ToolResult {
-                content: "Session persistence report".into(),
-                details: None,
-            },
-            is_error: false,
-            duration_ms: Some(20),
-        });
-        assert!(matches!(
-            &state.entries[0],
-            super::state::Entry::Tool {
-                status: super::state::ToolStatus::Success,
-                duration: Some(_),
-                started_at: None,
-                result: Some(report),
-                ..
-            } if report == "Session persistence report"
-        ));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, super::state::Entry::Tool { id, .. } if id == "subagent:task-native")
+                )
+                .count(),
+            1
+        );
+        assert_eq!(state.subagent_transcripts["task-native"].len(), 1);
+        assert_eq!(state.subagent_tasks["task-native"].status, "completed");
+
+        state.view = super::View::Tasks;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let tasks = buffer_text(terminal.backend().buffer(), 100, 24);
+        assert!(tasks.contains("Tasks · Subagents"));
+        assert!(tasks.contains("Inspect modal"));
+
+        state.open_selected_subagent();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let transcript = buffer_text(terminal.backend().buffer(), 100, 24);
+        assert!(transcript.contains("evidence"));
     }
 
     #[test]
@@ -2103,6 +2263,53 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_delete_requires_confirmation_and_refuses_active_session() {
+        let mut state = super::AppState {
+            view: super::View::Dashboard,
+            available_sessions: vec![
+                pi_harness::SessionInfo {
+                    id: "active".into(),
+                    path: "/sessions/active.jsonl".into(),
+                    name: Some("Active".into()),
+                    first_message: "active".into(),
+                    modified: String::new(),
+                    message_count: 1,
+                    current: true,
+                    cwd: "/work".into(),
+                    parent_session_path: None,
+                },
+                pi_harness::SessionInfo {
+                    id: "old".into(),
+                    path: "/sessions/old.jsonl".into(),
+                    name: Some("Old".into()),
+                    first_message: "old".into(),
+                    modified: String::new(),
+                    message_count: 1,
+                    current: false,
+                    cwd: "/work".into(),
+                    parent_session_path: None,
+                },
+            ],
+            ..super::AppState::default()
+        };
+
+        state.begin_dashboard_delete();
+        assert_eq!(state.overlay, super::OverlayKind::None);
+        assert!(state.status.contains("active session"));
+
+        state.dashboard_selected = 1;
+        state.begin_dashboard_delete();
+        assert_eq!(state.overlay, super::OverlayKind::SessionDeleteConfirm);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::DeleteSession { target }
+                if target == "/sessions/old.jsonl"
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::None);
+        assert_eq!(state.view, super::View::Dashboard);
+    }
+
+    #[test]
     fn session_reset_replaces_the_visible_transcript() {
         let mut state = fixtures::conversation();
         assert!(!state.entries.is_empty());
@@ -2434,6 +2641,44 @@ mod tests {
             Some(super::state::OverlayAction::Compact(Some(instructions)))
                 if instructions == "preserve test failures"
         ));
+
+        for (command, usage) in [
+            ("/name", "Usage: /name <session name>"),
+            ("/import", "Usage: /import <session.jsonl>"),
+        ] {
+            state.prompt = command.into();
+            assert!(matches!(
+                state.activate_slash_command(),
+                Some(super::state::OverlayAction::None)
+            ));
+            assert!(state.prompt.is_empty());
+            assert!(matches!(
+                state.entries.last(),
+                Some(super::state::Entry::Assistant { lines, .. }) if lines == &vec![usage.to_string()]
+            ));
+        }
+
+        state.available_auth_providers = vec![
+            pi_harness::ModelInfo {
+                id: "openai".into(),
+                display_name: "OpenAI".into(),
+            },
+            pi_harness::ModelInfo {
+                id: "anthropic".into(),
+                display_name: "Anthropic".into(),
+            },
+        ];
+        state.prompt = "/login".into();
+        assert!(state.activate_slash_command().is_some());
+        assert_eq!(state.overlay, super::OverlayKind::LoginProvider);
+        for character in "anth".chars() {
+            state.insert_overlay_char(character);
+        }
+        assert_eq!(state.overlay_items(), vec!["Anthropic"]);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::BeginOauth(provider) if provider == "anthropic"
+        ));
     }
 
     #[test]
@@ -2542,6 +2787,18 @@ mod tests {
             provider: "example".into(),
         });
         assert_eq!(state.status, "logged in to example");
+        assert!(matches!(
+            state.entries.last(),
+            Some(super::state::Entry::Assistant { lines, .. })
+                if lines.iter().any(|line| line.contains("Authentication successful"))
+        ));
+        state.apply(AgentEvent::ModelsChanged {
+            models: vec![pi_harness::ModelInfo {
+                id: "example/new-model".into(),
+                display_name: "New Model".into(),
+            }],
+        });
+        assert_eq!(state.available_models[0].id, "example/new-model");
     }
 
     #[test]
@@ -3238,7 +3495,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
-        assert!(output.contains("T O R I I"));
+        assert!(output.contains("Torii"));
         assert!(output.contains(env!("CARGO_PKG_VERSION")));
         assert!(output.contains("Running"));
         assert!(output.contains("Inactive"));

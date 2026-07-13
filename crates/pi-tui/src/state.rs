@@ -1,6 +1,6 @@
 use pi_harness::{
     AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
-    SessionTreeEntry, ToolResult, Usage,
+    SessionTreeEntry, SubagentTask, ToolResult, Usage,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -50,6 +50,8 @@ const SLASH_COMMANDS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum View {
     Dashboard,
+    Tasks,
+    Subagent,
     #[default]
     Transcript,
 }
@@ -71,6 +73,8 @@ pub enum OverlayKind {
     ScopedModels,
     OauthPrompt,
     OauthSelect,
+    LoginProvider,
+    ThinkingPicker,
     RewindPicker,
     Settings,
     Permission,
@@ -132,6 +136,7 @@ pub enum OverlayAction {
         label: Option<String>,
     },
     CycleThinking,
+    SetThinking(String),
     ReloadResources,
     SetRuntimeSetting {
         key: String,
@@ -327,7 +332,11 @@ pub enum Focus {
 pub struct AppState {
     pub view: View,
     pub dashboard_selected: usize,
+    pub task_selected: usize,
+    pub inspected_subagent: Option<String>,
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
+    pub composer_hover: Option<u8>,
     pub branch: String,
     pub cwd: String,
     pub context_used: u64,
@@ -360,6 +369,8 @@ pub struct AppState {
     /// `output_tokens` on TurnComplete.
     pub turn_output_chars: u64,
     pub thinking_level: String,
+    pub thinking_levels: Vec<String>,
+    pub pending_thinking_picker: bool,
     pub queued_steering: Vec<String>,
     pub queued_follow_up: Vec<String>,
     pub scroll_from_bottom: usize,
@@ -371,8 +382,11 @@ pub struct AppState {
     pub pending_permission: Option<PendingPermission>,
     pub pending_oauth: Option<PendingOauth>,
     pub available_models: Vec<ModelInfo>,
+    pub available_auth_providers: Vec<ModelInfo>,
     pub available_sessions: Vec<SessionInfo>,
     pub runtime_sessions: HashMap<String, pi_harness::RuntimeSessionInfo>,
+    pub subagent_tasks: HashMap<String, SubagentTask>,
+    pub subagent_transcripts: HashMap<String, Vec<AgentEvent>>,
     pub session_sort: SessionSort,
     pub session_named_only: bool,
     pub session_show_path: bool,
@@ -404,7 +418,11 @@ impl Default for AppState {
         Self {
             view: View::Transcript,
             dashboard_selected: 0,
+            task_selected: 0,
+            inspected_subagent: None,
             dashboard_list_rect: Cell::new(None),
+            composer_targets: RefCell::new(Vec::new()),
+            composer_hover: None,
             branch: "torii".into(),
             cwd: "~/dev/torii".into(),
             context_used: 0,
@@ -426,6 +444,8 @@ impl Default for AppState {
             turn_input_tokens: 0,
             turn_output_chars: 0,
             thinking_level: "off".into(),
+            thinking_levels: Vec::new(),
+            pending_thinking_picker: false,
             queued_steering: Vec::new(),
             queued_follow_up: Vec::new(),
             scroll_from_bottom: 0,
@@ -440,8 +460,11 @@ impl Default for AppState {
                 id: "mock".into(),
                 display_name: "Mock model".into(),
             }],
+            available_auth_providers: Vec::new(),
             available_sessions: Vec::new(),
             runtime_sessions: HashMap::new(),
+            subagent_tasks: HashMap::new(),
+            subagent_transcripts: HashMap::new(),
             session_sort: SessionSort::default(),
             session_named_only: false,
             session_show_path: false,
@@ -471,10 +494,57 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn sorted_subagent_tasks(&self) -> Vec<&SubagentTask> {
+        let mut tasks: Vec<_> = self.subagent_tasks.values().collect();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.started_at_ms));
+        tasks
+    }
+
+    pub fn selected_subagent_id(&self) -> Option<String> {
+        self.sorted_subagent_tasks()
+            .get(self.task_selected)
+            .map(|task| task.task_id.clone())
+    }
+
+    pub fn open_selected_subagent(&mut self) {
+        if let Some(task_id) = self.selected_subagent_id() {
+            self.inspected_subagent = Some(task_id);
+            self.view = View::Subagent;
+        }
+    }
+
     pub fn dashboard_selected_path(&self) -> Option<String> {
         self.available_sessions
             .get(self.dashboard_selected)
             .map(|session| session.path.clone())
+    }
+
+    pub fn begin_dashboard_rename(&mut self) {
+        let Some(session) = self.available_sessions.get(self.dashboard_selected) else {
+            return;
+        };
+        self.pending_session_path = Some(session.path.clone());
+        self.overlay_query = session.name.clone().unwrap_or_default();
+        self.overlay_selected = 0;
+        self.overlay = OverlayKind::SessionRename;
+    }
+
+    pub fn begin_dashboard_delete(&mut self) {
+        let Some(session) = self.available_sessions.get(self.dashboard_selected) else {
+            return;
+        };
+        if self.runtime_sessions.contains_key(&session.path) {
+            self.status = "cannot delete a resident session; close it first".into();
+            return;
+        }
+        if session.current {
+            self.status = "cannot delete the active session; close or switch it first".into();
+            return;
+        }
+        self.pending_session_path = Some(session.path.clone());
+        self.overlay_query.clear();
+        self.overlay_selected = 0;
+        self.overlay = OverlayKind::SessionDeleteConfirm;
     }
     pub fn dashboard_session_at_row(&self, row: usize, visible_rows: usize) -> Option<usize> {
         let selected = self
@@ -561,6 +631,10 @@ impl AppState {
             }
             "/new" => OverlayAction::NewSession,
             "/name" if argument.is_some() => OverlayAction::NameSession(argument.unwrap().into()),
+            "/name" => {
+                self.push_command_usage("Usage: /name <session name>");
+                OverlayAction::None
+            }
             "/session" => OverlayAction::SessionInfo,
             "/clone" => OverlayAction::CloneSession,
             "/tree" => OverlayAction::LoadTree { user_only: false },
@@ -576,9 +650,17 @@ impl AppState {
             "/import" if argument.is_some() => {
                 OverlayAction::ImportSession(argument.unwrap().to_string())
             }
+            "/import" => {
+                self.push_command_usage("Usage: /import <session.jsonl>");
+                OverlayAction::None
+            }
             "/copy" => OverlayAction::CopyLast,
             "/login" if argument.is_some() => {
                 OverlayAction::BeginOauth(argument.unwrap().to_string())
+            }
+            "/login" => {
+                self.open_overlay(OverlayKind::LoginProvider);
+                OverlayAction::None
             }
             "/rewind" => OverlayAction::LoadRewinds,
             "/plan" => {
@@ -614,6 +696,8 @@ impl AppState {
             }
             "/clear" => {
                 self.entries.clear();
+                self.subagent_tasks.clear();
+                self.subagent_transcripts.clear();
                 self.context_used = 0;
                 self.scroll_from_bottom = 0;
                 OverlayAction::None
@@ -624,6 +708,13 @@ impl AppState {
         };
         self.clear_prompt();
         Some(action)
+    }
+
+    fn push_command_usage(&mut self, message: &str) {
+        self.entries.push(Entry::Assistant {
+            lines: vec![message.into()],
+            timestamp: String::new(),
+        });
     }
 
     pub fn slash_suggestions(&self) -> Vec<(String, String)> {
@@ -780,6 +871,12 @@ impl AppState {
                         .collect()
                 })
                 .unwrap_or_default(),
+            OverlayKind::LoginProvider => self
+                .available_auth_providers
+                .iter()
+                .map(|provider| provider.display_name.clone())
+                .collect(),
+            OverlayKind::ThinkingPicker => self.thinking_levels.clone(),
             OverlayKind::RewindPicker => self
                 .rewind_checkpoints
                 .iter()
@@ -862,6 +959,7 @@ impl AppState {
                 | OverlayKind::ScopedModels
                 | OverlayKind::OauthPrompt
                 | OverlayKind::OauthSelect
+                | OverlayKind::LoginProvider
                 | OverlayKind::RewindPicker
         ) {
             self.overlay_query.push(character);
@@ -891,14 +989,22 @@ impl AppState {
                 self.status = "session name cannot be empty".into();
                 return OverlayAction::None;
             }
-            self.open_overlay(OverlayKind::SessionPicker);
+            if self.view == View::Dashboard {
+                self.close_overlay();
+            } else {
+                self.open_overlay(OverlayKind::SessionPicker);
+            }
             return OverlayAction::RenameSession { target, name };
         }
         if self.overlay == OverlayKind::SessionDeleteConfirm {
             let Some(target) = self.pending_session_path.take() else {
                 return OverlayAction::None;
             };
-            self.open_overlay(OverlayKind::SessionPicker);
+            if self.view == View::Dashboard {
+                self.close_overlay();
+            } else {
+                self.open_overlay(OverlayKind::SessionPicker);
+            }
             return OverlayAction::DeleteSession { target };
         }
         if self.overlay == OverlayKind::OauthPrompt {
@@ -961,6 +1067,7 @@ impl AppState {
                     return OverlayAction::None;
                 };
                 self.model = model.display_name;
+                self.pending_thinking_picker = true;
                 self.close_overlay();
                 return OverlayAction::SetModel { id: model.id };
             }
@@ -1066,6 +1173,19 @@ impl AppState {
                 let models = self.runtime_settings.enabled_models.clone();
                 self.close_overlay();
                 return OverlayAction::SetScopedModels(models);
+            }
+            OverlayKind::LoginProvider => {
+                let provider = self
+                    .available_auth_providers
+                    .iter()
+                    .find(|provider| provider.display_name == item)
+                    .map(|provider| provider.id.clone());
+                self.close_overlay();
+                return provider.map_or(OverlayAction::None, OverlayAction::BeginOauth);
+            }
+            OverlayKind::ThinkingPicker => {
+                self.close_overlay();
+                return OverlayAction::SetThinking(item);
             }
             OverlayKind::OauthSelect => {
                 let Some(pending) = self.pending_oauth.take() else {
@@ -1732,6 +1852,20 @@ impl AppState {
         }
     }
 
+    pub fn activate_entry_at(&mut self, index: usize) {
+        let subagent_id = self.entries.get(index).and_then(|entry| match entry {
+            Entry::Tool { id, .. } => id.strip_prefix("subagent:").map(str::to_owned),
+            _ => None,
+        });
+        if let Some(task_id) = subagent_id {
+            self.inspected_subagent = Some(task_id);
+            self.view = View::Subagent;
+            self.scroll_from_bottom = 0;
+        } else {
+            self.toggle_entry_at(index);
+        }
+    }
+
     pub fn all_reasoning_expanded(&self) -> bool {
         self.entries
             .iter()
@@ -1802,6 +1936,25 @@ impl AppState {
         })
     }
 
+    pub fn running_tool_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    Entry::Tool {
+                        status: ToolStatus::Running,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    pub fn has_background_work(&self) -> bool {
+        self.running_tool_count() > 0
+    }
+
     /// Records the start of a new LLM turn. Called by the TextDelta and
     /// ReasoningDelta arms on the first delta of a turn. Snapshots
     /// `context_used` as the input-token count and resets the output-char
@@ -1862,6 +2015,10 @@ impl AppState {
                 id: _,
                 display_name,
             } => self.model = display_name,
+            AgentEvent::ModelsChanged { models } => {
+                self.available_models = models;
+                self.status = format!("{} models available", self.available_models.len());
+            }
             AgentEvent::SessionInfo { summary } => {
                 self.entries.push(Entry::Assistant {
                     lines: vec![summary],
@@ -1871,8 +2028,20 @@ impl AppState {
             }
             AgentEvent::SessionList { sessions } => {
                 self.available_sessions = sessions;
+                self.dashboard_selected = self
+                    .dashboard_selected
+                    .min(self.available_sessions.len().saturating_sub(1));
                 self.pending_session_path = None;
-                self.open_overlay(OverlayKind::SessionPicker);
+                if self.view != View::Dashboard {
+                    self.open_overlay(OverlayKind::SessionPicker);
+                }
+                self.status = "sessions refreshed".into();
+            }
+            AgentEvent::SessionsChanged { sessions } => {
+                self.available_sessions = sessions;
+                self.dashboard_selected = self
+                    .dashboard_selected
+                    .min(self.available_sessions.len().saturating_sub(1));
                 self.status = "sessions refreshed".into();
             }
             AgentEvent::PromptPrefill { text } => {
@@ -1881,6 +2050,13 @@ impl AppState {
                 self.focus = Focus::Prompt;
             }
             AgentEvent::ThinkingChanged { level } => self.thinking_level = level,
+            AgentEvent::ThinkingOptions { levels } => {
+                self.thinking_levels = levels;
+                if self.pending_thinking_picker {
+                    self.pending_thinking_picker = false;
+                    self.open_overlay(OverlayKind::ThinkingPicker);
+                }
+            }
             AgentEvent::QueueChanged {
                 steering,
                 follow_up,
@@ -1940,6 +2116,12 @@ impl AppState {
             AgentEvent::OauthComplete { provider } => {
                 self.status = format!("logged in to {provider}");
                 self.close_overlay();
+                self.entries.push(Entry::Assistant {
+                    lines: vec![format!(
+                        "Authentication successful for {provider}. Model list refreshed; use /model to switch."
+                    )],
+                    timestamp: String::new(),
+                });
             }
             AgentEvent::RewindList { checkpoints } => {
                 self.rewind_checkpoints = checkpoints;
@@ -1990,6 +2172,10 @@ impl AppState {
                 self.streaming = true;
             }
             AgentEvent::ToolCallStart { id, name, args } => {
+                if name.eq_ignore_ascii_case("spawn_subagent") {
+                    self.status = "starting subagent…".into();
+                    return;
+                }
                 if name.eq_ignore_ascii_case("edit")
                     && let Some(diff_lines) = build_edit_diff(&args)
                 {
@@ -2020,6 +2206,99 @@ impl AppState {
                 });
                 self.status = "running tool…".into();
             }
+            AgentEvent::SubagentUpdate { task } => {
+                let append_background_notice = task.background
+                    && task.status != "running"
+                    && self
+                        .subagent_tasks
+                        .get(&task.task_id)
+                        .is_some_and(|previous| previous.status == "running");
+                let entry_id = format!("subagent:{}", task.task_id);
+                let status = match task.status.as_str() {
+                    "running" => ToolStatus::Running,
+                    "completed" => ToolStatus::Success,
+                    _ => ToolStatus::Error,
+                };
+                let detail = if task.activity.is_empty() {
+                    task.description.clone()
+                } else {
+                    format!("{} — {}", task.description, task.activity)
+                };
+                let duration = (task.status != "running")
+                    .then(|| format_elapsed(std::time::Duration::from_millis(task.duration_ms)));
+                let started_at = (task.status == "running").then(|| {
+                    Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(task.duration_ms))
+                        .unwrap_or_else(Instant::now)
+                });
+                let result = task.output.clone().or_else(|| task.error.clone());
+                if let Some(Entry::Tool {
+                    detail: current_detail,
+                    status: current_status,
+                    duration: current_duration,
+                    started_at: current_started_at,
+                    result: current_result,
+                    ..
+                }) = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == &entry_id))
+                {
+                    *current_detail = detail;
+                    *current_status = status;
+                    *current_duration = duration.clone();
+                    *current_started_at = started_at;
+                    *current_result = result.clone();
+                } else {
+                    self.entries.push(Entry::Tool {
+                        id: entry_id,
+                        label: "Agent".into(),
+                        detail,
+                        status,
+                        duration: duration.clone(),
+                        started_at,
+                        result: result.clone(),
+                        expanded: false,
+                    });
+                }
+                if append_background_notice {
+                    self.entries.push(Entry::Tool {
+                        id: format!("subagent-notice:{}", task.task_id),
+                        label: match task.status.as_str() {
+                            "completed" => "Agent completed",
+                            "cancelled" => "Agent cancelled",
+                            _ => "Agent failed",
+                        }
+                        .into(),
+                        detail: task.description.clone(),
+                        status,
+                        duration: duration.clone(),
+                        started_at: None,
+                        result: result.clone(),
+                        expanded: false,
+                    });
+                }
+                if task.status == "running" {
+                    self.status = format!("subagent working: {}", task.description);
+                } else if self
+                    .subagent_tasks
+                    .values()
+                    .all(|other| other.task_id == task.task_id || other.status != "running")
+                {
+                    self.status = if task.status == "completed" {
+                        "idle".into()
+                    } else {
+                        format!("subagent {}", task.status)
+                    };
+                }
+                self.subagent_tasks.insert(task.task_id.clone(), *task);
+            }
+            AgentEvent::SubagentTranscript { task_id, event } => {
+                self.subagent_transcripts
+                    .entry(task_id)
+                    .or_default()
+                    .push(*event);
+            }
             AgentEvent::ToolCallResult {
                 id,
                 result: ToolResult { content, details },
@@ -2040,7 +2319,6 @@ impl AppState {
                     .into();
                     return;
                 }
-                let mut completed_agent: Option<(String, String, Option<u64>)> = None;
                 if let Some(Entry::Tool {
                     status,
                     duration,
@@ -2059,19 +2337,12 @@ impl AppState {
                         } if tool_id == &id
                     )
                 }) {
-                    let background_agent =
-                        label == "Agent" && background_agent_id(&content).is_some();
-                    if !background_agent {
-                        let local_elapsed = started_at.take().map(|started| started.elapsed());
-                        *duration = duration_ms
-                            .map(|milliseconds| {
-                                format_elapsed(std::time::Duration::from_millis(milliseconds))
-                            })
-                            .or_else(|| local_elapsed.map(format_elapsed));
-                    }
-                    if label == "Agent result" {
-                        completed_agent = Some((detail.clone(), content.clone(), duration_ms));
-                    }
+                    let local_elapsed = started_at.take().map(|started| started.elapsed());
+                    *duration = duration_ms
+                        .map(|milliseconds| {
+                            format_elapsed(std::time::Duration::from_millis(milliseconds))
+                        })
+                        .or_else(|| local_elapsed.map(format_elapsed));
                     *current_result = Some(content);
                     if label == "Search"
                         && !detail.contains(" matches)")
@@ -2080,48 +2351,11 @@ impl AppState {
                     {
                         detail.push_str(&format!(" ({count} matches)"));
                     }
-                    if !background_agent {
-                        *status = if is_error {
-                            ToolStatus::Error
-                        } else {
-                            ToolStatus::Success
-                        };
-                    } else {
-                        *duration = None;
-                    }
-                }
-                if let Some((agent_id, report, agent_duration_ms)) = completed_agent
-                    && let Some(Entry::Tool {
-                        status,
-                        duration,
-                        started_at,
-                        result,
-                        ..
-                    }) = self.entries.iter_mut().rev().find(|entry| {
-                        matches!(
-                            entry,
-                            Entry::Tool {
-                                label,
-                                status: ToolStatus::Running,
-                                result: Some(spawn_result),
-                                ..
-                            } if label == "Agent"
-                                && background_agent_id(spawn_result).as_deref() == Some(agent_id.as_str())
-                        )
-                    })
-                {
-                    let local_elapsed = started_at.take().map(|started| started.elapsed());
-                    *duration = agent_duration_ms
-                        .map(|milliseconds| {
-                            format_elapsed(std::time::Duration::from_millis(milliseconds))
-                        })
-                        .or_else(|| local_elapsed.map(format_elapsed));
                     *status = if is_error {
                         ToolStatus::Error
                     } else {
                         ToolStatus::Success
                     };
-                    *result = Some(report);
                 }
             }
             AgentEvent::TurnComplete {
@@ -2136,7 +2370,12 @@ impl AppState {
                 self.turn_input_tokens = input_tokens;
                 self.turn_output_chars = 0;
                 self.turn_started_at = None;
-                self.status = "idle".into();
+                let running = self.running_tool_count();
+                self.status = if running == 0 {
+                    "idle".into()
+                } else {
+                    format!("{running} background task(s) running")
+                };
                 self.streaming = false;
                 for entry in &mut self.entries {
                     if let Entry::Reasoning { active, .. } = entry {
@@ -2579,26 +2818,6 @@ fn parse_diff_range(range: &str) -> Option<u32> {
         .parse()
         .ok()
 }
-fn background_agent_id(result: &str) -> Option<String> {
-    for marker in ["Agent ID:", "agent_id\":\"", "agent_id': '"] {
-        let Some((_, remainder)) = result.split_once(marker) else {
-            continue;
-        };
-        let id = remainder
-            .trim_start()
-            .trim_matches('"')
-            .split(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\'' | ',' | '}')
-            })
-            .next()
-            .unwrap_or_default();
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
-    }
-    None
-}
-
 fn apply_compaction(
     state: &mut AppState,
     phase: pi_harness::CompactionPhase,

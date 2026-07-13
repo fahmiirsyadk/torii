@@ -73,7 +73,8 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                 active,
                 expanded,
             } => {
-                row += reasoning_lines(text, *active, *expanded, width, Theme::GROK_NIGHT).len();
+                row += reasoning_lines(text, *active, *expanded, false, width, Theme::GROK_NIGHT)
+                    .len();
                 actionable = true;
             }
             Entry::Diff {
@@ -308,6 +309,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         crate::overlay::render(frame, state);
         return;
     }
+    if state.view == View::Tasks {
+        render_tasks(frame, state, theme);
+        return;
+    }
+    if state.view == View::Subagent {
+        render_subagent(frame, state, theme);
+        return;
+    }
 
     let outer = frame.area().inner(Margin {
         horizontal: 1,
@@ -340,6 +349,208 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     render_composer(frame, areas[4], state, theme);
     render_shortcuts(frame, areas[5], state, theme);
     crate::overlay::render(frame, state);
+}
+
+fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
+    let area = frame.area().inner(Margin {
+        horizontal: 3,
+        vertical: 2,
+    });
+    let tasks = state.sorted_subagent_tasks();
+    let mut lines = Vec::new();
+    for (index, task) in tasks.iter().enumerate() {
+        let selected = index == state.task_selected;
+        let elapsed = if task.status == "running" {
+            unix_time_ms().saturating_sub(u128::from(task.started_at_ms)) as u64
+        } else {
+            task.duration_ms
+        };
+        let icon = match task.status.as_str() {
+            "running" => WORKING_SPINNER[(elapsed / 80) as usize % WORKING_SPINNER.len()],
+            "completed" => "✓",
+            "cancelled" => "■",
+            _ => "✗",
+        };
+        let color = match task.status.as_str() {
+            "running" | "completed" => theme.success,
+            "cancelled" => theme.muted,
+            _ => theme.error,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(format!("{icon} Agent "), Style::default().fg(color)),
+            Span::styled(
+                task.description.clone(),
+                Style::default().fg(if selected {
+                    theme.foreground
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                format!("  {}  {}", task.activity, format_elapsed(elapsed)),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {} · {} · {}",
+                task.task_id,
+                task.subagent_type,
+                task.model.as_deref().unwrap_or("inherited model")
+            ),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No subagent tasks yet",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Tasks · Subagents ")
+        .title_bottom(
+            Line::from(" ↑/↓ select   Enter inspect   k kill   Ctrl+B close ")
+                .alignment(Alignment::Center),
+        )
+        .border_style(Style::default().fg(theme.accent));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_subagent(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
+    let area = frame.area().inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let Some(task_id) = state.inspected_subagent.as_deref() else {
+        return;
+    };
+    let task = state.subagent_tasks.get(task_id);
+    let elapsed = task.map_or(0, |task| {
+        if task.status == "running" {
+            unix_time_ms().saturating_sub(u128::from(task.started_at_ms)) as u64
+        } else {
+            task.duration_ms
+        }
+    });
+    let title = task.map_or_else(
+        || format!(" Agent {task_id} "),
+        |task| {
+            format!(
+                " Agent · {} · {} · {} ",
+                task.description,
+                task.activity,
+                format_elapsed(elapsed)
+            )
+        },
+    );
+    let mut lines = Vec::new();
+    for event in state
+        .subagent_transcripts
+        .get(task_id)
+        .into_iter()
+        .flatten()
+    {
+        match event {
+            pi_harness::AgentEvent::UserMessage { text } => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default()
+                        .fg(theme.foreground)
+                        .bg(theme.user_background),
+                )));
+            }
+            pi_harness::AgentEvent::ReasoningDelta { text } => {
+                for line in text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(theme.muted)),
+                        Span::styled(line.to_string(), Style::default().fg(theme.muted)),
+                    ]));
+                }
+            }
+            pi_harness::AgentEvent::TextDelta { text } => {
+                for line in text.lines() {
+                    lines.push(Line::raw(format!("  {line}")));
+                }
+            }
+            pi_harness::AgentEvent::ToolCallStart { name, args, .. } => {
+                lines.push(Line::from(vec![
+                    Span::styled("  ◆ ", Style::default().fg(theme.success)),
+                    Span::styled(name.clone(), Style::default().fg(theme.foreground)),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            truncate_text(
+                                &args.to_string(),
+                                area.width.saturating_sub(12) as usize
+                            )
+                        ),
+                        Style::default().fg(theme.muted),
+                    ),
+                ]));
+            }
+            pi_harness::AgentEvent::ToolCallResult {
+                is_error,
+                duration_ms,
+                ..
+            } => {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {} {}",
+                        if *is_error { "failed" } else { "done" },
+                        duration_ms.map(format_elapsed).unwrap_or_default()
+                    ),
+                    Style::default().fg(if *is_error { theme.error } else { theme.muted }),
+                )));
+            }
+            pi_harness::AgentEvent::Compaction { phase, .. } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ◇ Compaction {phase:?}"),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            pi_harness::AgentEvent::Error { message, .. } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ✗ {message}"),
+                    Style::default().fg(theme.error),
+                )));
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Waiting for child transcript…",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    let viewport = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title(Line::from(" [×] ").alignment(Alignment::Right))
+        .title_bottom(Line::from(" Esc/q close   ↑/↓ scroll ").alignment(Alignment::Center))
+        .border_style(
+            Style::default().fg(if task.is_some_and(|task| task.status == "running") {
+                theme.accent
+            } else {
+                theme.muted
+            }),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((scroll as u16, 0)),
+        area,
+    );
 }
 
 const TORII: &[&str] = &[
@@ -392,7 +603,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "T O R I I",
+                "Torii",
                 Style::default()
                     .fg(theme.foreground)
                     .add_modifier(Modifier::BOLD),
@@ -430,7 +641,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         let selected_here = index == selected;
         let runtime = state.runtime_sessions.get(&session.path);
         let running = runtime.is_some_and(|runtime| runtime.status == "running")
-            || (runtime.is_none() && session.current && state.streaming);
+            || (session.current && (state.streaming || state.has_background_work()));
         let attention = runtime.is_some_and(|runtime| runtime.status == "attention");
         let resident_idle = runtime.is_some_and(|runtime| runtime.status == "idle");
         let (indicator, status, color) = if running {
@@ -498,9 +709,11 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     )));
     frame.render_widget(Paragraph::new(lines), chunks[3]);
     frame.render_widget(
-        Paragraph::new("↑/↓ select   Enter open   n new   s stop   x close runtime   Esc return")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.muted)),
+        Paragraph::new(
+            "↑/↓ select   Enter open   n new   r rename   d delete   s stop   x close   Esc return",
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(theme.muted)),
         chunks[4],
     );
 }
@@ -532,6 +745,17 @@ fn truncate_text(value: &str, width: usize) -> String {
 }
 
 pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
+    if state.view == View::Subagent {
+        let count = state
+            .inspected_subagent
+            .as_ref()
+            .and_then(|task_id| state.subagent_transcripts.get(task_id))
+            .map_or(0, Vec::len);
+        return count.saturating_sub(usize::from(height.saturating_sub(4)));
+    }
+    if state.view != View::Transcript {
+        return 0;
+    }
     let (_, _, content_width, viewport) = transcript_geometry(state, width, height);
     TranscriptLayout::build(state, content_width.saturating_sub(1) as usize).max_scroll(viewport)
 }
@@ -589,7 +813,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 active,
                 expanded,
             } => {
-                lines.extend(reasoning_lines(text, *active, *expanded, width, theme));
+                lines.extend(reasoning_lines(
+                    text,
+                    *active,
+                    *expanded,
+                    state.hovered_entry == Some(entry_index),
+                    width,
+                    theme,
+                ));
             }
             Entry::Diff {
                 path,
@@ -955,36 +1186,68 @@ fn reasoning_lines(
     text: &str,
     active: bool,
     expanded: bool,
+    hovered: bool,
     width: usize,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    // Account for the `┊   ` prefix so reasoning never clips at the right edge.
-    let wrapped = markdown::wrap(text, width.saturating_sub(4));
+    let body_width = width.saturating_sub(2);
+    let wrapped = markdown::wrap(text.trim(), body_width);
+    if wrapped.iter().all(|line| line.trim().is_empty()) {
+        return Vec::new();
+    }
     let visible = if expanded {
         wrapped.len()
     } else if active {
         wrapped.len().min(3)
     } else {
-        wrapped.len().min(1)
+        wrapped.len().min(2)
     };
-    let glyph = if expanded { "⌄" } else { "›" };
-    let indicator = if active { " ◌" } else { "" };
+    let total_lines = wrapped.len();
+    let glyph = if hovered {
+        ">"
+    } else if active {
+        "⠹"
+    } else {
+        "◆"
+    };
+    let fold = if expanded { " [⌄]" } else { " [›]" };
+    let header_color = if hovered {
+        theme.foreground
+    } else if active {
+        theme.accent
+    } else {
+        theme.muted
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("┊ {glyph} Thinking…"),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(indicator, Style::default().fg(theme.accent)),
-    ])];
-    for line in wrapped.into_iter().take(visible) {
-        lines.push(Line::from(Span::styled(
-            format!("┊   {line}"),
+            format!("{glyph} Reasoning"),
             Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::ITALIC),
+                .fg(header_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(fold, Style::default().fg(theme.subtle)),
+    ])];
+    for (index, line) in wrapped.into_iter().take(visible).enumerate() {
+        let rail = if expanded || active {
+            if index + 1 == visible { "└ " } else { "│ " }
+        } else {
+            "  "
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{rail}{line}"),
+            Style::default().fg(if active {
+                theme.muted
+            } else {
+                theme.foreground
+            }),
         )));
     }
-    lines.push(Line::raw(""));
+    if !expanded && visible < total_lines {
+        lines.push(Line::from(Span::styled(
+            "  …",
+            Style::default().fg(theme.subtle),
+        )));
+    }
     lines
 }
 
@@ -1568,18 +1831,48 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
     } else {
         theme.subtle
     };
+    let model_label = format!(" {} ", state.model);
+    let thinking_label = format!(" thinking {} ", state.thinking_level);
+    let mode_label = format!("{} ", state.permission_mode.label());
+    let total = (model_label.chars().count()
+        + thinking_label.chars().count()
+        + mode_label.chars().count()) as u16;
+    let mut x = area.right().saturating_sub(total + 1);
+    let y = area.bottom().saturating_sub(1);
+    let mut targets = state.composer_targets.borrow_mut();
+    targets.clear();
+    for (kind, label) in [(0, &model_label), (1, &thinking_label), (2, &mode_label)] {
+        let end = x.saturating_add(label.chars().count() as u16);
+        targets.push((kind, x, end, y));
+        x = end;
+    }
+    drop(targets);
     let title_line = Line::from(vec![
         Span::styled(
-            format!(" {} ", state.model),
-            Style::default().fg(theme.muted).bg(theme.background),
+            model_label,
+            Style::default()
+                .fg(if state.composer_hover == Some(0) {
+                    theme.accent
+                } else {
+                    theme.muted
+                })
+                .bg(theme.background),
         ),
         Span::styled(
-            format!(" thinking {} ", state.thinking_level),
-            Style::default().fg(theme.subtle),
+            thinking_label,
+            Style::default().fg(if state.composer_hover == Some(1) {
+                theme.warning
+            } else {
+                theme.muted
+            }),
         ),
         Span::styled(
-            format!("{} ", state.permission_mode.label()),
-            Style::default().fg(theme.subtle),
+            mode_label,
+            Style::default().fg(if state.composer_hover == Some(2) {
+                theme.success
+            } else {
+                theme.muted
+            }),
         ),
     ]);
     let block = Block::default()
@@ -1611,7 +1904,9 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
         (Focus::Prompt, true) => {
             " Enter: steer  │  Alt+Enter: follow-up  │  Esc: abort/restore queue"
         }
-        (Focus::Prompt, false) => " Enter: send  │  Tab: scrollback  │  Shift+Tab: mode",
+        (Focus::Prompt, false) => {
+            " Enter: send  │  Tab: scrollback  │  Shift+Tab: mode  │  Ctrl+B: tasks"
+        }
         (Focus::Scrollback, _) => {
             " ↑/↓: scroll  │  e: reasoning  │  t: tool  │  d: diff  │  Tab: prompt"
         }

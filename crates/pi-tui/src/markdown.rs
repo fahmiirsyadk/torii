@@ -163,6 +163,22 @@ pub fn wrap(value: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in value.split_whitespace() {
+        if word.chars().count() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let characters = word.chars().collect::<Vec<_>>();
+            let chunks = characters.chunks(width).collect::<Vec<_>>();
+            for (index, chunk) in chunks.iter().enumerate() {
+                let text = chunk.iter().copied().collect::<String>();
+                if index + 1 == chunks.len() && chunk.len() < width {
+                    current = text;
+                } else {
+                    lines.push(text);
+                }
+            }
+            continue;
+        }
         let separator = usize::from(!current.is_empty());
         if current.chars().count() + separator + word.chars().count() > width && !current.is_empty()
         {

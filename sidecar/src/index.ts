@@ -19,6 +19,7 @@ import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
 import * as pi from "./pi-adapter.ts";
+import { NativeSubagentCoordinator, type TaskSnapshot } from "./subagents.ts";
 
 // -----------------------------------------------------------------------------
 // Per-session state at the protocol layer.
@@ -32,6 +33,34 @@ const alwaysAllowedTools = new Set<string>();
 const permissionModes = new Map<string, "normal" | "plan" | "always_approve">();
 const mcpClients = new Map<string, McpClient>();
 let nextPermissionId = 1;
+
+const subagents = new NativeSubagentCoordinator(async (context) => {
+  const parent = sessions.get(context.parentSessionId);
+  if (parent === undefined) throw new Error(`subagent parent session is not resident: ${context.parentSessionId}`);
+  return pi.launchNativeSubagent(context, openHooks, subagents, parent);
+});
+const persistedTaskStates = new Map<string, string>();
+
+subagents.subscribe((record) => {
+  const parent = sessions.get(record.parentSessionId);
+  const snapshot = subagents.snapshot(record);
+  writeMessage({ type: "event", session_id: record.parentSessionId, event: { type: "subagent_update", task: snapshot } });
+  if (parent === undefined) return;
+  const persistenceKey = `${record.status}:${record.activity}:${record.childSessionPath ?? ""}:${record.worktreePath ?? ""}:${record.completedAt ?? ""}`;
+  if (persistedTaskStates.get(record.taskId) !== persistenceKey) {
+    parent.session.sessionManager.appendCustomEntry("torii.subagent", snapshot);
+    persistedTaskStates.set(record.taskId, persistenceKey);
+  }
+  if (record.completedAt === undefined || persistedTaskStates.has(`${record.taskId}:notified`)) return;
+  persistedTaskStates.set(`${record.taskId}:notified`, "true");
+  const fullResult = record.output ?? record.error ?? `Subagent ${record.status}`;
+  const result = fullResult.length > 50_000 ? `${fullResult.slice(0, 50_000)}\n\n[Subagent result truncated; full output remains in task metadata.]` : fullResult;
+  const content = `[Subagent ${record.status}: ${record.description} (${record.taskId})]\n${result}`;
+  void parent.session.sendCustomMessage(
+    { customType: "torii.subagent-result", content, display: true, details: snapshot },
+    parent.session.isStreaming ? { triggerTurn: false, deliverAs: "nextTurn" } : { triggerTurn: false },
+  );
+});
 
 function emitFor(wireSessionId: string): (event: AgentEvent) => void {
   return (event) => writeMessage({ type: "event", session_id: wireSessionId, event });
@@ -54,7 +83,55 @@ const openHooks: pi.OpenSessionHooks = {
   registerPermissionReply: (id, reply) => permissionReplies.set(id, reply),
   unregisterPermissionReply: (id) => permissionReplies.delete(id),
   mcpClients,
+  subagents,
 };
+
+function restoreSubagents(active: pi.ActiveSession): AgentEvent[] {
+  const latest = new Map<string, TaskSnapshot>();
+  for (const entry of active.session.sessionManager.getEntries()) {
+    if (entry.type !== "custom" || entry.customType !== "torii.subagent") continue;
+    const data = entry.data as Partial<TaskSnapshot> | undefined;
+    if (data?.task_id === undefined || data.parent_session_id === undefined || data.status === undefined) continue;
+    latest.set(data.task_id, data as TaskSnapshot);
+  }
+  const events: AgentEvent[] = [];
+  for (const task of latest.values()) {
+    subagents.restore({
+      taskId: task.task_id,
+      parentSessionId: active.wireSessionId,
+      parentSessionPath: active.session.sessionFile,
+      childSessionId: task.child_session_id,
+      childSessionPath: task.child_session_path,
+      prompt: "",
+      description: task.description,
+      subagentType: task.subagent_type,
+      capabilityMode: task.capability_mode,
+      isolation: task.isolation,
+      background: task.background,
+      status: task.status,
+      activity: task.activity,
+      startedAt: task.started_at_ms,
+      completedAt: task.completed_at_ms,
+      output: task.output,
+      error: task.error,
+      model: task.model,
+      thinkingLevel: task.thinking_level,
+      worktreePath: task.worktree_path,
+      cwd: task.cwd,
+    });
+    const restored = subagents.get(task.task_id);
+    if (restored !== undefined) {
+      if (restored.completedAt !== undefined) persistedTaskStates.set(`${restored.taskId}:notified`, "true");
+      events.push({ type: "subagent_update", task: subagents.snapshot(restored) });
+      if (restored.childSessionPath !== undefined) {
+        for (const event of pi.loadPersistedSubagentTranscript(restored.childSessionPath)) {
+          events.push({ type: "subagent_transcript", task_id: restored.taskId, event });
+        }
+      }
+    }
+  }
+  return events;
+}
 
 // -----------------------------------------------------------------------------
 // Command dispatch
@@ -81,6 +158,7 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   if (command.type === "open_session") {
     const { active, history } = await pi.openSession(command, openHooks);
     sessions.set(active.wireSessionId, active);
+    history.push(...restoreSubagents(active));
     writeMessage({ type: "response", request_id: command.request_id, session_id: active.wireSessionId, history });
     return;
   }
@@ -89,6 +167,14 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   if (active === undefined) throw new Error(`unknown session: ${command.session_id}`);
   const sessionId = command.session_id;
   const emit = emitFor(sessionId);
+
+  if (command.type === "kill_task") {
+    const task = subagents.get(command.task_id);
+    if (task === undefined || task.parentSessionId !== sessionId || task.parentSessionPath !== active.session.sessionFile) throw new Error(`unknown task for session: ${command.task_id}`);
+    await subagents.kill(command.task_id);
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
 
   if (command.type === "list_auth_providers") {
     writeMessage({ type: "response", request_id: command.request_id, providers: pi.listAuthProviders(active) });
@@ -110,8 +196,8 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
       onAuth: ({ url }) => emit({ type: "oauth_request", id: `oauth-${newOauthId()}`, kind: "auth", url }),
       onDeviceCode: ({ userCode, verificationUri, intervalSeconds, expiresInSeconds }) =>
         emit({ type: "oauth_request", id: `oauth-${newOauthId()}`, kind: "device_code", user_code: userCode, verification_uri: verificationUri, interval_seconds: intervalSeconds, expires_in_seconds: expiresInSeconds }),
-      onPrompt: async ({ message }) => (await waitForOAuthReply({ kind: "prompt", message })) ?? "",
-      onSelect: async ({ message, options }) => waitForOAuthReply({ kind: "select", message, options }),
+      onPrompt: async ({ message }) => (await waitForOAuthReply(sessionId, { kind: "prompt", message })) ?? "",
+      onSelect: async ({ message, options }) => waitForOAuthReply(sessionId, { kind: "select", message, options }),
       onComplete: () => emit({ type: "oauth_complete", provider }),
       onError: (error) => emit({ type: "error", kind: "authentication", message: error instanceof Error ? error.message : String(error) }),
     });
@@ -190,6 +276,12 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   }
 
   if (command.type === "delete_session") {
+    const listedSessions = await pi.listAllSessions(active);
+    const target = listedSessions.find((session) => session.path === command.target);
+    if (target === undefined) throw new Error(`session not found: ${command.target}`);
+    if ([...sessions.values()].some((resident) => resident.session.sessionFile === target.path)) {
+      throw new Error("cannot delete a resident session; close it first");
+    }
     await pi.deleteSession(command.target);
     writeMessage({ type: "response", request_id: command.request_id, sessions: await pi.listAllSessions(active) });
     return;
@@ -236,20 +328,22 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "resume_session") {
     await pi.switchSession(active, command.target);
+    const subagentHistory = restoreSubagents(active);
     writeMessage({
       type: "response",
       request_id: command.request_id,
-      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager)],
+      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory],
     });
     return;
   }
 
   if (command.type === "new_session" || command.type === "clone_session") {
     await pi.newOrCloneSession(active, command.type === "clone_session" ? "clone" : "new");
+    const subagentHistory = restoreSubagents(active);
     writeMessage({
       type: "response",
       request_id: command.request_id,
-      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager)],
+      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory],
     });
     return;
   }
@@ -307,6 +401,9 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   }
 
   if (command.type === "close_session") {
+    for (const task of subagents.listForParent(sessionId)) {
+      if (task.status === "running") await subagents.kill(task.taskId);
+    }
     await active.runtime.dispose();
     sessions.delete(sessionId);
     permissionModes.delete(sessionId);
@@ -349,6 +446,15 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "set_model") {
     await pi.setModel(active, command.model);
+    emit({ type: "thinking_changed", level: pi.currentThinkingLevel(active) });
+    emit({ type: "thinking_options", levels: pi.availableThinkingLevels(active) });
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "set_thinking") {
+    pi.setThinkingLevel(active, command.level);
+    emit({ type: "thinking_changed", level: pi.currentThinkingLevel(active) });
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }
@@ -386,9 +492,9 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
 type OAuthReplyEvent = { kind: "prompt"; message: string } | { kind: "select"; message: string; options: Array<{ id: string; label: string }> };
 
-function waitForOAuthReply(event: OAuthReplyEvent): Promise<string | undefined> {
+function waitForOAuthReply(sessionId: string, event: OAuthReplyEvent): Promise<string | undefined> {
   const id = `oauth-${newOauthId()}`;
-  writeMessage({ type: "event", session_id: "_oauth", event: { type: "oauth_request", id, ...event } });
+  writeMessage({ type: "event", session_id: sessionId, event: { type: "oauth_request", id, ...event } });
   return new Promise((resolve) => oauthReplies.set(id, resolve));
 }
 

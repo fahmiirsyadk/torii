@@ -164,7 +164,7 @@ impl PiHarness {
         Ok(())
     }
 
-    pub async fn list_auth_providers(&self, id: &SessionId) -> Result<Vec<AuthProviderInfo>> {
+    pub async fn auth_provider_details(&self, id: &SessionId) -> Result<Vec<AuthProviderInfo>> {
         Ok(self
             .request(
                 json!({ "type": "list_auth_providers", "session_id": id.0 }),
@@ -361,6 +361,14 @@ impl AgentHarness for PiHarness {
         .await?;
         Ok(())
     }
+    async fn set_thinking(&self, id: &SessionId, level: String) -> Result<()> {
+        self.request(
+            json!({ "type": "set_thinking", "session_id": id.0, "level": level }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
 
     async fn clear_queue(&self, id: &SessionId) -> Result<()> {
         self.request(json!({ "type": "clear_queue", "session_id": id.0 }), None)
@@ -381,6 +389,15 @@ impl AgentHarness for PiHarness {
     async fn cancel(&self, id: &SessionId) -> Result<()> {
         self.request(json!({ "type": "cancel", "session_id": id.0 }), None)
             .await?;
+        Ok(())
+    }
+
+    async fn kill_task(&self, id: &SessionId, task_id: String) -> Result<()> {
+        self.request(
+            json!({ "type": "kill_task", "session_id": id.0, "task_id": task_id }),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -434,6 +451,26 @@ impl AgentHarness for PiHarness {
             .await?
             .models
             .unwrap_or_default())
+    }
+
+    async fn list_auth_providers(&self, id: &SessionId) -> Result<Vec<ModelInfo>> {
+        Ok(self
+            .auth_provider_details(id)
+            .await?
+            .into_iter()
+            .map(|provider| ModelInfo {
+                id: provider.id,
+                display_name: format!(
+                    "{}{}",
+                    provider.display_name,
+                    if provider.configured {
+                        "  ✓ configured"
+                    } else {
+                        ""
+                    }
+                ),
+            })
+            .collect())
     }
 
     async fn list_files(&self, id: &SessionId) -> Result<Vec<String>> {
@@ -829,6 +866,27 @@ mod tests {
                 event: AgentEvent::TextDelta { text },
                 ..
             } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn decodes_subagent_lifecycle_and_nested_transcript() {
+        let message: WireMessage = serde_json::from_value(json!({
+            "type": "event",
+            "session_id": "parent-1",
+            "event": {
+                "type": "subagent_transcript",
+                "task_id": "task-1",
+                "event": { "type": "text_delta", "text": "child output" }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            message,
+            WireMessage::Event {
+                event: AgentEvent::SubagentTranscript { task_id, event },
+                ..
+            } if task_id == "task-1" && matches!(*event, AgentEvent::TextDelta { ref text } if text == "child output")
         ));
     }
 }

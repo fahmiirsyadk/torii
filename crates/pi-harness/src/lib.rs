@@ -76,10 +76,16 @@ pub enum AgentEvent {
         id: String,
         display_name: String,
     },
+    ModelsChanged {
+        models: Vec<ModelInfo>,
+    },
     SessionInfo {
         summary: String,
     },
     SessionList {
+        sessions: Vec<SessionInfo>,
+    },
+    SessionsChanged {
         sessions: Vec<SessionInfo>,
     },
     PromptPrefill {
@@ -87,6 +93,9 @@ pub enum AgentEvent {
     },
     ThinkingChanged {
         level: String,
+    },
+    ThinkingOptions {
+        levels: Vec<String>,
     },
     QueueChanged {
         steering: Vec<String>,
@@ -121,6 +130,13 @@ pub enum AgentEvent {
     },
     ReasoningDelta {
         text: String,
+    },
+    SubagentUpdate {
+        task: Box<SubagentTask>,
+    },
+    SubagentTranscript {
+        task_id: String,
+        event: Box<AgentEvent>,
     },
     ToolCallStart {
         id: String,
@@ -176,6 +192,30 @@ pub struct RuntimeSessionInfo {
     pub path: String,
     pub status: String,
     pub started_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentTask {
+    pub task_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: Option<String>,
+    pub child_session_path: Option<String>,
+    pub description: String,
+    pub subagent_type: String,
+    pub capability_mode: String,
+    pub isolation: String,
+    pub background: bool,
+    pub status: String,
+    pub activity: String,
+    pub started_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    pub duration_ms: u64,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+    pub worktree_path: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -311,6 +351,7 @@ pub trait AgentHarness: Send + Sync {
         delivery: Option<MessageDelivery>,
     ) -> Result<()>;
     async fn cycle_thinking(&self, id: &SessionId) -> Result<()>;
+    async fn set_thinking(&self, id: &SessionId, level: String) -> Result<()>;
     async fn clear_queue(&self, id: &SessionId) -> Result<()>;
     async fn execute_bash(
         &self,
@@ -319,6 +360,7 @@ pub trait AgentHarness: Send + Sync {
         exclude_from_context: bool,
     ) -> Result<()>;
     async fn cancel(&self, id: &SessionId) -> Result<()>;
+    async fn kill_task(&self, id: &SessionId, task_id: String) -> Result<()>;
     async fn close_session(&self, id: &SessionId) -> Result<()> {
         self.cancel(id).await
     }
@@ -330,6 +372,9 @@ pub trait AgentHarness: Send + Sync {
     ) -> Result<()>;
     async fn set_model(&self, id: &SessionId, model: String) -> Result<()>;
     async fn list_models(&self) -> Result<Vec<ModelInfo>>;
+    async fn list_auth_providers(&self, _id: &SessionId) -> Result<Vec<ModelInfo>> {
+        Ok(Vec::new())
+    }
     async fn list_files(&self, id: &SessionId) -> Result<Vec<String>>;
     async fn runtime_resources(&self, id: &SessionId) -> Result<RuntimeResources>;
     async fn reload_resources(&self, id: &SessionId) -> Result<()>;
@@ -469,6 +514,10 @@ impl AgentHarness for MockHarness {
         Ok(())
     }
 
+    async fn kill_task(&self, _id: &SessionId, _task_id: String) -> Result<()> {
+        Ok(())
+    }
+
     async fn deliver_message(
         &self,
         id: &SessionId,
@@ -482,6 +531,10 @@ impl AgentHarness for MockHarness {
         let _ = self.sender(id)?.send(AgentEvent::ThinkingChanged {
             level: "medium".into(),
         });
+        Ok(())
+    }
+    async fn set_thinking(&self, id: &SessionId, level: String) -> Result<()> {
+        let _ = self.sender(id)?.send(AgentEvent::ThinkingChanged { level });
         Ok(())
     }
 

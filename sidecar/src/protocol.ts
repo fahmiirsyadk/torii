@@ -53,9 +53,11 @@ export type SidecarCommand =
   | { type: "set_model"; request_id: string; session_id: string; model: string }
   | { type: "prompt"; request_id: string; session_id: string; text: string; delivery?: "steer" | "follow_up" }
   | { type: "cycle_thinking"; request_id: string; session_id: string }
+  | { type: "set_thinking"; request_id: string; session_id: string; level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | { type: "clear_queue"; request_id: string; session_id: string }
   | { type: "bash"; request_id: string; session_id: string; command: string; exclude_from_context?: boolean }
   | { type: "cancel"; request_id: string; session_id: string }
+  | { type: "kill_task"; request_id: string; session_id: string; task_id: string }
   | { type: "close_session"; request_id: string; session_id: string }
   | {
       type: "permission";
@@ -139,11 +141,14 @@ export type AgentEvent =
   | { type: "session_info"; summary: string }
   | { type: "prompt_prefill"; text: string }
   | { type: "thinking_changed"; level: string }
+  | { type: "thinking_options"; levels: string[] }
   | { type: "queue_changed"; steering: string[]; follow_up: string[] }
   | { type: "oauth_request"; id: string; kind: "auth" | "device_code" | "prompt" | "select"; message?: string; url?: string; user_code?: string; verification_uri?: string; interval_seconds?: number; expires_in_seconds?: number; options?: Array<{ id: string; label: string }> }
   | { type: "oauth_complete"; provider: string }
   | { type: "text_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
+  | { type: "subagent_update"; task: SubagentTask }
+  | { type: "subagent_transcript"; task_id: string; event: AgentEvent }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "permission_request"; id: string; tool: string; args: unknown; reason: string }
   | { type: "plan_update"; entries: Array<{ step: string; status: string }> }
@@ -174,6 +179,29 @@ export type AgentEvent =
       reason: string;
       tokens_before?: number;
     };
+
+export interface SubagentTask {
+  task_id: string;
+  parent_session_id: string;
+  child_session_id?: string;
+  child_session_path?: string;
+  description: string;
+  subagent_type: string;
+  capability_mode: "read-only" | "read-write" | "execute" | "all";
+  isolation: "none" | "worktree";
+  background: boolean;
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted";
+  activity: string;
+  started_at_ms: number;
+  completed_at_ms?: number;
+  duration_ms: number;
+  output?: string;
+  error?: string;
+  model?: string;
+  thinking_level?: string;
+  worktree_path?: string;
+  cwd?: string;
+}
 
 export function writeMessage(message: SidecarMessage): void {
   process.stdout.write(`${JSON.stringify(message)}\n`);
