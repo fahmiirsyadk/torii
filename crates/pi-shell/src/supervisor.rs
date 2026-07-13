@@ -13,6 +13,12 @@ use tokio::process::Command;
 use tokio::sync::{RwLock, broadcast};
 
 const MAX_REPLAY_EVENTS: usize = 20_000;
+// Resuming a resident replays its whole buffered transcript through the event
+// channel. Size the channel past MAX_REPLAY_EVENTS so a full replay plus live
+// headroom fits without the single foreground consumer lagging and dropping
+// history. Mirrors the harness, which sizes its per-session channel to fit the
+// one bounded resume snapshot (pi-harness-pi/src/lib.rs).
+const EVENT_CHANNEL_CAPACITY: usize = MAX_REPLAY_EVENTS + 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStatus {
@@ -45,6 +51,91 @@ struct Resident {
     background_tasks: HashSet<String>,
 }
 
+impl Resident {
+    /// Fold one event into the live runtime status/timer bookkeeping.
+    fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::UserMessage { .. } => {
+                self.turn_running = true;
+                self.status = RuntimeStatus::Running;
+                self.started_at = Some(Instant::now());
+            }
+            AgentEvent::ToolCallStart { id, name, .. } => {
+                self.running_tools.insert(id.clone(), name.clone());
+                self.status = RuntimeStatus::Running;
+                self.started_at.get_or_insert_with(Instant::now);
+            }
+            AgentEvent::ToolCallResult { id, .. } => {
+                self.running_tools.remove(id);
+                if !self.turn_running
+                    && self.running_tools.is_empty()
+                    && self.background_tasks.is_empty()
+                {
+                    self.status = RuntimeStatus::Idle;
+                    self.started_at = None;
+                }
+            }
+            AgentEvent::SubagentUpdate { task } => {
+                if task.status == "running" {
+                    self.background_tasks.insert(task.task_id.clone());
+                    self.status = RuntimeStatus::Running;
+                    self.started_at.get_or_insert_with(Instant::now);
+                } else {
+                    self.background_tasks.remove(&task.task_id);
+                    if task.status == "failed" || task.status == "interrupted" {
+                        self.status = RuntimeStatus::Attention;
+                    } else if !self.turn_running
+                        && self.running_tools.is_empty()
+                        && self.background_tasks.is_empty()
+                    {
+                        self.status = RuntimeStatus::Idle;
+                        self.started_at = None;
+                    }
+                }
+            }
+            AgentEvent::TurnComplete { .. } => {
+                self.turn_running = false;
+                if self.running_tools.is_empty() && self.background_tasks.is_empty() {
+                    self.status = RuntimeStatus::Idle;
+                    self.started_at = None;
+                }
+            }
+            AgentEvent::PermissionRequest { .. } | AgentEvent::Error { .. } => {
+                self.status = RuntimeStatus::Attention;
+            }
+            _ => {}
+        }
+    }
+
+    /// Collapse the state left by a replayed transcript into a resumed baseline.
+    ///
+    /// A resumed session has no live in-flight work: a persisted turn that was
+    /// interrupted mid-flight has no trailing `TurnComplete`, so `observe`
+    /// would otherwise leave it stuck `Running` with a wall-clock timer that
+    /// started at resume. Clear that phantom activity, then re-derive `Attention`
+    /// straight from the replayed history so a failed/interrupted child or a
+    /// persisted error still surfaces even when a later `TurnComplete` had reset
+    /// the transient status during replay.
+    fn settle_after_resume(&mut self) {
+        self.turn_running = false;
+        self.running_tools.clear();
+        self.background_tasks.clear();
+        self.started_at = None;
+        let needs_attention = self.history.iter().any(|event| match event {
+            AgentEvent::SubagentUpdate { task } => {
+                task.status == "failed" || task.status == "interrupted"
+            }
+            AgentEvent::Error { .. } => true,
+            _ => false,
+        });
+        self.status = if needs_attention {
+            RuntimeStatus::Attention
+        } else {
+            RuntimeStatus::Idle
+        };
+    }
+}
+
 pub struct SessionSupervisor {
     harness: Arc<dyn AgentHarness>,
     residents: Arc<RwLock<HashMap<String, Resident>>>,
@@ -54,7 +145,7 @@ pub struct SessionSupervisor {
 
 impl SessionSupervisor {
     pub fn new(harness: Arc<dyn AgentHarness>) -> Self {
-        let (events, _) = broadcast::channel(1024);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             harness,
             residents: Arc::new(RwLock::new(HashMap::new())),
@@ -96,7 +187,14 @@ impl SessionSupervisor {
         let residents = Arc::clone(&self.residents);
         let (output, receiver) = broadcast::channel(1024);
         tokio::spawn(async move {
-            while let Ok(message) = tagged.recv().await {
+            loop {
+                let message = match tagged.recv().await {
+                    Ok(message) => message,
+                    // A lag only means this consumer fell behind; the channel is
+                    // still open, so keep draining instead of ending the fan-out.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
                 let active_id = if let Some(path) = active_path.read().await.as_ref() {
                     residents
                         .read()
@@ -307,13 +405,17 @@ impl SessionSupervisor {
         let residents = self.residents.read().await;
         let sessions = runtime_infos(&residents);
         drop(residents);
-        let session_id = self.active_session().await.ok();
-        if let Some(session_id) = session_id {
-            let _ = self.events.send(TaggedEvent {
-                session_id,
-                event: AgentEvent::RuntimeSessions { sessions },
-            });
-        }
+        // Fall back to an empty id so the runtime list still reaches the UI when
+        // no session is active (e.g. after the last resident is closed) — the
+        // foreground filter forwards RuntimeSessions regardless of its tag.
+        let session_id = self
+            .active_session()
+            .await
+            .unwrap_or_else(|_| SessionId(String::new()));
+        let _ = self.events.send(TaggedEvent {
+            session_id,
+            event: AgentEvent::RuntimeSessions { sessions },
+        });
     }
 
     fn forward(&self, path: String, id: SessionId, mut receiver: broadcast::Receiver<AgentEvent>) {
@@ -321,7 +423,44 @@ impl SessionSupervisor {
         let output = self.events.clone();
         let harness = Arc::clone(&self.harness);
         tokio::spawn(async move {
-            while let Ok(event) = receiver.recv().await {
+            // Phase 1 — replay. Everything already queued on the receiver is the
+            // resumed transcript (the harness sends it synchronously before the
+            // session goes live). Fold it into history and forward it to the UI,
+            // but do not let interrupted/in-flight-looking history drive the live
+            // timer: settle to a resumed baseline once the queue is drained.
+            let mut replaying = true;
+            loop {
+                let event = if replaying {
+                    match receiver.try_recv() {
+                        Ok(event) => event,
+                        Err(broadcast::error::TryRecvError::Empty) => {
+                            replaying = false;
+                            let sessions = {
+                                let mut residents = residents.write().await;
+                                if let Some(resident) = residents.get_mut(&path) {
+                                    resident.settle_after_resume();
+                                }
+                                runtime_infos(&residents)
+                            };
+                            let _ = output.send(TaggedEvent {
+                                session_id: id.clone(),
+                                event: AgentEvent::RuntimeSessions { sessions },
+                            });
+                            continue;
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::TryRecvError::Closed) => break,
+                    }
+                } else {
+                    match receiver.recv().await {
+                        Ok(event) => event,
+                        // Falling behind is recoverable: the per-session channel
+                        // is still live, so skip the gap rather than dropping the
+                        // resident's event stream permanently.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                };
                 if let Some(url) = browser_oauth_url(&event) {
                     let url = url.to_string();
                     tokio::spawn(async move {
@@ -335,59 +474,7 @@ impl SessionSupervisor {
                             resident.history.drain(..1_000);
                         }
                         resident.history.push(event.clone());
-                        match &event {
-                            AgentEvent::UserMessage { .. } => {
-                                resident.turn_running = true;
-                                resident.status = RuntimeStatus::Running;
-                                resident.started_at = Some(Instant::now());
-                            }
-                            AgentEvent::ToolCallStart { id, name, .. } => {
-                                resident.running_tools.insert(id.clone(), name.clone());
-                                resident.status = RuntimeStatus::Running;
-                                resident.started_at.get_or_insert_with(Instant::now);
-                            }
-                            AgentEvent::ToolCallResult { id, .. } => {
-                                resident.running_tools.remove(id);
-                                if !resident.turn_running
-                                    && resident.running_tools.is_empty()
-                                    && resident.background_tasks.is_empty()
-                                {
-                                    resident.status = RuntimeStatus::Idle;
-                                    resident.started_at = None;
-                                }
-                            }
-                            AgentEvent::SubagentUpdate { task } => {
-                                if task.status == "running" {
-                                    resident.background_tasks.insert(task.task_id.clone());
-                                    resident.status = RuntimeStatus::Running;
-                                    resident.started_at.get_or_insert_with(Instant::now);
-                                } else {
-                                    resident.background_tasks.remove(&task.task_id);
-                                    if task.status == "failed" || task.status == "interrupted" {
-                                        resident.status = RuntimeStatus::Attention;
-                                    } else if !resident.turn_running
-                                        && resident.running_tools.is_empty()
-                                        && resident.background_tasks.is_empty()
-                                    {
-                                        resident.status = RuntimeStatus::Idle;
-                                        resident.started_at = None;
-                                    }
-                                }
-                            }
-                            AgentEvent::TurnComplete { .. } => {
-                                resident.turn_running = false;
-                                if resident.running_tools.is_empty()
-                                    && resident.background_tasks.is_empty()
-                                {
-                                    resident.status = RuntimeStatus::Idle;
-                                    resident.started_at = None;
-                                }
-                            }
-                            AgentEvent::PermissionRequest { .. } | AgentEvent::Error { .. } => {
-                                resident.status = RuntimeStatus::Attention;
-                            }
-                            _ => {}
-                        }
+                        resident.observe(&event);
                     }
                     runtime_infos(&residents)
                 };
@@ -403,10 +490,14 @@ impl SessionSupervisor {
                         event: AgentEvent::ModelsChanged { models },
                     });
                 }
-                let _ = output.send(TaggedEvent {
-                    session_id: id.clone(),
-                    event: AgentEvent::RuntimeSessions { sessions },
-                });
+                // During replay a single settled snapshot (emitted once the queue
+                // drains) is enough; only live events need a per-event refresh.
+                if !replaying {
+                    let _ = output.send(TaggedEvent {
+                        session_id: id.clone(),
+                        event: AgentEvent::RuntimeSessions { sessions },
+                    });
+                }
             }
         });
     }
@@ -486,6 +577,11 @@ mod tests {
         }
     }
 
+    /// Wait for the forward task to drain any preloaded replay and settle.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
     #[tokio::test]
     async fn dashboard_stays_running_after_parent_turn_while_child_is_active() {
         let harness: Arc<dyn AgentHarness> = Arc::new(MockHarness::default());
@@ -495,6 +591,8 @@ mod tests {
         supervisor
             .adopt("/session.jsonl".into(), id.clone(), receiver)
             .await;
+        // Let the (empty) replay drain and settle before driving live events.
+        settle().await;
         supervisor.mark_running(&id).await;
 
         sender
@@ -532,6 +630,7 @@ mod tests {
         supervisor
             .adopt("/session.jsonl".into(), id, receiver)
             .await;
+        settle().await;
 
         sender
             .send(AgentEvent::ToolCallStart {
@@ -555,5 +654,74 @@ mod tests {
         assert!(!resident.turn_running);
         assert!(resident.running_tools.is_empty());
         assert!(resident.background_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resuming_an_interrupted_turn_does_not_look_like_running() {
+        // An interrupted turn is persisted without a trailing TurnComplete. The
+        // replayed history must not leave the resident stuck Running with a
+        // phantom timer counting from the resume moment.
+        let harness: Arc<dyn AgentHarness> = Arc::new(MockHarness::default());
+        let supervisor = SessionSupervisor::new(harness);
+        let (sender, receiver) = broadcast::channel(16);
+        let id = SessionId("session-1".into());
+        // Preload the replay transcript before adopting, mirroring how the
+        // harness queues history synchronously ahead of the live stream.
+        sender
+            .send(AgentEvent::UserMessage {
+                text: "do the thing".into(),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::ToolCallStart {
+                id: "t1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({}),
+            })
+            .unwrap();
+        supervisor
+            .adopt("/session.jsonl".into(), id, receiver)
+            .await;
+        settle().await;
+
+        let snapshot = &supervisor.snapshots().await[0];
+        assert_eq!(snapshot.status, RuntimeStatus::Idle);
+        assert!(snapshot.started_at.is_none());
+        let residents = supervisor.residents.read().await;
+        let resident = residents.get("/session.jsonl").unwrap();
+        assert!(!resident.turn_running);
+        assert!(resident.running_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resuming_with_a_failed_child_shows_attention_not_running() {
+        let harness: Arc<dyn AgentHarness> = Arc::new(MockHarness::default());
+        let supervisor = SessionSupervisor::new(harness);
+        let (sender, receiver) = broadcast::channel(16);
+        let id = SessionId("session-1".into());
+        sender
+            .send(AgentEvent::UserMessage {
+                text: "spawn a child".into(),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::SubagentUpdate {
+                task: Box::new(task("interrupted")),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::TurnComplete {
+                usage: Usage::default(),
+                stop_reason: "end_turn".into(),
+            })
+            .unwrap();
+        supervisor
+            .adopt("/session.jsonl".into(), id, receiver)
+            .await;
+        settle().await;
+
+        let snapshot = &supervisor.snapshots().await[0];
+        assert_eq!(snapshot.status, RuntimeStatus::Attention);
+        assert!(snapshot.started_at.is_none());
     }
 }
