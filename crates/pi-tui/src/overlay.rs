@@ -382,15 +382,37 @@ fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
             viewport_height as u16,
         ),
     );
-    frame.render_widget(
-        Paragraph::new("Enter newline · Ctrl+Enter apply · Esc cancel · click to position")
-            .style(Style::default().fg(theme.muted).bg(theme.background)),
-        Rect::new(
-            area.x + 2,
-            area.bottom().saturating_sub(2),
-            area.width.saturating_sub(4),
+    let footer_y = area.bottom().saturating_sub(2);
+    let footer_x = area.x + 2;
+    let save = "[ Save ]";
+    let cancel = "[ Cancel ]";
+    *state.paste_editor_actions.borrow_mut() = vec![
+        (0, footer_x, footer_x + save.len() as u16, footer_y),
+        (
             1,
+            footer_x + save.len() as u16 + 1,
+            footer_x + save.len() as u16 + 1 + cancel.len() as u16,
+            footer_y,
         ),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                save,
+                Style::default().fg(theme.background).bg(theme.success),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                cancel,
+                Style::default().fg(theme.foreground).bg(theme.subtle),
+            ),
+            Span::styled(
+                "  Enter newline · Ctrl+Enter/Ctrl+S save · Esc cancel",
+                Style::default().fg(theme.muted).bg(theme.background),
+            ),
+        ]))
+        .style(Style::default().bg(theme.background)),
+        Rect::new(footer_x, footer_y, area.width.saturating_sub(4), 1),
     );
     if let Some(position) = cursor_position {
         frame.set_cursor_position(position);

@@ -373,6 +373,7 @@ pub struct AppState {
     pub paste_editor_follow_cursor: Cell<bool>,
     pub paste_editor_rows: RefCell<Vec<Vec<(usize, usize)>>>,
     pub paste_editor_targets: RefCell<Vec<(u16, u16, usize)>>,
+    pub paste_editor_actions: RefCell<Vec<(u8, u16, u16, u16)>>,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
     pub placeholder: String,
@@ -470,6 +471,7 @@ impl Default for AppState {
             paste_editor_follow_cursor: Cell::new(true),
             paste_editor_rows: RefCell::new(Vec::new()),
             paste_editor_targets: RefCell::new(Vec::new()),
+            paste_editor_actions: RefCell::new(Vec::new()),
             prompt_history: Vec::new(),
             history_index: None,
             placeholder: "Ask anything…".into(),
@@ -2107,6 +2109,16 @@ impl AppState {
         self.paste_editor_preferred_column = None;
         self.paste_editor_follow_cursor.set(true);
         true
+    }
+
+    pub fn paste_editor_action_at(&self, column: u16, row: u16) -> Option<u8> {
+        self.paste_editor_actions
+            .borrow()
+            .iter()
+            .find(|(_, start, end, target_row)| {
+                row == *target_row && column >= *start && column < *end
+            })
+            .map(|(action, _, _, _)| *action)
     }
 
     pub fn insert_paste_editor_text(&mut self, text: String) {

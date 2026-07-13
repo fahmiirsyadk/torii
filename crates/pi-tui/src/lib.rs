@@ -14,7 +14,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -111,7 +112,12 @@ impl TerminalGuard {
                 return Err(error.into());
             }
         };
-        if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
             ratatui::restore();
             return Err(error.into());
         }
@@ -121,7 +127,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -416,6 +427,15 @@ async fn run_app(
                             break;
                         }
                     }
+                    KeyCode::Char('s')
+                        if state.overlay == OverlayKind::PasteEditor
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let action = state.activate_overlay();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
+                    }
                     KeyCode::Enter => {
                         let action = if key.modifiers.contains(KeyModifiers::SHIFT) {
                             state.activate_tree_with_summary()
@@ -689,6 +709,19 @@ async fn run_app(
                     }
                 }
                 MouseEventKind::Down(_) => {
+                    if state.overlay == OverlayKind::PasteEditor
+                        && let Some(action) = state.paste_editor_action_at(mouse.column, mouse.row)
+                    {
+                        let action = if action == 0 {
+                            state.activate_overlay()
+                        } else {
+                            state.cancel_oauth()
+                        };
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
+                        continue;
+                    }
                     if state.overlay == OverlayKind::PasteEditor
                         && state.click_paste_editor(mouse.column, mouse.row)
                     {
