@@ -239,6 +239,13 @@ pub enum MessageDelivery {
     FollowUp,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageImage {
+    pub path: String,
+    pub mime_type: String,
+    pub temporary: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -352,6 +359,7 @@ pub trait AgentHarness: Send + Sync {
         id: &SessionId,
         text: String,
         delivery: Option<MessageDelivery>,
+        images: Vec<MessageImage>,
     ) -> Result<()>;
     async fn cycle_thinking(&self, id: &SessionId) -> Result<()>;
     async fn set_thinking(&self, id: &SessionId, level: String) -> Result<()>;
@@ -526,6 +534,7 @@ impl AgentHarness for MockHarness {
         id: &SessionId,
         text: String,
         _delivery: Option<MessageDelivery>,
+        _images: Vec<MessageImage>,
     ) -> Result<()> {
         self.prompt(id, text).await
     }

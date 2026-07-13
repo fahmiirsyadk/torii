@@ -6,11 +6,15 @@ mod theme;
 mod ui;
 
 use std::{
+    fs::{self, File},
     io,
+    path::PathBuf,
+    time::SystemTime,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use clipboard_rs::{Clipboard as ClipboardRs, ClipboardContext};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -26,11 +30,195 @@ use state::OverlayAction;
 pub use state::{AppState, Focus, OverlayKind, View};
 use tokio::sync::{broadcast, mpsc};
 
+fn read_clipboard_image() -> Result<state::ImageAttachment> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    if let Ok(image) = clipboard.get_image() {
+        let directory = std::env::temp_dir().join("pi-shell-attachments");
+        fs::create_dir_all(&directory)?;
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = format!("screenshot-{timestamp}.png");
+        let path: PathBuf = directory.join(&name);
+        let (preview_width, preview_height, preview_rgba) =
+            image_preview(image.width, image.height, image.bytes.as_ref());
+        let file = File::create(&path)?;
+        let mut encoder = png::Encoder::new(file, image.width as u32, image.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(image.bytes.as_ref())?;
+        writer.finish()?;
+        return Ok(state::ImageAttachment {
+            id: 0,
+            path: path.to_string_lossy().into_owned(),
+            name,
+            width: image.width,
+            height: image.height,
+            mime_type: "image/png".into(),
+            temporary: true,
+            preview_width,
+            preview_height,
+            preview_rgba,
+        });
+    }
+
+    let file_clipboard = ClipboardContext::new().ok();
+    let file_path = file_clipboard.as_ref().and_then(clipboard_file_path);
+    let text_path = || {
+        clipboard
+            .get_text()
+            .ok()
+            .and_then(|text| text.lines().map(str::trim).find_map(clipboard_image_path))
+    };
+    let path = file_path.or_else(text_path).ok_or_else(|| {
+        let formats = file_clipboard
+            .as_ref()
+            .and_then(|clipboard| clipboard.available_formats().ok())
+            .filter(|formats| !formats.is_empty())
+            .map(|formats| formats.join(", "))
+            .unwrap_or_else(|| "none reported".into());
+        anyhow!("no image pixels or image file found (clipboard formats: {formats})")
+    })?;
+    image_attachment_from_path(path)
+}
+
+fn begin_clipboard_image_load(
+    state: &mut AppState,
+    sender: &mpsc::UnboundedSender<Result<state::ImageAttachment, String>>,
+) {
+    if state.image_processing_started_at.is_some() {
+        state.status = "image processing already in progress…".into();
+        return;
+    }
+    state.image_processing_started_at = Some(Instant::now());
+    state.status = "processing image from clipboard…".into();
+    let sender = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = read_clipboard_image().map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+}
+
+fn clipboard_file_path(clipboard: &ClipboardContext) -> Option<PathBuf> {
+    if let Some(path) = clipboard.get_files().ok().and_then(|files| {
+        files
+            .iter()
+            .find_map(|file| clipboard_image_path(file.trim()))
+    }) {
+        return Some(path);
+    }
+
+    ["x-special/gnome-copied-files", "text/uri-list"]
+        .iter()
+        .filter_map(|format| clipboard.get_buffer(format).ok())
+        .filter_map(|buffer| String::from_utf8(buffer).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .find_map(|line| clipboard_image_path(&line))
+}
+
+fn image_attachment_from_path(path: PathBuf) -> Result<state::ImageAttachment> {
+    let decoded = image::open(&path)?.to_rgba8();
+    let width = decoded.width() as usize;
+    let height = decoded.height() as usize;
+    let (preview_width, preview_height, preview_rgba) =
+        image_preview(width, height, decoded.as_raw());
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("clipboard-image")
+        .to_string();
+    let mime_type = match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/png",
+    };
+    Ok(state::ImageAttachment {
+        id: 0,
+        path: path.to_string_lossy().into_owned(),
+        name,
+        width,
+        height,
+        mime_type: mime_type.into(),
+        temporary: false,
+        preview_width,
+        preview_height,
+        preview_rgba,
+    })
+}
+
+fn clipboard_image_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim_matches(|character: char| {
+        character == '\0' || character == '\r' || character == '\n'
+    });
+    if value == "copy" || value == "cut" || value.is_empty() {
+        return None;
+    }
+    let decoded = value.strip_prefix("file://").map_or_else(
+        || value.to_string(),
+        |uri| percent_decode_path(uri).unwrap_or_else(|| uri.to_string()),
+    );
+    let path = PathBuf::from(decoded);
+    path.is_absolute().then_some(path)
+}
+
+fn percent_decode_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            output.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn image_preview(width: usize, height: usize, rgba: &[u8]) -> (u16, u16, Vec<u8>) {
+    let (preview_width, preview_height) = if width <= 100 && height <= 60 {
+        (width.max(1), height.max(1))
+    } else if width.saturating_mul(60) > height.saturating_mul(100) {
+        (100, (height.saturating_mul(100) / width).max(1))
+    } else {
+        ((width.saturating_mul(60) / height).max(1), 60)
+    };
+    let mut preview_rgba = Vec::with_capacity(preview_width * preview_height * 4);
+    for y in 0..preview_height {
+        let source_y = y * height / preview_height;
+        for x in 0..preview_width {
+            let source_x = x * width / preview_width;
+            let offset = (source_y * width + source_x) * 4;
+            preview_rgba.extend_from_slice(&rgba[offset..offset + 4]);
+        }
+    }
+    (preview_width as u16, preview_height as u16, preview_rgba)
+}
+
 #[derive(Debug)]
 pub enum UiCommand {
     Submit {
         text: String,
         delivery: Option<pi_harness::MessageDelivery>,
+        images: Vec<pi_harness::MessageImage>,
     },
     Permission {
         request_id: String,
@@ -98,6 +286,7 @@ pub enum UiCommand {
 enum LoopWake {
     Input(Option<io::Result<Event>>),
     Agent(Result<pi_harness::AgentEvent, broadcast::error::RecvError>),
+    Image(Result<state::ImageAttachment, String>),
     Animation,
 }
 
@@ -212,12 +401,14 @@ async fn run_app(
 ) -> Result<()> {
     let (_guard, mut terminal) = TerminalGuard::enter()?;
     let mut input = EventStream::new();
+    let (image_sender, mut image_receiver) = mpsc::unbounded_channel();
     let mut dirty = true;
     let mut last_draw_at = None;
     const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
     loop {
         let animated = state.streaming
+            || state.image_processing_started_at.is_some()
             || state.active_compaction_started_at().is_some()
             || state.has_background_work()
             || state
@@ -244,6 +435,9 @@ async fn run_app(
         let wake = tokio::select! {
             input_event = input.next() => LoopWake::Input(input_event),
             agent_event = next_agent_event(&mut events) => LoopWake::Agent(agent_event),
+            image = image_receiver.recv(), if state.image_processing_started_at.is_some() => {
+                LoopWake::Image(image.expect("image worker sender remains alive"))
+            },
             _ = tokio::time::sleep(animation_wait) => LoopWake::Animation,
         };
         let input_event = match wake {
@@ -265,6 +459,15 @@ async fn run_app(
             }
             LoopWake::Agent(Err(broadcast::error::RecvError::Closed)) => {
                 events = None;
+                continue;
+            }
+            LoopWake::Image(result) => {
+                state.image_processing_started_at = None;
+                match result {
+                    Ok(image) => state.attach_image(image),
+                    Err(error) => state.status = format!("clipboard image unavailable: {error}"),
+                }
+                dirty = true;
                 continue;
             }
             LoopWake::Animation => continue,
@@ -412,6 +615,12 @@ async fn run_app(
                         state.begin_tree_label();
                     }
                     KeyCode::Backspace => state.overlay_backspace(),
+                    KeyCode::Delete if state.overlay == OverlayKind::ImageViewer => {
+                        state.remove_viewed_image();
+                    }
+                    KeyCode::Enter if state.overlay == OverlayKind::ImageViewer => {
+                        state.close_overlay();
+                    }
                     KeyCode::Enter
                         if state.overlay == OverlayKind::PasteEditor
                             && !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -561,6 +770,14 @@ async fn run_app(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.clear_prompt();
                 }
+                KeyCode::Char('v')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key
+                            .modifiers
+                            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+                {
+                    begin_clipboard_image_load(&mut state, &image_sender);
+                }
                 KeyCode::BackTab => {
                     state.cycle_permission_mode();
                     if let Some(sender) = &commands {
@@ -575,7 +792,10 @@ async fn run_app(
                     }
                 }
                 KeyCode::Enter if state.focus == Focus::Prompt => {
-                    if let Some(action) = state.activate_slash_command() {
+                    if state.prompt.trim() == "/paste-image" {
+                        state.clear_prompt_text();
+                        begin_clipboard_image_load(&mut state, &image_sender);
+                    } else if let Some(action) = state.activate_slash_command() {
                         if dispatch_overlay_action(action, &commands) {
                             break;
                         }
@@ -588,7 +808,7 @@ async fn run_app(
                                 exclude_from_context,
                             });
                         }
-                    } else if let Some(prompt) = state.submit_prompt()
+                    } else if let Some((prompt, images)) = state.submit_message()
                         && let Some(sender) = &commands
                     {
                         let delivery = state.streaming.then_some(
@@ -601,6 +821,7 @@ async fn run_app(
                         let _ = sender.send(UiCommand::Submit {
                             text: prompt,
                             delivery,
+                            images,
                         });
                     }
                 }
@@ -698,6 +919,13 @@ async fn run_app(
                 MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
                 MouseEventKind::ScrollDown => state.move_overlay_selection(1),
                 MouseEventKind::Moved => {
+                    if state.overlay == OverlayKind::PasteEditor {
+                        state.paste_editor_action_hover =
+                            state.paste_editor_action_at(mouse.column, mouse.row);
+                    } else if state.overlay == OverlayKind::ImageViewer {
+                        state.image_view_action_hover =
+                            state.image_view_action_at(mouse.column, mouse.row);
+                    }
                     if let Some(index) = crate::overlay::item_at_position(
                         &state,
                         size.width,
@@ -709,6 +937,16 @@ async fn run_app(
                     }
                 }
                 MouseEventKind::Down(_) => {
+                    if state.overlay == OverlayKind::ImageViewer
+                        && let Some(action) = state.image_view_action_at(mouse.column, mouse.row)
+                    {
+                        if action == 0 {
+                            state.remove_viewed_image();
+                        } else {
+                            state.close_overlay();
+                        }
+                        continue;
+                    }
                     if state.overlay == OverlayKind::PasteEditor
                         && let Some(action) = state.paste_editor_action_at(mouse.column, mouse.row)
                     {
@@ -865,10 +1103,20 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(id, _, _, _)| *id);
-                    let composer_changed =
-                        state.composer_hover != composer_hover || state.paste_hover != paste_hover;
+                    let image_hover = state
+                        .image_targets
+                        .borrow()
+                        .iter()
+                        .find(|(_, start, end, row)| {
+                            mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                        })
+                        .map(|(id, _, _, _)| *id);
+                    let composer_changed = state.composer_hover != composer_hover
+                        || state.paste_hover != paste_hover
+                        || state.image_hover != image_hover;
                     state.composer_hover = composer_hover;
                     state.paste_hover = paste_hover;
+                    state.image_hover = image_hover;
                     let hovered = ui::section_hit_at(
                         &state,
                         size.width,
@@ -899,7 +1147,17 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(id, _, _, _)| *id);
-                    if let Some(id) = paste_target {
+                    let image_target = state
+                        .image_targets
+                        .borrow()
+                        .iter()
+                        .find(|(_, start, end, row)| {
+                            mouse.row == *row && mouse.column >= *start && mouse.column < *end
+                        })
+                        .map(|(id, _, _, _)| *id);
+                    if let Some(id) = image_target {
+                        state.begin_image_view(id);
+                    } else if let Some(id) = paste_target {
                         state.begin_paste_edit(id);
                     } else if let Some(target) = composer_target {
                         if target == 2 {
@@ -1284,6 +1542,38 @@ mod tests {
     }
 
     #[test]
+    fn image_selected_from_file_reference_picker_becomes_an_attachment() {
+        let path =
+            std::env::temp_dir().join(format!("pi-shell-at-image-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let mut state = super::AppState {
+            prompt: "inspect @".into(),
+            cursor: 9,
+            available_files: vec![path_text],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::FilePicker);
+
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.prompt, "inspect ");
+        assert_eq!(state.image_attachments.len(), 1);
+        assert_eq!(
+            (
+                state.image_attachments[0].width,
+                state.image_attachments[0].height
+            ),
+            (2, 3)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn multiline_paste_is_inserted_inline_and_expands_on_submit() {
         let mut state = super::AppState {
             prompt: "check this  some text".into(),
@@ -1386,6 +1676,82 @@ mod tests {
             .unwrap();
         assert!(state.click_paste_editor(target.0, target.1));
         assert_eq!(state.overlay_cursor, 0);
+    }
+
+    #[test]
+    fn image_attachment_renders_as_filename_chip_and_submits_natively() {
+        let mut state = super::AppState::default();
+        state.attach_image(super::state::ImageAttachment {
+            id: 0,
+            path: "/tmp/screenshot.png".into(),
+            name: "a-very-long-screenshot-filename.png".into(),
+            width: 1280,
+            height: 720,
+            mime_type: "image/png".into(),
+            temporary: true,
+            preview_width: 2,
+            preview_height: 2,
+            preview_rgba: vec![255; 16],
+        });
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 80, 20);
+        assert!(output.contains("[a-very-long-screensho…]"));
+        let id = state.image_attachments[0].id;
+        assert!(state.begin_image_view(id));
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let viewer = buffer_text(terminal.backend().buffer(), 80, 20);
+        assert!(viewer.contains("Image attachment"));
+        assert!(viewer.contains("1280×720"));
+        assert!(viewer.contains("[ Remove ]"));
+        state.close_overlay();
+
+        let (text, images) = state.submit_message().unwrap();
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].path, "/tmp/screenshot.png");
+        assert!(state.image_attachments.is_empty());
+    }
+
+    #[test]
+    fn copied_file_uri_is_decoded_and_portrait_preview_keeps_aspect_ratio() {
+        assert_eq!(
+            super::clipboard_image_path("file:///home/void/Pictures/flower%202.jpg"),
+            Some(std::path::PathBuf::from("/home/void/Pictures/flower 2.jpg"))
+        );
+        assert_eq!(
+            super::clipboard_image_path("file:///home/void/Pictures/flower2.jpg\0"),
+            Some(std::path::PathBuf::from("/home/void/Pictures/flower2.jpg"))
+        );
+        let pixels = vec![255; 1060 * 1500 * 4];
+        let (width, height, _) = super::image_preview(1060, 1500, &pixels);
+        assert_eq!((width, height), (42, 60));
+    }
+
+    #[test]
+    fn clearing_paste_image_command_preserves_existing_attachments() {
+        let mut state = super::AppState::default();
+        state.attach_image(super::state::ImageAttachment {
+            id: 0,
+            path: "/tmp/first.png".into(),
+            name: "first.png".into(),
+            width: 1,
+            height: 1,
+            mime_type: "image/png".into(),
+            temporary: true,
+            preview_width: 1,
+            preview_height: 1,
+            preview_rgba: vec![255; 4],
+        });
+        state.prompt = "/paste-image".into();
+        state.cursor = state.prompt.chars().count();
+
+        state.clear_prompt_text();
+
+        assert!(state.prompt.is_empty());
+        assert_eq!(state.image_attachments.len(), 1);
+        assert_eq!(state.image_attachments[0].name, "first.png");
     }
 
     #[test]

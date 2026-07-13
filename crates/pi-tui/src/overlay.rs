@@ -32,6 +32,10 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         render_paste_editor(frame, state);
         return;
     }
+    if state.overlay == OverlayKind::ImageViewer {
+        render_image_viewer(frame, state);
+        return;
+    }
 
     let theme = Theme::GROK_NIGHT;
     let frame_area = frame.area();
@@ -56,6 +60,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::TreeSummaryPicker => " Summarize branch? ",
         OverlayKind::TreeSummaryEditor => " Custom summarization instructions ",
         OverlayKind::PasteEditor => " Edit pasted text ",
+        OverlayKind::ImageViewer => " Image attachment ",
         OverlayKind::LabelEditor => " Entry label ",
         OverlayKind::FilePicker => " Reference file ",
         OverlayKind::ScopedModels => " Scoped models ",
@@ -80,6 +85,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
             | OverlayKind::ForkPicker
             | OverlayKind::TreeSummaryEditor
             | OverlayKind::PasteEditor
+            | OverlayKind::ImageViewer
             | OverlayKind::LabelEditor
             | OverlayKind::FilePicker
             | OverlayKind::ScopedModels
@@ -269,6 +275,148 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
+    let theme = Theme::GROK_NIGHT;
+    let Some(image) = state.viewed_image() else {
+        return;
+    };
+    let frame_area = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
+    let max_width = frame_area.width.saturating_sub(6).max(1);
+    let max_height = frame_area.height.saturating_sub(9).saturating_mul(2).max(1);
+    let (display_width, display_height) =
+        if image.preview_width <= max_width && image.preview_height <= max_height {
+            (image.preview_width, image.preview_height)
+        } else if u32::from(image.preview_width) * u32::from(max_height)
+            > u32::from(image.preview_height) * u32::from(max_width)
+        {
+            (
+                max_width,
+                ((u32::from(image.preview_height) * u32::from(max_width)
+                    / u32::from(image.preview_width)) as u16)
+                    .max(1),
+            )
+        } else {
+            (
+                ((u32::from(image.preview_width) * u32::from(max_height)
+                    / u32::from(image.preview_height)) as u16)
+                    .max(1),
+                max_height,
+            )
+        };
+    let preview_rows = usize::from(display_height).div_ceil(2);
+    let width = (display_width + 4)
+        .max(44)
+        .min(frame_area.width.saturating_sub(2).max(1));
+    let height = (preview_rows as u16 + 7).min(frame_area.height.saturating_sub(2).max(1));
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .title(" Image attachment ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent).bg(theme.background))
+            .style(Style::default().fg(theme.foreground).bg(theme.background)),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                &image.name,
+                Style::default().fg(theme.foreground),
+            )),
+            Line::from(Span::styled(
+                format!("{}×{} · {}", image.width, image.height, image.mime_type),
+                Style::default().fg(theme.muted),
+            )),
+        ])
+        .style(Style::default().bg(theme.background)),
+        Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 2),
+    );
+    let preview_x = area.x + area.width.saturating_sub(display_width) / 2;
+    let preview_y = area.y + 3;
+    for row in 0..preview_rows {
+        for column in 0..usize::from(display_width) {
+            let source_x = column * usize::from(image.preview_width) / usize::from(display_width);
+            let source_top_y =
+                row * 2 * usize::from(image.preview_height) / usize::from(display_height);
+            let source_bottom_y = ((row * 2 + 1).min(usize::from(display_height) - 1)
+                * usize::from(image.preview_height)
+                / usize::from(display_height))
+            .min(usize::from(image.preview_height) - 1);
+            let top = (source_top_y * usize::from(image.preview_width) + source_x) * 4;
+            let bottom = (source_bottom_y * usize::from(image.preview_width) + source_x) * 4;
+            if bottom + 2 >= image.preview_rgba.len() || top + 2 >= image.preview_rgba.len() {
+                continue;
+            }
+            let foreground = Color::Rgb(
+                image.preview_rgba[top],
+                image.preview_rgba[top + 1],
+                image.preview_rgba[top + 2],
+            );
+            let background = Color::Rgb(
+                image.preview_rgba[bottom],
+                image.preview_rgba[bottom + 1],
+                image.preview_rgba[bottom + 2],
+            );
+            frame.buffer_mut().set_string(
+                preview_x + column as u16,
+                preview_y + row as u16,
+                "▀",
+                Style::default().fg(foreground).bg(background),
+            );
+        }
+    }
+    let footer_y = area.bottom().saturating_sub(2);
+    let remove = "[ Remove ]";
+    let close = "[ Close ]";
+    let footer_x = area.x + 2;
+    *state.image_view_actions.borrow_mut() = vec![
+        (0, footer_x, footer_x + remove.len() as u16, footer_y),
+        (
+            1,
+            footer_x + remove.len() as u16 + 1,
+            footer_x + remove.len() as u16 + close.len() as u16 + 1,
+            footer_y,
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                remove,
+                Style::default()
+                    .fg(if state.image_view_action_hover == Some(0) {
+                        theme.error
+                    } else {
+                        theme.muted
+                    })
+                    .bg(theme.background),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                close,
+                Style::default()
+                    .fg(if state.image_view_action_hover == Some(1) {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    })
+                    .bg(theme.background),
+            ),
+            Span::styled("  Esc close", Style::default().fg(theme.muted)),
+        ]))
+        .style(Style::default().bg(theme.background)),
+        Rect::new(footer_x, footer_y, area.width.saturating_sub(4), 1),
+    );
+}
+
 fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
     let theme = Theme::GROK_NIGHT;
     let frame_area = frame.area();
@@ -399,12 +547,24 @@ fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 save,
-                Style::default().fg(theme.background).bg(theme.success),
+                Style::default()
+                    .fg(if state.paste_editor_action_hover == Some(0) {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    })
+                    .bg(theme.background),
             ),
             Span::raw(" "),
             Span::styled(
                 cancel,
-                Style::default().fg(theme.foreground).bg(theme.subtle),
+                Style::default()
+                    .fg(if state.paste_editor_action_hover == Some(1) {
+                        theme.error
+                    } else {
+                        theme.muted
+                    })
+                    .bg(theme.background),
             ),
             Span::styled(
                 "  Enter newline · Ctrl+Enter/Ctrl+S save · Esc cancel",

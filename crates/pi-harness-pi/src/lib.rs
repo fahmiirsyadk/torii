@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use pi_harness::{
-    AgentEvent, AgentHarness, MessageDelivery, ModelInfo, PermissionDecision, RewindCheckpoint,
-    RuntimeResources, RuntimeSettings, SessionConfig, SessionId, SessionInfo, SessionStats,
-    SessionTreeEntry,
+    AgentEvent, AgentHarness, MessageDelivery, MessageImage, ModelInfo, PermissionDecision,
+    RewindCheckpoint, RuntimeResources, RuntimeSettings, SessionConfig, SessionId, SessionInfo,
+    SessionStats, SessionTreeEntry,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -344,9 +344,10 @@ impl AgentHarness for PiHarness {
         id: &SessionId,
         text: String,
         delivery: Option<MessageDelivery>,
+        images: Vec<MessageImage>,
     ) -> Result<()> {
         self.request(
-            json!({ "type": "prompt", "session_id": id.0, "text": text, "delivery": delivery }),
+            json!({ "type": "prompt", "session_id": id.0, "text": text, "delivery": delivery, "images": images }),
             None,
         )
         .await?;

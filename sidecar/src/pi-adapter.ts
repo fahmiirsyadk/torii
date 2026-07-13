@@ -1491,9 +1491,17 @@ export function sendPrompt(
   active: ActiveSession,
   text: string,
   delivery: "steer" | "follow_up" | undefined,
+  imageFiles: Array<{ path: string; mime_type: string; temporary: boolean }> | undefined,
 ): Promise<unknown> {
   const streamingBehavior: "steer" | "followUp" | undefined = delivery === "follow_up" ? "followUp" : delivery;
-  return active.session.prompt(text, { streamingBehavior });
+  const images = imageFiles?.map((image) => {
+    const data = readFileSync(image.path).toString("base64");
+    if (image.temporary) {
+      try { unlinkSync(image.path); } catch { /* best-effort temporary cleanup */ }
+    }
+    return { type: "image" as const, data, mimeType: image.mime_type };
+  });
+  return active.session.prompt(text, { streamingBehavior, images });
 }
 
 export function projectFiles(cwd: string): string[] {

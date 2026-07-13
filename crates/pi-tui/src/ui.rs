@@ -332,7 +332,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         vertical: 0,
     });
     let compaction_active = state.active_compaction_started_at().is_some();
-    let working_active = state.turn_started_at.is_some();
+    let working_active =
+        state.turn_started_at.is_some() || state.image_processing_started_at.is_some();
     let working_height: u16 = if working_active { 1 } else { 0 };
     let compaction_height: u16 = if compaction_active { 1 } else { 0 };
     let areas = Layout::default()
@@ -1362,6 +1363,21 @@ const COMPACTION_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 const WORKING_SPINNER: &[&str] = &["⠋", "⠙", "⠸", "⠴", "⠦", "⠇", "⠏", "⠋"];
 
 fn render_working_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
+    if let Some(started_at) = state.image_processing_started_at {
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        let spinner = WORKING_SPINNER[(elapsed_ms / 100) as usize % WORKING_SPINNER.len()];
+        render_three_column_banner(
+            frame,
+            area,
+            &format!("{spinner} Processing image…"),
+            &format_elapsed(elapsed_ms),
+            "clipboard",
+            theme,
+            theme.warning,
+            theme.muted,
+        );
+        return;
+    }
     let started_at = state
         .turn_started_at
         .unwrap_or_else(std::time::Instant::now);
@@ -1888,7 +1904,23 @@ fn diff_render_lines(
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
-    let available = area.width.saturating_sub(5) as usize;
+    let image_labels = state
+        .image_attachments
+        .iter()
+        .map(|image| {
+            let mut name = image.name.chars().take(22).collect::<String>();
+            if image.name.chars().count() > 22 {
+                name.pop();
+                name.push('…');
+            }
+            (image.id, format!("[{name}] "))
+        })
+        .collect::<Vec<_>>();
+    let image_width = image_labels
+        .iter()
+        .map(|(_, label)| label.chars().count())
+        .sum::<usize>();
+    let available = (area.width.saturating_sub(5) as usize).saturating_sub(image_width);
     let prompt_length = if state.paste_blocks.is_empty() {
         state.prompt.chars().count()
     } else {
@@ -1900,12 +1932,12 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         state.composer_display_cursor()
     };
     let start = display_cursor.saturating_sub(available.saturating_sub(1));
-    let value = if state.prompt.is_empty() {
+    let value = if state.prompt.is_empty() && state.image_attachments.is_empty() {
         state.placeholder.clone()
     } else {
         state.prompt.chars().skip(start).take(available).collect()
     };
-    let value_style = if state.prompt.is_empty() {
+    let value_style = if state.prompt.is_empty() && state.image_attachments.is_empty() {
         Style::default().fg(theme.subtle)
     } else {
         Style::default().fg(theme.foreground)
@@ -1968,9 +2000,28 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         .title_bottom(title_line)
         .title_alignment(Alignment::Right);
     let mut prompt_spans = vec![Span::styled("▯ ", Style::default().fg(theme.foreground))];
-    if state.prompt.is_empty() {
+    let mut image_x = area.x + 3;
+    let mut image_targets = state.image_targets.borrow_mut();
+    image_targets.clear();
+    for (id, label) in &image_labels {
+        let end = image_x + label.chars().count() as u16;
+        image_targets.push((*id, image_x, end, area.y + 1));
+        prompt_spans.push(Span::styled(
+            label,
+            Style::default().fg(
+                if state.image_hover == Some(*id) || state.focused_image == Some(*id) {
+                    theme.accent
+                } else {
+                    theme.muted
+                },
+            ),
+        ));
+        image_x = end;
+    }
+    drop(image_targets);
+    if state.prompt.is_empty() && state.image_attachments.is_empty() {
         prompt_spans.push(Span::styled(value, value_style));
-    } else {
+    } else if !state.prompt.is_empty() {
         prompt_spans.extend(composer_prompt_spans(state, start, available, theme));
     }
     frame.render_widget(Paragraph::new(Line::from(prompt_spans)).block(block), area);
@@ -1981,7 +2032,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         } else {
             display_cursor.saturating_sub(start).min(available)
         };
-        frame.set_cursor_position((area.x + 3 + cursor_offset as u16, area.y + 1));
+        frame.set_cursor_position((
+            area.x + 3 + image_width as u16 + cursor_offset as u16,
+            area.y + 1,
+        ));
     }
 }
 
@@ -2110,8 +2164,24 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
             " ↑/↓: scroll  │  e: reasoning  │  t: tool  │  d: diff  │  Tab: prompt"
         }
     };
-    let line = Line::from(Span::styled(left, Style::default().fg(theme.foreground)));
-    frame.render_widget(Paragraph::new(line), area);
+    let status_color = if state.status.contains("unavailable") || state.status.contains("failed") {
+        theme.error
+    } else if state.status.contains("loading") {
+        theme.warning
+    } else {
+        theme.muted
+    };
+    let lines = vec![
+        Line::from(Span::styled(left, Style::default().fg(theme.foreground))),
+        Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate(&state.status, area.width.saturating_sub(2) as usize)
+            ),
+            Style::default().fg(status_color),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn compact_number(value: u64) -> String {

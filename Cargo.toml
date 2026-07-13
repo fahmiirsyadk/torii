@@ -14,6 +14,9 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = { version = "3.6", features = ["image-data", "wayland-data-control"] }
+clipboard-rs = "0.3.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 async-trait = "0.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

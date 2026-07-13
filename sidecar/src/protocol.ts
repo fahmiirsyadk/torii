@@ -51,7 +51,7 @@ export type SidecarCommand =
         | { mode: "in_memory" };
     }
   | { type: "set_model"; request_id: string; session_id: string; model: string }
-  | { type: "prompt"; request_id: string; session_id: string; text: string; delivery?: "steer" | "follow_up" }
+  | { type: "prompt"; request_id: string; session_id: string; text: string; delivery?: "steer" | "follow_up"; images?: Array<{ path: string; mime_type: string; temporary: boolean }> }
   | { type: "cycle_thinking"; request_id: string; session_id: string }
   | { type: "set_thinking"; request_id: string; session_id: string; level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | { type: "clear_queue"; request_id: string; session_id: string }

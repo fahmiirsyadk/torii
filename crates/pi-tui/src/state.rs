@@ -30,6 +30,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/thinking",
     "/context",
     "/reload",
+    "/paste-image",
     "/scoped-models",
     "/subagent-model",
     "/trust",
@@ -70,6 +71,7 @@ pub enum OverlayKind {
     TreeSummaryPicker,
     TreeSummaryEditor,
     PasteEditor,
+    ImageViewer,
     LabelEditor,
     FilePicker,
     ScopedModels,
@@ -290,6 +292,20 @@ pub struct PasteBlock {
     pub end: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub id: u64,
+    pub path: String,
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    pub mime_type: String,
+    pub temporary: bool,
+    pub preview_width: u16,
+    pub preview_height: u16,
+    pub preview_rgba: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DiffKind {
     Context,
@@ -366,6 +382,14 @@ pub struct AppState {
     pub cursor: usize,
     pub paste_blocks: Vec<PasteBlock>,
     pub next_paste_id: u64,
+    pub image_attachments: Vec<ImageAttachment>,
+    pub next_image_id: u64,
+    pub focused_image: Option<u64>,
+    pub image_hover: Option<u64>,
+    pub image_targets: RefCell<Vec<(u64, u16, u16, u16)>>,
+    pub pending_image_id: Option<u64>,
+    pub image_view_actions: RefCell<Vec<(u8, u16, u16, u16)>>,
+    pub image_view_action_hover: Option<u8>,
     pub pending_paste_id: Option<u64>,
     pub overlay_cursor: usize,
     pub paste_editor_preferred_column: Option<usize>,
@@ -374,6 +398,7 @@ pub struct AppState {
     pub paste_editor_rows: RefCell<Vec<Vec<(usize, usize)>>>,
     pub paste_editor_targets: RefCell<Vec<(u16, u16, usize)>>,
     pub paste_editor_actions: RefCell<Vec<(u8, u16, u16, u16)>>,
+    pub paste_editor_action_hover: Option<u8>,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
     pub placeholder: String,
@@ -386,6 +411,7 @@ pub struct AppState {
     /// composer to render a ticking elapsed-time counter while the model is
     /// generating. Cleared on TurnComplete, error, or compaction.
     pub turn_started_at: Option<Instant>,
+    pub image_processing_started_at: Option<Instant>,
     /// Snapshot of `context_used` (i.e. the input token count) at the
     /// moment the current turn started. The working banner shows this as
     /// the ↑ input figure.
@@ -464,6 +490,14 @@ impl Default for AppState {
             cursor: 0,
             paste_blocks: Vec::new(),
             next_paste_id: 1,
+            image_attachments: Vec::new(),
+            next_image_id: 1,
+            focused_image: None,
+            image_hover: None,
+            image_targets: RefCell::new(Vec::new()),
+            pending_image_id: None,
+            image_view_actions: RefCell::new(Vec::new()),
+            image_view_action_hover: None,
             pending_paste_id: None,
             overlay_cursor: 0,
             paste_editor_preferred_column: None,
@@ -472,6 +506,7 @@ impl Default for AppState {
             paste_editor_rows: RefCell::new(Vec::new()),
             paste_editor_targets: RefCell::new(Vec::new()),
             paste_editor_actions: RefCell::new(Vec::new()),
+            paste_editor_action_hover: None,
             prompt_history: Vec::new(),
             history_index: None,
             placeholder: "Ask anything…".into(),
@@ -480,6 +515,7 @@ impl Default for AppState {
             status: "idle".into(),
             streaming: false,
             turn_started_at: None,
+            image_processing_started_at: None,
             turn_input_tokens: 0,
             turn_output_chars: 0,
             thinking_level: "off".into(),
@@ -863,6 +899,7 @@ impl AppState {
             self.overlay_query.clear();
             self.overlay_cursor = 0;
             self.pending_paste_id = None;
+            self.pending_image_id = None;
             self.overlay_selected = 0;
         }
     }
@@ -934,7 +971,9 @@ impl AppState {
                 "Summarize".into(),
                 "Summarize with custom prompt".into(),
             ],
-            OverlayKind::TreeSummaryEditor | OverlayKind::PasteEditor => Vec::new(),
+            OverlayKind::TreeSummaryEditor
+            | OverlayKind::PasteEditor
+            | OverlayKind::ImageViewer => Vec::new(),
             OverlayKind::Settings => vec![
                 format!("Steering delivery: {}", self.runtime_settings.steering_mode),
                 format!(
@@ -1119,6 +1158,7 @@ impl AppState {
                 | OverlayKind::TreePicker
                 | OverlayKind::TreeSummaryEditor
                 | OverlayKind::PasteEditor
+                | OverlayKind::ImageViewer
                 | OverlayKind::LabelEditor
                 | OverlayKind::FilePicker
                 | OverlayKind::ScopedModels
@@ -1456,11 +1496,22 @@ impl AppState {
             | OverlayKind::SessionDeleteConfirm
             | OverlayKind::TreeSummaryEditor
             | OverlayKind::PasteEditor
+            | OverlayKind::ImageViewer
             | OverlayKind::LabelEditor
             | OverlayKind::None => {}
             OverlayKind::FilePicker => {
-                self.insert_file_reference(&item);
-                self.close_overlay();
+                if is_image_reference(&item) {
+                    self.remove_file_reference_trigger();
+                    self.close_overlay();
+                    self.status = format!("loading {item}…");
+                    match crate::image_attachment_from_path(std::path::PathBuf::from(&item)) {
+                        Ok(image) => self.attach_image(image),
+                        Err(error) => self.status = format!("image reference unavailable: {error}"),
+                    }
+                } else {
+                    self.insert_file_reference(&item);
+                    self.close_overlay();
+                }
             }
         }
         OverlayAction::None
@@ -1726,6 +1777,18 @@ impl AppState {
         self.focus = Focus::Prompt;
     }
 
+    fn remove_file_reference_trigger(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before_cursor = self.prompt.chars().take(self.cursor).collect::<String>();
+        if before_cursor.ends_with('@') {
+            let byte = char_to_byte(&self.prompt, self.cursor - 1);
+            self.prompt.remove(byte);
+            self.cursor -= 1;
+        }
+    }
+
     pub fn activate_tree_with_summary(&mut self) -> OverlayAction {
         if self.overlay != OverlayKind::TreePicker {
             return self.activate_overlay();
@@ -1929,6 +1992,7 @@ impl AppState {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        self.focused_image = None;
         let position = self.cursor;
         let byte = char_to_byte(&self.prompt, self.cursor);
         self.prompt.insert(byte, character);
@@ -2222,6 +2286,19 @@ impl AppState {
     }
 
     pub fn backspace(&mut self) {
+        if self.focused_image.is_some()
+            || (self.prompt.is_empty() && !self.image_attachments.is_empty())
+        {
+            let id = self
+                .focused_image
+                .or_else(|| self.image_attachments.last().map(|image| image.id));
+            if let Some(id) = id {
+                self.image_attachments.retain(|image| image.id != id);
+                self.focused_image = None;
+                self.image_hover = None;
+                return;
+            }
+        }
         if let Some(id) = self.paste_at_cursor()
             && self.remove_paste(id)
         {
@@ -2286,6 +2363,13 @@ impl AppState {
     }
 
     pub fn clear_prompt(&mut self) {
+        self.clear_prompt_text();
+        self.image_attachments.clear();
+        self.focused_image = None;
+        self.image_hover = None;
+    }
+
+    pub fn clear_prompt_text(&mut self) {
         self.prompt.clear();
         self.cursor = 0;
         self.paste_blocks.clear();
@@ -2492,6 +2576,89 @@ impl AppState {
         self.scroll_to_bottom();
         self.status = "queued".into();
         Some(prompt)
+    }
+
+    pub fn submit_message(&mut self) -> Option<(String, Vec<pi_harness::MessageImage>)> {
+        let prompt = self.prompt.trim().to_string();
+        if prompt.is_empty() && self.image_attachments.is_empty() {
+            return None;
+        }
+        let images = self
+            .image_attachments
+            .iter()
+            .map(|image| pi_harness::MessageImage {
+                path: image.path.clone(),
+                mime_type: image.mime_type.clone(),
+                temporary: image.temporary,
+            })
+            .collect::<Vec<_>>();
+        let display = if prompt.is_empty() {
+            self.image_attachments
+                .iter()
+                .map(|image| format!("[{}]", image.name))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            prompt.clone()
+        };
+        if !prompt.is_empty() {
+            self.prompt_history.push(prompt.clone());
+        }
+        self.entries.push(Entry::User {
+            text: display,
+            timestamp: String::new(),
+        });
+        self.clear_prompt();
+        self.scroll_to_bottom();
+        self.status = "queued".into();
+        Some((prompt, images))
+    }
+
+    pub fn attach_image(&mut self, mut image: ImageAttachment) {
+        let status = format!(
+            "attached {} ({}×{}, {})",
+            image.name, image.width, image.height, image.mime_type
+        );
+        image.id = self.next_image_id;
+        self.next_image_id += 1;
+        self.image_attachments.push(image);
+        self.focused_image = None;
+        self.focus = Focus::Prompt;
+        self.status = status;
+    }
+
+    pub fn begin_image_view(&mut self, id: u64) -> bool {
+        if !self.image_attachments.iter().any(|image| image.id == id) {
+            return false;
+        }
+        self.open_overlay(OverlayKind::ImageViewer);
+        self.pending_image_id = Some(id);
+        true
+    }
+
+    pub fn viewed_image(&self) -> Option<&ImageAttachment> {
+        let id = self.pending_image_id?;
+        self.image_attachments.iter().find(|image| image.id == id)
+    }
+
+    pub fn remove_viewed_image(&mut self) -> bool {
+        let Some(id) = self.pending_image_id else {
+            return false;
+        };
+        let before = self.image_attachments.len();
+        self.image_attachments.retain(|image| image.id != id);
+        self.close_overlay();
+        before != self.image_attachments.len()
+    }
+
+    pub fn image_view_action_at(&self, column: u16, row: u16) -> Option<u8> {
+        self.image_view_actions
+            .borrow()
+            .iter()
+            .find(|(_, start, end, target_row)| {
+                row == *target_row && column >= *start && column < *end
+            })
+            .map(|(action, _, _, _)| *action)
     }
 
     pub fn submit_bash(&mut self) -> Option<(String, bool)> {
@@ -3084,6 +3251,7 @@ fn builtin_description(command: &str) -> &'static str {
         "/thinking" => "Cycle thinking level",
         "/context" => "Show loaded context files",
         "/reload" => "Reload Pi resources",
+        "/paste-image" => "Attach image from clipboard",
         "/scoped-models" => "Choose models for cycling",
         "/subagent-model" => "Choose the persistent model for native subagents",
         "/trust" => "Save project trust decision",
@@ -3116,6 +3284,18 @@ fn format_elapsed(duration: std::time::Duration) -> String {
     } else {
         format!("{}ms", duration.as_millis())
     }
+}
+
+fn is_image_reference(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg"
+    )
 }
 
 fn char_to_byte(value: &str, character_index: usize) -> usize {

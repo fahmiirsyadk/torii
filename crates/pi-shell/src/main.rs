@@ -160,10 +160,14 @@ async fn main() -> Result<()> {
                     continue;
                 };
                 match command {
-                    pi_tui::UiCommand::Submit { text, delivery } => {
+                    pi_tui::UiCommand::Submit {
+                        text,
+                        delivery,
+                        images,
+                    } => {
                         command_supervisor.mark_running(&command_session).await;
                         let _ = command_harness
-                            .deliver_message(&command_session, text, delivery)
+                            .deliver_message(&command_session, text, delivery, images)
                             .await;
                     }
                     pi_tui::UiCommand::Permission {

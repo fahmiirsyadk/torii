@@ -482,7 +482,7 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   // Default: text prompt to the LLM.
   writeMessage({ type: "response", request_id: command.request_id });
-  pi.sendPrompt(active, command.text, command.delivery).catch((error: unknown) => {
+  pi.sendPrompt(active, command.text, command.delivery, command.images).catch((error: unknown) => {
     writeMessage({
       type: "error",
       request_id: command.request_id,
