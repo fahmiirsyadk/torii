@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::{
@@ -63,6 +63,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         OverlayKind::LabelEditor => " Entry label ",
         OverlayKind::FilePicker => " Reference file ",
         OverlayKind::ScopedModels => " Scoped models ",
+        OverlayKind::SubagentModelPicker => " Subagent model ",
         OverlayKind::OauthPrompt => " OAuth input ",
         OverlayKind::OauthSelect => " OAuth selection ",
         OverlayKind::LoginProvider => " Login provider ",
@@ -208,12 +209,21 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         let selected = index == state.overlay_selected;
         let marker = if selected { "› " } else { "  " };
         let model_current = state.overlay == OverlayKind::ModelPicker && item == &state.model;
+        let subagent_model_current = state.overlay == OverlayKind::SubagentModelPicker
+            && match state.runtime_settings.subagent_model.as_deref() {
+                None => item == "Inherit parent (default)",
+                Some(id) => state
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == id)
+                    .is_some_and(|model| item == &model.display_name),
+            };
         let session_current = state.overlay == OverlayKind::SessionPicker
             && state
                 .filtered_sessions()
                 .get(index)
                 .is_some_and(|session| session.current);
-        let current = if model_current || session_current {
+        let current = if model_current || subagent_model_current || session_current {
             "  ✓ current"
         } else {
             ""
@@ -654,36 +664,72 @@ fn short_timestamp(timestamp: &str) -> String {
     timestamp.get(5..16).unwrap_or(timestamp).replace('T', " ")
 }
 
-fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
-    if !state.prompt.starts_with('/') || state.prompt.contains(' ') {
-        return;
+fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, usize)> {
+    if !state.prompt.starts_with('/') || state.prompt.contains(char::is_whitespace) {
+        return None;
     }
     let matches = state.slash_suggestions();
     if matches.is_empty() {
-        return;
+        return None;
     }
 
+    let content_width = matches
+        .iter()
+        .map(|(command, description)| {
+            2 + 1 + command.chars().count() + 2 + description.chars().count()
+        })
+        .max()
+        .unwrap_or(0);
+    let width = (content_width + 2)
+        .min(72)
+        .min(usize::from(frame_area.width.saturating_sub(6).max(1))) as u16;
+    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let rows = matches
+        .iter()
+        .map(|(command, description)| {
+            let line_width = 2 + 1 + command.chars().count() + 2 + description.chars().count();
+            line_width.div_ceil(inner_width).max(1)
+        })
+        .sum::<usize>();
+    let height = (rows + 2).min(usize::from(frame_area.height)).max(1) as u16;
+    let composer_y = frame_area.bottom().saturating_sub(5);
+    Some((
+        Rect::new(
+            3.min(frame_area.width.saturating_sub(1)),
+            composer_y.saturating_sub(height),
+            width,
+            height,
+        ),
+        inner_width,
+    ))
+}
+
+fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
+    let Some((area, _)) = slash_suggestion_area(state, frame.area()) else {
+        return;
+    };
+    let matches = state.slash_suggestions();
     let theme = Theme::GROK_NIGHT;
-    let height = matches.len() as u16 + 2;
-    let width = frame.area().width.saturating_sub(6).min(56);
-    let composer_y = frame.area().bottom().saturating_sub(5);
-    let area = Rect::new(3, composer_y.saturating_sub(height), width, height);
     let lines = matches
         .into_iter()
         .enumerate()
         .map(|(index, (command, description))| {
+            let selected = index == state.overlay_selected;
+            let marker = if selected { "›" } else { " " };
+            let style = if selected {
+                Style::default().fg(theme.background).bg(theme.foreground)
+            } else {
+                Style::default().fg(theme.foreground)
+            };
             Line::from(vec![
-                Span::styled(
-                    format!("{} {command:<12}", if index == 0 { "›" } else { " " }),
-                    Style::default().fg(theme.foreground),
-                ),
-                Span::styled(description, Style::default().fg(theme.muted)),
+                Span::styled(format!("{marker} {command}  "), style),
+                Span::styled(description, style.fg(theme.muted)),
             ])
         })
         .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.subtle))
@@ -691,6 +737,23 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
         ),
         area,
     );
+}
+
+pub fn slash_item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<usize> {
+    let (area, inner_width) = slash_suggestion_area(state, Rect::new(0, 0, width, height))?;
+    if row < area.y || row >= area.bottom() || area.width < 3 {
+        return None;
+    }
+    let mut start = area.y + 1;
+    for (index, (command, description)) in state.slash_suggestions().iter().enumerate() {
+        let line_width = 2 + 1 + command.chars().count() + 2 + description.chars().count();
+        let rows = line_width.div_ceil(inner_width).max(1) as u16;
+        if row < start + rows {
+            return Some(index);
+        }
+        start += rows;
+    }
+    None
 }
 
 pub fn item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<usize> {

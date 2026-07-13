@@ -42,6 +42,7 @@ pub enum UiCommand {
         name: String,
     },
     DeleteSession(String),
+    RefreshSessions,
     NewSession,
     NameSession(String),
     SessionInfo,
@@ -543,6 +544,22 @@ async fn run_app(
                 KeyCode::Right if state.focus == Focus::Prompt => state.move_cursor_right(),
                 KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
                 KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
+                KeyCode::Up
+                    if state.focus == Focus::Prompt
+                        && state.prompt.starts_with('/')
+                        && !state.prompt.contains(char::is_whitespace)
+                        && !state.slash_suggestions().is_empty() =>
+                {
+                    state.move_slash_selection(-1);
+                }
+                KeyCode::Down
+                    if state.focus == Focus::Prompt
+                        && state.prompt.starts_with('/')
+                        && !state.prompt.contains(char::is_whitespace)
+                        && !state.slash_suggestions().is_empty() =>
+                {
+                    state.move_slash_selection(1);
+                }
                 KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
                 KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
                 KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
@@ -644,6 +661,33 @@ async fn run_app(
                 _ => {}
             },
             Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Moved
+                    if state.focus == Focus::Prompt
+                        && state.prompt.starts_with('/')
+                        && !state.prompt.contains(char::is_whitespace) =>
+                {
+                    if let Some(index) =
+                        crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
+                    {
+                        state.overlay_selected = index;
+                    }
+                }
+                MouseEventKind::Down(_)
+                    if state.focus == Focus::Prompt
+                        && state.prompt.starts_with('/')
+                        && !state.prompt.contains(char::is_whitespace) =>
+                {
+                    if let Some(index) =
+                        crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
+                    {
+                        state.overlay_selected = index;
+                        if let Some(action) = state.activate_slash_command()
+                            && dispatch_overlay_action(action, &commands)
+                        {
+                            break;
+                        }
+                    }
+                }
                 MouseEventKind::ScrollUp if state.view == View::Tasks => {
                     state.task_selected = state.task_selected.saturating_sub(1);
                 }
@@ -825,6 +869,12 @@ fn dispatch_overlay_action(
 ) -> bool {
     match action {
         OverlayAction::None => false,
+        OverlayAction::RefreshSessions => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::RefreshSessions);
+            }
+            false
+        }
         OverlayAction::Quit => true,
         OverlayAction::Permission {
             request_id,
@@ -1070,7 +1120,7 @@ mod tests {
         assert!(
             cells
                 .iter()
-                .any(|cell| cell.bg == Theme::GROK_NIGHT.success)
+                .any(|cell| cell.fg == Theme::GROK_NIGHT.success)
         );
     }
 
@@ -1083,7 +1133,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
-        assert!(output.contains("Reasoning"));
+        assert!(output.contains("Thinking…"));
         assert!(output.contains("Enter: steer"));
         assert!(output.contains("Alt+Enter: follow-up"));
         assert!(output.contains("cargo test"));
@@ -1408,6 +1458,30 @@ mod tests {
     }
 
     #[test]
+    fn historical_tool_without_duration_does_not_show_replay_time() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "historical".into(),
+            name: "read".into(),
+            args: serde_json::json!({"path": "README.md"}),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "historical".into(),
+            result: pi_harness::ToolResult {
+                content: "done".into(),
+                details: None,
+            },
+            is_error: false,
+            duration_ms: None,
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Tool { duration, .. } => assert_eq!(duration, &None),
+            other => panic!("expected tool entry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn section_focus_steps_entries_and_keeps_them_visible() {
         let mut state = fixtures::conversation();
         state.focus = super::Focus::Scrollback;
@@ -1485,11 +1559,41 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         let edit = output.lines().find(|line| line.contains("> Edit")).unwrap();
-        assert_eq!(edit.chars().nth(1), Some('┌'));
+        assert_eq!(edit.chars().nth(1), Some('▏'));
         assert_eq!(state.scroll_from_bottom, scroll_before);
         assert_eq!(
             state.focused_target_id.as_deref(),
             Some("tool-group:tool-test")
+        );
+    }
+
+    #[test]
+    fn clearing_hover_removes_every_preview_rail_cell() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.hovered_target_id = Some("diff:fixture-diff-2".into());
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "▏")
+        );
+
+        state.hovered_target_id = None;
+        state.hovered_entry = None;
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| !matches!(cell.symbol(), "▏" | "▕"))
         );
     }
 
@@ -1978,6 +2082,79 @@ mod tests {
                 assert!(matches!(lines[2].kind, super::state::DiffKind::Added));
                 assert_eq!(lines[2].number, Some(13));
                 assert_eq!(lines[2].text, "final");
+            }
+            other => panic!("expected diff entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_pi_edit_diff_uses_source_numbers_without_a_fake_index() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "edit-numbered".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/lib.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "edit-numbered".into(),
+            result: pi_harness::ToolResult {
+                content: "Edited src/lib.rs".into(),
+                details: Some(serde_json::json!({
+                    "diff": "      ...\n 1224   let listed = sessions();\n-1225   return listed;\n+1225   return filtered;\n      ..."
+                })),
+            },
+            is_error: false,
+            duration_ms: Some(10),
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Diff { lines, .. } => {
+                assert_eq!(lines[0].number, None);
+                assert_eq!(lines[0].text, "...");
+                assert_eq!(lines[1].number, Some(1224));
+                assert_eq!(lines[1].text, "  let listed = sessions();");
+                assert_eq!(lines[2].number, Some(1225));
+                assert!(matches!(lines[2].kind, super::state::DiffKind::Removed));
+                assert_eq!(lines[3].number, Some(1225));
+                assert!(matches!(lines[3].kind, super::state::DiffKind::Added));
+            }
+            other => panic!("expected diff entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ellipsis_does_not_hide_unnumbered_replacement_lines() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "edit-ellipsis".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/lib.rs",
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+        });
+        state.apply(AgentEvent::ToolCallResult {
+            id: "edit-ellipsis".into(),
+            result: pi_harness::ToolResult {
+                content: "Edited src/lib.rs".into(),
+                details: Some(serde_json::json!({
+                    "diff": "      ...\n-old value\n+new value\n      ..."
+                })),
+            },
+            is_error: false,
+            duration_ms: Some(10),
+        });
+
+        match &state.entries[0] {
+            super::state::Entry::Diff { lines, .. } => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].text, "old value");
+                assert!(matches!(lines[0].kind, super::state::DiffKind::Removed));
+                assert_eq!(lines[1].text, "new value");
+                assert!(matches!(lines[1].kind, super::state::DiffKind::Added));
             }
             other => panic!("expected diff entry, got {other:?}"),
         }
@@ -2624,6 +2801,14 @@ mod tests {
         assert_eq!(state.overlay, super::OverlayKind::ModelPicker);
         assert!(state.prompt.is_empty());
 
+        state.prompt = "/dashboard".into();
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::RefreshSessions)
+        ));
+        assert_eq!(state.view, super::View::Dashboard);
+
         state.prompt = "/mode".into();
         state.cursor = 5;
         let previous = state.permission_mode.label();
@@ -2737,6 +2922,22 @@ mod tests {
         assert!(
             matches!(state.activate_overlay(), super::state::OverlayAction::SetScopedModels(models) if models == vec!["one/a"])
         );
+
+        state.open_overlay(super::OverlayKind::SubagentModelPicker);
+        state.overlay_selected = 2;
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::SetRuntimeSetting { key, value } if key == "subagent_model" && value == serde_json::json!("two/b"))
+        );
+        assert_eq!(
+            state.runtime_settings.subagent_model.as_deref(),
+            Some("two/b")
+        );
+
+        state.open_overlay(super::OverlayKind::SubagentModelPicker);
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::SetRuntimeSetting { key, value } if key == "subagent_model" && value.is_null())
+        );
+        assert_eq!(state.runtime_settings.subagent_model, None);
 
         state.prompt = "/trust".into();
         assert!(matches!(

@@ -5,7 +5,7 @@ export type SidecarCommand =
   | { type: "list_resources"; request_id: string; session_id: string }
   | { type: "reload_resources"; request_id: string; session_id: string }
   | { type: "get_settings"; request_id: string; session_id: string }
-  | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust"; value: string | boolean }
+  | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust" | "subagent_model"; value: string | boolean | null }
   | { type: "set_scoped_models"; request_id: string; session_id: string; models: string[] }
   | { type: "set_project_trust"; request_id: string; session_id: string; trusted: boolean }
   | { type: "export_session"; request_id: string; session_id: string; path?: string }
@@ -87,6 +87,7 @@ export type SidecarMessage =
         default_project_trust: "ask" | "always" | "never";
         enabled_models: string[];
         project_trusted: boolean;
+        subagent_model?: string;
       };
       rewinds?: Array<{ id: string; path: string; timestamp: string; tool: string }>;
       providers?: Array<{

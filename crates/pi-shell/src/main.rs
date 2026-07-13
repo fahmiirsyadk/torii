@@ -152,6 +152,10 @@ async fn main() -> Result<()> {
                     let _ = command_supervisor.create(None).await;
                     continue;
                 }
+                if matches!(command, pi_tui::UiCommand::RefreshSessions) {
+                    let _ = command_supervisor.refresh_sessions().await;
+                    continue;
+                }
                 let Ok(command_session) = command_supervisor.active_session().await else {
                     continue;
                 };
@@ -188,6 +192,7 @@ async fn main() -> Result<()> {
                             .await;
                     }
                     pi_tui::UiCommand::NewSession => unreachable!(),
+                    pi_tui::UiCommand::RefreshSessions => unreachable!(),
                     pi_tui::UiCommand::NameSession(name) => {
                         let _ = command_harness.name_session(&command_session, name).await;
                     }

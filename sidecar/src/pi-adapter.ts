@@ -1035,12 +1035,19 @@ export async function launchNativeSubagent(
     : SessionManager.create(cwd, undefined, { parentSession: parentPath });
   const sourceModelParts = context.source?.model?.split("/", 2);
   const sourceModel = sourceModelParts?.length === 2 ? { provider: sourceModelParts[0], id: sourceModelParts[1] } : undefined;
-  const model = sourceModel ?? role.model ?? (parent.session.model === undefined ? undefined : { provider: parent.session.model.provider, id: parent.session.model.id });
+  const parentModel = parent.session.model;
+  const configuredModel = resolveToriiSubagentModel(parent);
+  // A new child follows the live parent model. Role files may outlive provider
+  // credentials/model catalogs, so treating their model field as the default can
+  // make every native child fail before it starts. Resumed children keep the
+  // model recorded in their task metadata.
+  const selectedModel = configuredModel ?? parentModel;
+  const model = sourceModel ?? (selectedModel === undefined ? role.model : { provider: selectedModel.provider, id: selectedModel.id });
   const sourceThinking = context.source?.thinkingLevel;
   const validThinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   const thinkingLevel = validThinking.has(sourceThinking ?? "")
     ? sourceThinking as ResolvedSubagentRole["thinkingLevel"]
-    : role.thinkingLevel ?? parent.session.thinkingLevel;
+    : childThinkingLevel(selectedModel);
   const capability = context.request.capabilityMode ?? "all";
   const capabilityAllowlist = capability === "all" ? undefined : capabilityTools(capability);
   const tools = role.tools === undefined
@@ -1108,6 +1115,15 @@ export async function launchNativeSubagent(
   };
 }
 
+export function childThinkingLevel(model: ActiveSession["session"]["model"]): ResolvedSubagentRole["thinkingLevel"] {
+  if (model === undefined || !model.reasoning) return "off";
+  if (model.thinkingLevelMap?.low !== null) return "low";
+  if (model.thinkingLevelMap?.off !== null) return "off";
+  // Some reasoning-only providers reject both low and off. Let the SDK clamp
+  // minimal upward to the least supported effort for that model.
+  return "minimal";
+}
+
 // -----------------------------------------------------------------------------
 // Top-level SDK operations used by the dispatcher
 //
@@ -1170,6 +1186,7 @@ export function listResources(active: ActiveSession) {
 
 export function getSettings(active: ActiveSession) {
   const manager = active.settingsManager;
+  const torii = readToriiSettings(active.agentDir);
   return {
     steering_mode: active.session.steeringMode,
     follow_up_mode: active.session.followUpMode,
@@ -1177,18 +1194,66 @@ export function getSettings(active: ActiveSession) {
     default_project_trust: manager.getDefaultProjectTrust(),
     enabled_models: manager.getEnabledModels() ?? [],
     project_trusted: new ProjectTrustStore(active.agentDir).get(active.cwd) === true,
+    subagent_model: torii.subagent_model,
   };
+}
+
+interface ToriiSettings {
+  subagent_model?: string;
+}
+
+function toriiSettingsPath(agentDir: string): string {
+  return join(agentDir, "torii.json");
+}
+
+export function readToriiSettings(agentDir: string): ToriiSettings {
+  const path = toriiSettingsPath(agentDir);
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as ToriiSettings;
+    return typeof parsed.subagent_model === "string" ? { subagent_model: parsed.subagent_model } : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeToriiSettings(agentDir: string, settings: ToriiSettings): void {
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(toriiSettingsPath(agentDir), `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+export function writeToriiSubagentModel(agentDir: string, model: string | undefined): void {
+  writeToriiSettings(agentDir, model === undefined ? {} : { subagent_model: model });
+}
+
+function resolveToriiSubagentModel(active: ActiveSession) {
+  const reference = readToriiSettings(active.agentDir).subagent_model;
+  if (reference === undefined) return undefined;
+  const separator = reference.indexOf("/");
+  if (separator < 1) return undefined;
+  const model = active.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1));
+  return model !== undefined && active.modelRegistry.hasConfiguredAuth(model) ? model : undefined;
 }
 
 export async function applySetting(
   active: ActiveSession,
-  key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust",
-  value: string | boolean,
+  key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust" | "subagent_model",
+  value: string | boolean | null,
 ): Promise<void> {
   if (key === "steering_mode") await active.session.setSteeringMode(value as "all" | "one-at-a-time");
   else if (key === "follow_up_mode") await active.session.setFollowUpMode(value as "all" | "one-at-a-time");
   else if (key === "auto_compaction") await active.session.setAutoCompactionEnabled(value === true);
-  else await active.settingsManager.setDefaultProjectTrust(value as "ask" | "always" | "never");
+  else if (key === "default_project_trust") await active.settingsManager.setDefaultProjectTrust(value as "ask" | "always" | "never");
+  else {
+    if (value !== null && typeof value !== "string") throw new Error("subagent model must be a model identifier or null");
+    if (typeof value === "string") {
+      const separator = value.indexOf("/");
+      const model = separator < 1 ? undefined : active.modelRegistry.find(value.slice(0, separator), value.slice(separator + 1));
+      if (model === undefined || !active.modelRegistry.hasConfiguredAuth(model)) throw new Error(`unavailable subagent model: ${value}`);
+    }
+    writeToriiSubagentModel(active.agentDir, value ?? undefined);
+    return;
+  }
   await active.settingsManager.flush();
 }
 
@@ -1222,7 +1287,10 @@ export async function copyLastAssistantMessage(active: ActiveSession): Promise<s
 export async function listAllSessions(active: ActiveSession) {
   const currentPath = active.session.sessionFile;
   const listed = await SessionManager.list(active.cwd);
-  return listed.map((session) => ({
+  // Native subagents use persistent child sessions so their transcripts can be
+  // inspected and resumed later. They are implementation details of the parent
+  // conversation, not independent sessions for the dashboard/resume picker.
+  return listed.filter((session) => session.parentSessionPath === undefined || session.path === currentPath).map((session) => ({
     id: session.id,
     path: session.path,
     name: session.name,
@@ -1504,7 +1572,53 @@ export function setSessionName(active: ActiveSession, name: string): void {
 }
 
 export async function compactSession(active: ActiveSession, instructions: string | undefined): Promise<void> {
-  await active.session.compact(instructions);
+  try {
+    await active.session.compact(instructions);
+    return;
+  } catch (error) {
+    if (!isMissingCompactionModel(error)) throw error;
+
+    const originalModel = active.session.model;
+    if (originalModel === undefined) throw error;
+    const fallbackModel = await findCompactionFallback(active, originalModel);
+    if (fallbackModel === undefined) throw error;
+
+    // Pi's compactor uses the model currently held by AgentSession and does not
+    // expose a per-compaction model override. Change only the in-memory agent
+    // model here: setModel() would persist a model-change entry and overwrite the
+    // user's default even though this is only a recovery path for summarization.
+    active.session.agent.state.model = fallbackModel;
+    try {
+      await active.session.compact(instructions);
+    } finally {
+      active.session.agent.state.model = originalModel;
+    }
+  }
+}
+
+function isMissingCompactionModel(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /model (?:not found|does not exist|is unavailable)|unknown model/i.test(message);
+}
+
+async function findCompactionFallback(active: ActiveSession, originalModel: ActiveSession["session"]["model"]) {
+  const candidates: Array<NonNullable<typeof originalModel>> = [];
+  const seen = new Set<string>();
+  const add = (model: NonNullable<typeof originalModel> | undefined): void => {
+    if (model === undefined) return;
+    const key = `${model.provider}/${model.id}`;
+    if (seen.has(key) || (originalModel !== undefined && key === `${originalModel.provider}/${originalModel.id}`)) return;
+    seen.add(key);
+    candidates.push(model);
+  };
+
+  for (const reference of active.settingsManager.getEnabledModels() ?? []) {
+    const separator = reference.indexOf("/");
+    if (separator > 0) add(active.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1)));
+  }
+  for (const model of await Promise.resolve(active.modelRegistry.getAvailable())) add(model);
+
+  return candidates.find((model) => active.modelRegistry.hasConfiguredAuth(model));
 }
 
 export function setApiKey(active: ActiveSession, provider: string, key: string): void {

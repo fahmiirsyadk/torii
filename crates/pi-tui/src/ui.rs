@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::{
@@ -299,6 +299,10 @@ pub fn move_section_focus(state: &mut AppState, width: u16, height: u16, directi
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let theme = Theme::GROK_NIGHT;
+    // Clear symbols as well as styles. This matters when a resume replaces a
+    // tall focused/hovered section with shorter content in terminals that keep
+    // the previous alternate-screen cells until explicitly overwritten.
+    frame.render_widget(Clear, frame.area());
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background).fg(theme.foreground)),
         frame.area(),
@@ -1036,7 +1040,9 @@ fn render_section_border(
     for row in visible_start..visible_end {
         let only = section.end.saturating_sub(section.start) == 1;
         let continuation = clipped_below && row.saturating_add(3) >= visible_end;
-        let (left, right) = if continuation {
+        let (left, right) = if preview {
+            ("▏", "▕")
+        } else if continuation {
             ("┊", "┊")
         } else if only {
             ("[", "]")
@@ -1191,18 +1197,9 @@ fn reasoning_lines(
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(2);
-    let wrapped = markdown::wrap(text.trim(), body_width);
-    if wrapped.iter().all(|line| line.trim().is_empty()) {
+    if text.trim().is_empty() {
         return Vec::new();
     }
-    let visible = if expanded {
-        wrapped.len()
-    } else if active {
-        wrapped.len().min(3)
-    } else {
-        wrapped.len().min(2)
-    };
-    let total_lines = wrapped.len();
     let glyph = if hovered {
         ">"
     } else if active {
@@ -1210,7 +1207,6 @@ fn reasoning_lines(
     } else {
         "◆"
     };
-    let fold = if expanded { " [⌄]" } else { " [›]" };
     let header_color = if hovered {
         theme.foreground
     } else if active {
@@ -1218,35 +1214,32 @@ fn reasoning_lines(
     } else {
         theme.muted
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{glyph} Reasoning"),
-            Style::default()
-                .fg(header_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(fold, Style::default().fg(theme.subtle)),
-    ])];
-    for (index, line) in wrapped.into_iter().take(visible).enumerate() {
-        let rail = if expanded || active {
-            if index + 1 == visible { "└ " } else { "│ " }
-        } else {
-            "  "
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{rail}{line}"),
-            Style::default().fg(if active {
-                theme.muted
+    let label = if active { "Thinking…" } else { "Thinking" };
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{glyph} {label}"),
+        Style::default()
+            .fg(header_color)
+            .add_modifier(Modifier::ITALIC),
+    ))];
+
+    if expanded {
+        let source = markdown::wrap(text.trim(), body_width);
+        let mut body = markdown::render(&source, body_width, theme);
+        let body_len = body.len();
+        for (index, mut line) in body.drain(..).enumerate() {
+            let rail = if index + 1 == body_len {
+                "└ "
             } else {
-                theme.foreground
-            }),
-        )));
-    }
-    if !expanded && visible < total_lines {
-        lines.push(Line::from(Span::styled(
-            "  …",
-            Style::default().fg(theme.subtle),
-        )));
+                "│ "
+            };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled(rail, Style::default().fg(theme.subtle)));
+            spans.extend(line.spans.drain(..).map(|mut span| {
+                span.style = span.style.fg(theme.muted).add_modifier(Modifier::ITALIC);
+                span
+            }));
+            lines.push(Line::from(spans));
+        }
     }
     lines
 }
@@ -1793,9 +1786,9 @@ fn diff_render_lines(
                 body_width,
             );
             let body_style = match diff_line.kind {
-                DiffKind::Context => Style::default().bg(theme.background).fg(theme.foreground),
-                DiffKind::Added => Style::default().bg(theme.success).fg(theme.background),
-                DiffKind::Removed => Style::default().bg(theme.error).fg(theme.background),
+                DiffKind::Context => Style::default().fg(theme.foreground),
+                DiffKind::Added => Style::default().fg(theme.success),
+                DiffKind::Removed => Style::default().fg(theme.error),
             };
             let number_color = match diff_line.kind {
                 DiffKind::Added => theme.success,

@@ -324,6 +324,8 @@ pub struct RuntimeSettings {
     pub default_project_trust: String,
     pub enabled_models: Vec<String>,
     pub project_trusted: bool,
+    #[serde(default)]
+    pub subagent_model: Option<String>,
 }
 
 impl Default for RuntimeSettings {
@@ -335,6 +337,7 @@ impl Default for RuntimeSettings {
             default_project_trust: "ask".into(),
             enabled_models: Vec::new(),
             project_trusted: false,
+            subagent_model: None,
         }
     }
 }

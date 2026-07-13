@@ -227,6 +227,16 @@ impl SessionSupervisor {
             .ok_or_else(|| anyhow!("active resident session disappeared"))
     }
 
+    pub async fn refresh_sessions(&self) -> Result<()> {
+        let id = self.active_session().await?;
+        let sessions = self.harness.list_sessions(&id).await?;
+        let _ = self.events.send(TaggedEvent {
+            session_id: id,
+            event: AgentEvent::SessionsChanged { sessions },
+        });
+        Ok(())
+    }
+
     pub async fn mark_running(&self, id: &SessionId) {
         if let Some(resident) = self
             .residents

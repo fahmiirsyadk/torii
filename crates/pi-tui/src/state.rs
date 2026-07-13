@@ -31,6 +31,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/context",
     "/reload",
     "/scoped-models",
+    "/subagent-model",
     "/trust",
     "/export",
     "/import",
@@ -71,6 +72,7 @@ pub enum OverlayKind {
     LabelEditor,
     FilePicker,
     ScopedModels,
+    SubagentModelPicker,
     OauthPrompt,
     OauthSelect,
     LoginProvider,
@@ -97,6 +99,7 @@ pub struct PendingOauth {
 #[derive(Debug)]
 pub enum OverlayAction {
     None,
+    RefreshSessions,
     Quit,
     Permission {
         request_id: String,
@@ -603,7 +606,35 @@ impl AppState {
         true
     }
 
+    pub fn move_slash_selection(&mut self, delta: isize) {
+        if !self.prompt.starts_with('/') || self.prompt.contains(char::is_whitespace) {
+            return;
+        }
+        let count = self.slash_suggestions().len();
+        if count == 0 {
+            self.overlay_selected = 0;
+            return;
+        }
+        self.overlay_selected = if delta < 0 {
+            self.overlay_selected
+                .checked_sub(delta.unsigned_abs())
+                .unwrap_or(count - 1)
+        } else {
+            self.overlay_selected.saturating_add(delta as usize) % count
+        };
+    }
+
     pub fn activate_slash_command(&mut self) -> Option<OverlayAction> {
+        if self.prompt.starts_with('/') && !self.prompt.contains(char::is_whitespace) {
+            let suggestions = self.slash_suggestions();
+            let exact = suggestions
+                .iter()
+                .any(|(command, _)| command == &self.prompt);
+            if !exact && let Some((command, _)) = suggestions.get(self.overlay_selected) {
+                self.prompt = command.clone();
+                self.cursor = self.prompt.chars().count();
+            }
+        }
         let input = self.prompt.trim();
         let mut parts = input.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default().to_ascii_lowercase();
@@ -619,7 +650,7 @@ impl AppState {
                     .iter()
                     .position(|session| session.current)
                     .unwrap_or(0);
-                OverlayAction::None
+                OverlayAction::RefreshSessions
             }
             "/model" => {
                 self.open_overlay(OverlayKind::ModelPicker);
@@ -643,6 +674,10 @@ impl AppState {
             "/reload" => OverlayAction::ReloadResources,
             "/scoped-models" => {
                 self.open_overlay(OverlayKind::ScopedModels);
+                OverlayAction::None
+            }
+            "/subagent-model" => {
+                self.open_overlay(OverlayKind::SubagentModelPicker);
                 OverlayAction::None
             }
             "/trust" => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
@@ -846,6 +881,13 @@ impl AppState {
                     "Scoped models: {}",
                     self.runtime_settings.enabled_models.len()
                 ),
+                format!(
+                    "Subagent model: {}",
+                    self.runtime_settings
+                        .subagent_model
+                        .as_deref()
+                        .unwrap_or("inherit parent")
+                ),
             ],
             OverlayKind::ScopedModels => self
                 .available_models
@@ -858,6 +900,13 @@ impl AppState {
                     };
                     format!("[{mark}] {}", model.display_name)
                 })
+                .collect(),
+            OverlayKind::SubagentModelPicker => std::iter::once("Inherit parent (default)".into())
+                .chain(
+                    self.available_models
+                        .iter()
+                        .map(|model| model.display_name.clone()),
+                )
                 .collect(),
             OverlayKind::OauthPrompt => Vec::new(),
             OverlayKind::OauthSelect => self
@@ -1160,8 +1209,12 @@ impl AppState {
                         }
                     }
                     4 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
-                    _ => {
+                    5 => {
                         self.open_overlay(OverlayKind::ScopedModels);
+                        return OverlayAction::None;
+                    }
+                    _ => {
+                        self.open_overlay(OverlayKind::SubagentModelPicker);
                         return OverlayAction::None;
                     }
                 };
@@ -1173,6 +1226,28 @@ impl AppState {
                 let models = self.runtime_settings.enabled_models.clone();
                 self.close_overlay();
                 return OverlayAction::SetScopedModels(models);
+            }
+            OverlayKind::SubagentModelPicker => {
+                let model = if item == "Inherit parent (default)" {
+                    None
+                } else {
+                    self.available_models
+                        .iter()
+                        .find(|model| model.display_name == item)
+                        .map(|model| model.id.clone())
+                };
+                if item != "Inherit parent (default)" && model.is_none() {
+                    return OverlayAction::None;
+                }
+                let action = OverlayAction::SetRuntimeSetting {
+                    key: "subagent_model".into(),
+                    value: model
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
+                };
+                self.runtime_settings.subagent_model = model;
+                self.close_overlay();
+                return action;
             }
             OverlayKind::LoginProvider => {
                 let provider = self
@@ -1389,6 +1464,9 @@ impl AppState {
             OverlayAction::SetRuntimeSetting { key, value } if key == "default_project_trust" => {
                 self.runtime_settings.default_project_trust =
                     value.as_str().unwrap_or_default().into()
+            }
+            OverlayAction::SetRuntimeSetting { key, value } if key == "subagent_model" => {
+                self.runtime_settings.subagent_model = value.as_str().map(str::to_owned)
             }
             OverlayAction::SetProjectTrust(trusted) => {
                 self.runtime_settings.project_trusted = *trusted
@@ -2337,12 +2415,14 @@ impl AppState {
                         } if tool_id == &id
                     )
                 }) {
-                    let local_elapsed = started_at.take().map(|started| started.elapsed());
-                    *duration = duration_ms
-                        .map(|milliseconds| {
-                            format_elapsed(std::time::Duration::from_millis(milliseconds))
-                        })
-                        .or_else(|| local_elapsed.map(format_elapsed));
+                    // Live Pi events carry the duration measured by the sidecar.
+                    // Historical sessions may not have persisted one; timing the
+                    // synchronous replay produces a misleading "0ms" instead of
+                    // the original tool duration, so leave it blank.
+                    started_at.take();
+                    *duration = duration_ms.map(|milliseconds| {
+                        format_elapsed(std::time::Duration::from_millis(milliseconds))
+                    });
                     *current_result = Some(content);
                     if label == "Search"
                         && !detail.contains(" matches)")
@@ -2451,6 +2531,7 @@ fn builtin_description(command: &str) -> &'static str {
         "/context" => "Show loaded context files",
         "/reload" => "Reload Pi resources",
         "/scoped-models" => "Choose models for cycling",
+        "/subagent-model" => "Choose the persistent model for native subagents",
         "/trust" => "Save project trust decision",
         "/export" => "Export session to HTML",
         "/import" => "Import a JSONL session",
@@ -2773,6 +2854,16 @@ fn result_diff(details: Option<&serde_json::Value>) -> Option<&str> {
 }
 
 fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
+    let numbered = diff
+        .lines()
+        .filter_map(parse_numbered_diff_line)
+        .collect::<Vec<_>>();
+    if numbered.iter().any(|line| line.number.is_some())
+        && !diff.lines().any(|line| line.starts_with("@@ "))
+    {
+        return numbered;
+    }
+
     let mut old_line = 0_u32;
     let mut new_line = 0_u32;
     let mut lines = Vec::new();
@@ -2797,6 +2888,8 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
                 kind: DiffKind::Added,
             });
             new_line = new_line.saturating_add(1);
+        } else if line.trim() == "..." {
+            continue;
         } else if let Some(text) = line.strip_prefix(' ') {
             lines.push(DiffLine {
                 number: Some(new_line),
@@ -2808,6 +2901,38 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
         }
     }
     lines
+}
+
+fn parse_numbered_diff_line(line: &str) -> Option<DiffLine> {
+    let marker = line.chars().next()?;
+    if !matches!(marker, ' ' | '+' | '-') {
+        return None;
+    }
+    let remainder = &line[marker.len_utf8()..];
+    let digits = remainder
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        let text = remainder.trim();
+        return (text == "...").then(|| DiffLine {
+            number: None,
+            text: text.into(),
+            kind: DiffKind::Context,
+        });
+    }
+    let text = remainder[digits.len()..]
+        .strip_prefix(' ')
+        .unwrap_or(&remainder[digits.len()..]);
+    Some(DiffLine {
+        number: digits.parse().ok(),
+        text: text.into(),
+        kind: match marker {
+            '+' => DiffKind::Added,
+            '-' => DiffKind::Removed,
+            _ => DiffKind::Context,
+        },
+    })
 }
 
 fn parse_diff_range(range: &str) -> Option<u32> {

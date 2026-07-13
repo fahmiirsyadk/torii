@@ -217,10 +217,14 @@ normal grouped/timed tool renderer.
 Subagent orchestration is owned by Torii's sidecar rather than a global Pi
 extension. The model receives `spawn_subagent`,
 `get_command_or_subagent_output`, `wait_commands_or_subagents`, and
-`kill_command_or_subagent`. Children inherit or resolve their model, thinking,
-role/persona, capability allowlist, and working directory; nesting stops at one
-level. Optional worktree isolation is detached and never auto-merged—applying
-or removing it requires a separate permission-gated tool call.
+`kill_command_or_subagent`. New children inherit the parent model with reduced
+thinking by default; `/subagent-model` can select a persistent global override
+or restore parent inheritance. Torii stores that override in
+`~/.pi/agent/torii.json`, separate from Pi's official settings schema. Children
+also resolve their role/persona, capability allowlist, and working directory;
+nesting stops at one level. Optional worktree isolation is detached and never
+auto-merged—applying or removing it requires a separate permission-gated tool
+call.
 
 MCP servers can be configured in `~/.pi/agent/mcp.json` or a trusted project's
 `.mcp.json` using the common `{ "mcpServers": { ... } }` shape. Entries may use

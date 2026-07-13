@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { grokToolsExtension, loadedHistory, resolveSubagentRole } from "./pi-adapter.ts";
+import { childThinkingLevel, grokToolsExtension, loadedHistory, readToriiSettings, resolveSubagentRole, writeToriiSubagentModel } from "./pi-adapter.ts";
 import { NativeSubagentCoordinator } from "./subagents.ts";
 
 test("loaded history preserves Pi compaction-aware entry order", () => {
@@ -64,6 +64,28 @@ test("subagent role resolution layers project role over persona defaults", () =>
     assert.deepEqual(role.tools, ["read", "grep"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("new subagents choose the lowest practical thinking effort", () => {
+  const model = (reasoning: boolean, thinkingLevelMap?: Record<string, string | null>) =>
+    ({ reasoning, thinkingLevelMap }) as Parameters<typeof childThinkingLevel>[0];
+
+  assert.equal(childThinkingLevel(model(false)), "off");
+  assert.equal(childThinkingLevel(model(true)), "low");
+  assert.equal(childThinkingLevel(model(true, { low: null, off: "none" })), "off");
+  assert.equal(childThinkingLevel(model(true, { low: null, off: null })), "minimal");
+});
+
+test("Torii subagent model override persists independently of Pi settings", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "torii-settings-"));
+  try {
+    writeToriiSubagentModel(agentDir, "provider/model");
+    assert.equal(readToriiSettings(agentDir).subagent_model, "provider/model");
+    writeToriiSubagentModel(agentDir, undefined);
+    assert.equal(readToriiSettings(agentDir).subagent_model, undefined);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
   }
 });
 
