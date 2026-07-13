@@ -3523,7 +3523,7 @@ fn build_edit_diff(args: &serde_json::Value) -> Option<Vec<DiffLine>> {
             let edit = edit.as_object()?;
             let old = edit.get("oldText").and_then(serde_json::Value::as_str)?;
             let new = edit.get("newText").and_then(serde_json::Value::as_str)?;
-            lines.extend(replacement_diff(old, new, None));
+            lines.extend(replacement_diff(old, new));
         }
         return (!lines.is_empty()).then_some(lines);
     }
@@ -3538,43 +3538,66 @@ fn build_edit_diff(args: &serde_json::Value) -> Option<Vec<DiffLine>> {
     if old_text == new_text {
         return None;
     }
-    let start = object
-        .get("start_line")
-        .or_else(|| object.get("offset"))
-        .or_else(|| object.get("line"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value as u32);
-    Some(replacement_diff(old_text, new_text, start))
+    Some(replacement_diff(old_text, new_text))
 }
 
-fn replacement_diff(old_text: &str, new_text: &str, start: Option<u32>) -> Vec<DiffLine> {
-    let mut diff_lines = Vec::new();
+/// Build a preview diff from an edit tool call's arguments.
+///
+/// This runs before the tool executes (e.g. while a permission prompt is up),
+/// so the authoritative `details.diff` in the result is not available yet. We
+/// still want the preview to match the final diff, so we compute a real
+/// line-level diff instead of dumping the whole old block as removed and the
+/// whole new block as added — a one-line change inside a larger block should
+/// read as one `-`/`+` pair, not `-N +N`. Line numbers are left unset because
+/// the arguments carry text, not file positions; the result diff fills them in.
+fn replacement_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
     let old_lines: Vec<&str> = old_text.split_terminator('\n').collect();
     let new_lines: Vec<&str> = new_text.split_terminator('\n').collect();
-    if !old_lines.is_empty() {
-        for (index, line) in old_lines.iter().enumerate() {
-            let number = start.map(|base| base + index as u32);
-            diff_lines.push(DiffLine {
-                number,
-                text: (*line).to_string(),
-                kind: DiffKind::Removed,
-            });
+    let rows = old_lines.len();
+    let cols = new_lines.len();
+
+    // Longest-common-subsequence table over lines. Edit payloads are small, so
+    // the O(rows * cols) table is cheap and keeps the diff line-accurate.
+    let mut lcs = vec![vec![0u32; cols + 1]; rows + 1];
+    for i in (0..rows).rev() {
+        for j in (0..cols).rev() {
+            lcs[i][j] = if old_lines[i] == new_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
         }
     }
-    if !new_lines.is_empty() {
-        let base = start.unwrap_or(0) + old_lines.len() as u32;
-        for (index, line) in new_lines.iter().enumerate() {
-            let number = if start.is_some() {
-                Some(base + index as u32)
-            } else {
-                None
-            };
-            diff_lines.push(DiffLine {
-                number,
-                text: (*line).to_string(),
-                kind: DiffKind::Added,
-            });
+
+    let mut diff_lines = Vec::new();
+    let push = |diff_lines: &mut Vec<DiffLine>, text: &str, kind: DiffKind| {
+        diff_lines.push(DiffLine {
+            number: None,
+            text: text.to_string(),
+            kind,
+        });
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < rows && j < cols {
+        if old_lines[i] == new_lines[j] {
+            push(&mut diff_lines, old_lines[i], DiffKind::Context);
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            push(&mut diff_lines, old_lines[i], DiffKind::Removed);
+            i += 1;
+        } else {
+            push(&mut diff_lines, new_lines[j], DiffKind::Added);
+            j += 1;
         }
+    }
+    while i < rows {
+        push(&mut diff_lines, old_lines[i], DiffKind::Removed);
+        i += 1;
+    }
+    while j < cols {
+        push(&mut diff_lines, new_lines[j], DiffKind::Added);
+        j += 1;
     }
     diff_lines
 }

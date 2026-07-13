@@ -2905,26 +2905,48 @@ mod tests {
 
         match &state.entries[0] {
             super::state::Entry::Diff { lines, .. } => {
-                assert_eq!(lines.len(), 7);
-                // old_text: 3 lines, all Removed
+                // The preview is a real line-level diff: only the inserted line
+                // is Added, the unchanged surrounding lines stay Context.
+                assert_eq!(lines.len(), 4);
                 assert_eq!(lines[0].text, "fn handle(req: Request) -> Response {");
-                assert!(matches!(lines[0].kind, super::state::DiffKind::Removed));
-                assert_eq!(lines[1].text, "    process(req)");
-                assert!(matches!(lines[1].kind, super::state::DiffKind::Removed));
-                assert_eq!(lines[2].text, "}");
-                assert!(matches!(lines[2].kind, super::state::DiffKind::Removed));
-                // new_text: 4 lines, all Added
-                assert_eq!(lines[3].text, "fn handle(req: Request) -> Response {");
-                assert!(matches!(lines[3].kind, super::state::DiffKind::Added));
-                assert_eq!(lines[4].text, "    validate(&req)?;");
-                assert!(matches!(lines[4].kind, super::state::DiffKind::Added));
-                assert_eq!(lines[5].text, "    process(req)");
-                assert!(matches!(lines[5].kind, super::state::DiffKind::Added));
-                assert_eq!(lines[6].text, "}");
-                assert!(matches!(lines[6].kind, super::state::DiffKind::Added));
+                assert!(matches!(lines[0].kind, super::state::DiffKind::Context));
+                assert_eq!(lines[1].text, "    validate(&req)?;");
+                assert!(matches!(lines[1].kind, super::state::DiffKind::Added));
+                assert_eq!(lines[2].text, "    process(req)");
+                assert!(matches!(lines[2].kind, super::state::DiffKind::Context));
+                assert_eq!(lines[3].text, "}");
+                assert!(matches!(lines[3].kind, super::state::DiffKind::Context));
             }
             other => panic!("expected Diff entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn expanded_edit_diff_still_shows_the_change_count_in_the_header() {
+        let (width, height) = (80, 12);
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ToolCallStart {
+            id: "count".into(),
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "let border = theme.border;\n",
+                "new_text": "let border = focused_border(state, theme);\n",
+            }),
+        });
+        assert!(
+            matches!(&state.entries[0], super::state::Entry::Diff { expanded, .. } if *expanded),
+            "edit diffs render expanded by default"
+        );
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let rendered = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(
+            rendered.contains("+1 -1"),
+            "expanded diff header must show the +/- count, got:\n{rendered}"
+        );
     }
 
     #[test]

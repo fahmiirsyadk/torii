@@ -1843,11 +1843,10 @@ fn diff_render_lines(
         .iter()
         .filter(|line| matches!(line.kind, DiffKind::Removed))
         .count();
-    let summary = if expanded {
-        String::new()
-    } else {
-        format!("  +{added} -{removed}")
-    };
+    // The change count belongs in the header whether or not the body is
+    // expanded — collapsing a diff should not be the only way to see how many
+    // lines it touched.
+    let summary = format!("  +{added} -{removed}");
     let path_width = width.saturating_sub(7 + summary.chars().count());
     let mut lines = vec![Line::from(vec![
         Span::styled(
@@ -1864,7 +1863,10 @@ fn diff_render_lines(
             truncate(path, path_width),
             Style::default().fg(theme.warning),
         ),
-        Span::styled(summary, Style::default().fg(theme.muted)),
+        Span::styled("  +", Style::default().fg(theme.muted)),
+        Span::styled(added.to_string(), Style::default().fg(theme.success)),
+        Span::styled(" -", Style::default().fg(theme.muted)),
+        Span::styled(removed.to_string(), Style::default().fg(theme.error)),
     ])];
 
     if expanded {
