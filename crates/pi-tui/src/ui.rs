@@ -1451,26 +1451,77 @@ pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
-    let task_status = if state.tasks_total == 0 {
-        String::new()
-    } else {
-        format!(" │ Plan {}/{}", state.tasks_complete, state.tasks_total)
-    };
-    let right = format!(
-        "{} / {}{}",
-        compact_number(state.context_used),
-        compact_number(state.context_limit),
-        task_status
-    );
-    let left = format!("⎇ {}  {}", state.branch, state.cwd);
-    let gap = area
-        .width
-        .saturating_sub((left.chars().count() + right.chars().count()) as u16);
-    let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(theme.muted)),
-        Span::raw(" ".repeat(gap as usize)),
-        Span::styled(right, Style::default().fg(theme.foreground)),
-    ]);
+    let separator = || Span::styled(" │ ", Style::default().fg(theme.subtle));
+    let queued = state.queued_steering.len() + state.queued_follow_up.len();
+    let mut right = Vec::new();
+    if state.streaming {
+        right.push(Span::styled(
+            "● working",
+            Style::default().fg(theme.accent_running),
+        ));
+    }
+    if state.tasks_total > 0 {
+        if !right.is_empty() {
+            right.push(separator());
+        }
+        right.push(Span::styled(
+            format!("Plan {}/{}", state.tasks_complete, state.tasks_total),
+            Style::default().fg(theme.accent_plan),
+        ));
+    }
+    if queued > 0 {
+        if !right.is_empty() {
+            right.push(separator());
+        }
+        right.push(Span::styled(
+            format!("+{queued}"),
+            Style::default().fg(theme.accent_user),
+        ));
+    }
+    if !right.is_empty() {
+        right.push(separator());
+    }
+    let context_percent = state
+        .context_used
+        .saturating_mul(100)
+        .checked_div(state.context_limit.max(1))
+        .unwrap_or(0);
+    right.push(Span::styled(
+        format!(
+            "{} / {}  {context_percent}%",
+            compact_number(state.context_used),
+            compact_number(state.context_limit)
+        ),
+        Style::default().fg(if context_percent >= 95 {
+            theme.error
+        } else if context_percent >= 85 {
+            theme.warning
+        } else {
+            theme.muted
+        }),
+    ));
+    let right_width = right
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let left_budget = usize::from(area.width).saturating_sub(right_width + 1);
+    let branch = format!("⎇ {}", state.branch);
+    let cwd_budget = left_budget.saturating_sub(branch.chars().count() + 2);
+    let cwd = truncate(&state.cwd, cwd_budget);
+    let mut spans = vec![
+        Span::styled(branch, Style::default().fg(theme.text_secondary)),
+        Span::styled("  ", Style::default()),
+        Span::styled(cwd, Style::default().fg(theme.muted)),
+    ];
+    let left_width = spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    spans.push(Span::raw(" ".repeat(
+        usize::from(area.width).saturating_sub(left_width + right_width),
+    )));
+    spans.extend(right);
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
 

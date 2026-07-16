@@ -3,6 +3,7 @@ mod agent_layout;
 mod fixtures;
 mod markdown;
 mod overlay;
+mod picker;
 mod prompt;
 mod scrollback;
 mod state;
@@ -696,6 +697,29 @@ async fn run_app(
                     }
                     KeyCode::Up => state.move_overlay_selection(-1),
                     KeyCode::Down => state.move_overlay_selection(1),
+                    KeyCode::PageUp
+                        if !matches!(
+                            state.overlay,
+                            OverlayKind::PasteEditor | OverlayKind::TreePicker
+                        ) =>
+                    {
+                        state.move_overlay_selection(-(page as isize));
+                    }
+                    KeyCode::PageDown
+                        if !matches!(
+                            state.overlay,
+                            OverlayKind::PasteEditor | OverlayKind::TreePicker
+                        ) =>
+                    {
+                        state.move_overlay_selection(page as isize);
+                    }
+                    KeyCode::Home if state.overlay != OverlayKind::PasteEditor => {
+                        state.overlay_selected = 0;
+                    }
+                    KeyCode::End if state.overlay != OverlayKind::PasteEditor => {
+                        let count = state.overlay_items().len();
+                        state.overlay_selected = count.saturating_sub(1);
+                    }
                     KeyCode::Left if state.overlay == OverlayKind::Permission => {
                         state.move_overlay_selection(-1);
                     }
@@ -728,6 +752,12 @@ async fn run_app(
                     }
                     KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
                         state.toggle_scoped_model();
+                    }
+                    KeyCode::Char(' ') if state.overlay == OverlayKind::Settings => {
+                        let action = state.activate_overlay();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
                     }
                     KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1182,8 +1212,8 @@ async fn run_app(
                 MouseEventKind::ScrollDown if state.overlay == OverlayKind::PasteEditor => {
                     state.scroll_paste_editor(3);
                 }
-                MouseEventKind::ScrollUp => state.move_overlay_selection(-1),
-                MouseEventKind::ScrollDown => state.move_overlay_selection(1),
+                MouseEventKind::ScrollUp => state.move_overlay_selection(-3),
+                MouseEventKind::ScrollDown => state.move_overlay_selection(3),
                 MouseEventKind::Moved => {
                     if state.overlay == OverlayKind::PasteEditor {
                         state.paste_editor_action_hover =
@@ -3683,8 +3713,16 @@ mod tests {
 
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
-        assert!(output.contains("MiniMax-M3  ✓ current"));
-        assert!(!output.contains("GLM-5.2  ✓ current"));
+        let current = output
+            .lines()
+            .find(|line| line.contains("MiniMax-M3"))
+            .expect("current model row");
+        let other = output
+            .lines()
+            .find(|line| line.contains("GLM-5.2"))
+            .expect("other model row");
+        assert!(current.contains("✓ current"));
+        assert!(!other.contains("✓ current"));
     }
 
     #[test]
@@ -3716,7 +3754,7 @@ mod tests {
         );
         let selected_row = output
             .lines()
-            .position(|line| line.contains('›') && line.contains("Model 25"))
+            .position(|line| line.contains("Model 25"))
             .unwrap() as u16;
         assert_eq!(
             overlay::item_at_position(&state, width, height, width / 2, selected_row),
@@ -4679,6 +4717,17 @@ mod tests {
         assert!(
             matches!(state.activate_overlay(), super::state::OverlayAction::SetRuntimeSetting { key, value } if key == "steering_mode" && value == serde_json::json!("all"))
         );
+        assert_eq!(state.overlay, super::OverlayKind::Settings);
+
+        state.overlay_selected = 5;
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::ScopedModels);
+        state.close_overlay();
+        assert_eq!(state.overlay, super::OverlayKind::Settings);
+        assert_eq!(state.overlay_selected, 5);
 
         state.open_overlay(super::OverlayKind::ScopedModels);
         state.toggle_scoped_model();

@@ -247,6 +247,14 @@ pub enum OverlayKind {
     Permission,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlaySnapshot {
+    pub kind: OverlayKind,
+    pub query: String,
+    pub cursor: usize,
+    pub selected: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingPermission {
     pub id: String,
@@ -624,6 +632,7 @@ pub struct AppState {
     pub focus: Focus,
     pub inside_think_tag: bool,
     pub overlay: OverlayKind,
+    pub overlay_stack: Vec<OverlaySnapshot>,
     pub overlay_query: String,
     pub overlay_selected: usize,
     pub pending_permission: Option<PendingPermission>,
@@ -759,6 +768,7 @@ impl Default for AppState {
             focus: Focus::Prompt,
             inside_think_tag: false,
             overlay: OverlayKind::None,
+            overlay_stack: Vec::new(),
             overlay_query: String::new(),
             overlay_selected: 0,
             pending_permission: None,
@@ -1282,19 +1292,39 @@ impl AppState {
 
     pub fn open_overlay(&mut self, overlay: OverlayKind) {
         self.overlay = overlay;
+        self.overlay_stack.clear();
         self.overlay_query.clear();
+        self.overlay_cursor = 0;
+        self.overlay_selected = 0;
+    }
+
+    pub fn open_child_overlay(&mut self, overlay: OverlayKind) {
+        self.overlay_stack.push(OverlaySnapshot {
+            kind: self.overlay,
+            query: std::mem::take(&mut self.overlay_query),
+            cursor: self.overlay_cursor,
+            selected: self.overlay_selected,
+        });
+        self.overlay = overlay;
         self.overlay_cursor = 0;
         self.overlay_selected = 0;
     }
 
     pub fn close_overlay(&mut self) {
         if self.overlay != OverlayKind::Permission {
-            self.overlay = OverlayKind::None;
-            self.overlay_query.clear();
-            self.overlay_cursor = 0;
+            if let Some(parent) = self.overlay_stack.pop() {
+                self.overlay = parent.kind;
+                self.overlay_query = parent.query;
+                self.overlay_cursor = parent.cursor;
+                self.overlay_selected = parent.selected;
+            } else {
+                self.overlay = OverlayKind::None;
+                self.overlay_query.clear();
+                self.overlay_cursor = 0;
+                self.overlay_selected = 0;
+            }
             self.pending_paste_id = None;
             self.pending_image_id = None;
-            self.overlay_selected = 0;
         }
     }
 
@@ -2068,16 +2098,15 @@ impl AppState {
                     }
                     4 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
                     5 => {
-                        self.open_overlay(OverlayKind::ScopedModels);
+                        self.open_child_overlay(OverlayKind::ScopedModels);
                         return OverlayAction::None;
                     }
                     _ => {
-                        self.open_overlay(OverlayKind::SubagentModelPicker);
+                        self.open_child_overlay(OverlayKind::SubagentModelPicker);
                         return OverlayAction::None;
                     }
                 };
                 self.apply_runtime_setting(&action);
-                self.close_overlay();
                 return action;
             }
             OverlayKind::ScopedModels => {
@@ -3476,6 +3505,7 @@ impl AppState {
                 self.pending_permission = None;
                 self.pending_oauth = None;
                 self.overlay = OverlayKind::None;
+                self.overlay_stack.clear();
                 self.escape_armed_at = None;
                 self.context_used = 0;
                 self.scroll_from_bottom = 0;

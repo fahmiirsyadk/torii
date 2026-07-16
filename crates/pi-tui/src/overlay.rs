@@ -8,14 +8,41 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    agent_layout::AgentLayout,
+    picker::{self, PickerRow, PickerSpec},
     state::{AppState, OverlayKind},
     theme::Theme,
 };
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
+    if state.overlay == OverlayKind::None {
+        render_slash_suggestions(frame, state);
+        return;
+    }
+    if state.overlay == OverlayKind::TreePicker {
+        render_tree_picker(frame, state);
+        return;
+    }
+    if state.overlay == OverlayKind::ForkPicker {
+        render_fork_picker(frame, state);
+        return;
+    }
+    if state.overlay == OverlayKind::PasteEditor {
+        render_paste_editor(frame, state);
+        return;
+    }
+    if state.overlay == OverlayKind::ImageViewer {
+        render_image_viewer(frame, state);
+        return;
+    }
+    render_grok_picker(frame, state);
+}
+
+#[allow(dead_code)]
+fn render_legacy(frame: &mut Frame<'_>, state: &AppState) {
     if state.overlay == OverlayKind::None {
         render_slash_suggestions(frame, state);
         return;
@@ -283,6 +310,280 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+struct GenericPickerData {
+    title: &'static str,
+    query_label: Option<&'static str>,
+    notes: Vec<String>,
+    rows: Vec<PickerRow>,
+    footer: &'static str,
+    max_width: u16,
+    max_height: u16,
+}
+
+fn render_grok_picker(frame: &mut Frame<'_>, state: &AppState) {
+    let data = generic_picker_data(state);
+    let display_query = if state.overlay == OverlayKind::OauthPrompt {
+        "•".repeat(state.overlay_query.chars().count())
+    } else {
+        state.overlay_query.clone()
+    };
+    let spec = PickerSpec {
+        title: data.title,
+        query: data
+            .query_label
+            .map(|label| (label, display_query.as_str())),
+        notes: &data.notes,
+        rows: &data.rows,
+        footer: data.footer,
+        max_width: data.max_width,
+        max_height: data.max_height,
+    };
+    picker::render(frame, &spec, state.overlay_selected, Theme::GROK_NIGHT);
+}
+
+fn generic_picker_data(state: &AppState) -> GenericPickerData {
+    let title = match state.overlay {
+        OverlayKind::CommandPalette => "Commands",
+        OverlayKind::ModelPicker => "Select model",
+        OverlayKind::WorkflowPicker => "Workflow catalog",
+        OverlayKind::WorkflowPreview => "Workflow preflight",
+        OverlayKind::SessionPicker => "Resume session",
+        OverlayKind::SessionRename => "Rename session",
+        OverlayKind::SessionDeleteConfirm => "Delete session?",
+        OverlayKind::TreePicker => "Session tree",
+        OverlayKind::ForkPicker => "Fork from prompt",
+        OverlayKind::TreeSummaryPicker => "Summarize branch?",
+        OverlayKind::TreeSummaryEditor => "Custom summary instructions",
+        OverlayKind::PasteEditor => "Edit pasted text",
+        OverlayKind::ImageViewer => "Image attachment",
+        OverlayKind::LabelEditor => "Entry label",
+        OverlayKind::FilePicker => "Reference file",
+        OverlayKind::ScopedModels => "Scoped models",
+        OverlayKind::SubagentModelPicker => "Subagent model",
+        OverlayKind::OauthPrompt => "OAuth input",
+        OverlayKind::OauthSelect => "OAuth selection",
+        OverlayKind::LoginProvider => "Login provider",
+        OverlayKind::ThinkingPicker => "Thinking effort",
+        OverlayKind::RewindPicker => "Rewind file edit",
+        OverlayKind::Settings => "Settings",
+        OverlayKind::Permission => "Permission required",
+        OverlayKind::None => "",
+    };
+    let query_label = overlay_has_query(state.overlay).then_some(match state.overlay {
+        OverlayKind::LabelEditor => "Label",
+        OverlayKind::SessionRename => "Name",
+        OverlayKind::TreeSummaryEditor => "Instructions",
+        OverlayKind::OauthPrompt => "Reply",
+        _ => "Search",
+    });
+    let mut notes = Vec::new();
+    if state.overlay == OverlayKind::SessionPicker {
+        notes.push(format!(
+            "Sort {}  ·  {} sessions  ·  paths {}",
+            state.session_sort.label(),
+            if state.session_named_only {
+                "named"
+            } else {
+                "all"
+            },
+            if state.session_show_path {
+                "shown"
+            } else {
+                "hidden"
+            }
+        ));
+    }
+    if state.overlay == OverlayKind::SessionDeleteConfirm {
+        notes.push(format!(
+            "Delete {}? This cannot be undone.",
+            state.pending_session_path.as_deref().unwrap_or_default()
+        ));
+    }
+    if let Some(permission) = &state.pending_permission
+        && state.overlay == OverlayKind::Permission
+    {
+        notes.push(format!("Tool: {}", permission.tool));
+        notes.push(permission.reason.clone());
+    }
+    if let Some(oauth) = &state.pending_oauth
+        && matches!(
+            state.overlay,
+            OverlayKind::OauthPrompt | OverlayKind::OauthSelect
+        )
+    {
+        notes.push(oauth.message.clone());
+    }
+    let items = state.overlay_items();
+    let filtered_models = state.filtered_models();
+    let subagent_inherit_visible = state.overlay == OverlayKind::SubagentModelPicker
+        && (state.overlay_query.is_empty()
+            || "inherit parent (default)".contains(&state.overlay_query.to_ascii_lowercase()));
+    let mut rows = if state.overlay == OverlayKind::Settings {
+        settings_rows(state)
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let mut row = PickerRow::item(index, item.clone());
+                let row_model = match state.overlay {
+                    OverlayKind::ModelPicker | OverlayKind::ScopedModels => {
+                        filtered_models.get(index).copied()
+                    }
+                    OverlayKind::SubagentModelPicker => index
+                        .checked_sub(usize::from(subagent_inherit_visible))
+                        .and_then(|model_index| filtered_models.get(model_index).copied()),
+                    _ => None,
+                };
+                if let Some(model) = row_model {
+                    row.description = model
+                        .id
+                        .split_once('/')
+                        .map_or("unknown", |(provider, _)| provider)
+                        .to_string();
+                }
+                row.current = match state.overlay {
+                    OverlayKind::ModelPicker => {
+                        row_model.is_some_and(|model| model.display_name == state.model)
+                    }
+                    OverlayKind::SubagentModelPicker => {
+                        match state.runtime_settings.subagent_model.as_deref() {
+                            None => row_model.is_none() && item == "Inherit parent (default)",
+                            Some(id) => row_model.is_some_and(|model| model.id == id),
+                        }
+                    }
+                    OverlayKind::SessionPicker => state
+                        .filtered_sessions()
+                        .get(index)
+                        .is_some_and(|session| session.current),
+                    _ => false,
+                };
+                if state.overlay == OverlayKind::ScopedModels {
+                    row.checked = Some(item.starts_with("[✓]"));
+                    row.label = item
+                        .strip_prefix("[✓] ")
+                        .or_else(|| item.strip_prefix("[ ] "))
+                        .unwrap_or(item)
+                        .to_string();
+                }
+                if state.overlay == OverlayKind::CommandPalette {
+                    let parts = item.split("  ·  ").collect::<Vec<_>>();
+                    row.label = parts.first().copied().unwrap_or(item).to_string();
+                    if parts.len() == 3 {
+                        row.right = parts[1].to_string();
+                        row.description = parts[2].to_string();
+                    } else if parts.len() == 2 {
+                        row.description = parts[1].to_string();
+                    }
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    if state.overlay == OverlayKind::SessionPicker && rows.is_empty() {
+        notes.push(if state.session_named_only {
+            "No named sessions. Ctrl+N shows all sessions.".into()
+        } else {
+            "No sessions found.".into()
+        });
+    }
+    if state.overlay == OverlayKind::SessionDeleteConfirm {
+        rows.push(PickerRow::item(0, "Delete session"));
+    }
+    let footer = match state.overlay {
+        OverlayKind::SessionPicker => {
+            "↑/↓ navigate · Enter open · Ctrl+S sort · Ctrl+N named · Ctrl+P paths · Ctrl+R rename · Ctrl+D delete · Esc close"
+        }
+        OverlayKind::ScopedModels => "↑/↓ navigate · Space toggle · Enter apply · Esc back",
+        OverlayKind::Settings => "↑/↓ navigate · Space/Enter change · Esc close",
+        OverlayKind::WorkflowPreview => "↑/↓ scroll · Enter use workflow · Esc back",
+        OverlayKind::SessionDeleteConfirm => "Enter delete · Esc cancel",
+        _ => "↑/↓ navigate · Enter confirm · Esc close",
+    };
+    GenericPickerData {
+        title,
+        query_label,
+        notes,
+        rows,
+        footer,
+        max_width: if state.overlay == OverlayKind::WorkflowPreview {
+            110
+        } else {
+            92
+        },
+        max_height: if state.overlay == OverlayKind::WorkflowPreview {
+            30
+        } else {
+            24
+        },
+    }
+}
+
+fn settings_rows(state: &AppState) -> Vec<PickerRow> {
+    let mut rows = vec![PickerRow::header("Agent behavior")];
+    let values = [
+        (
+            "Steering delivery",
+            state.runtime_settings.steering_mode.as_str(),
+            "How immediate steering messages are drained",
+        ),
+        (
+            "Follow-up delivery",
+            state.runtime_settings.follow_up_mode.as_str(),
+            "How queued next-turn prompts are drained",
+        ),
+        (
+            "Auto compaction",
+            if state.runtime_settings.auto_compaction {
+                "on"
+            } else {
+                "off"
+            },
+            "Compact context automatically near the model limit",
+        ),
+        (
+            "Default project trust",
+            state.runtime_settings.default_project_trust.as_str(),
+            "Default policy for project-local resources",
+        ),
+        (
+            "Current project trusted",
+            if state.runtime_settings.project_trusted {
+                "yes"
+            } else {
+                "no"
+            },
+            "Allow this project's agents and workflows",
+        ),
+    ];
+    rows.extend(
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, value, description))| {
+                let mut row = PickerRow::item(index, label);
+                row.right = value.into();
+                row.description = description.into();
+                row
+            }),
+    );
+    rows.push(PickerRow::header("Models"));
+    let mut scoped = PickerRow::item(5, "Scoped models");
+    scoped.right = state.runtime_settings.enabled_models.len().to_string();
+    scoped.description = "Limit model cycling and selection".into();
+    rows.push(scoped);
+    let mut subagent = PickerRow::item(6, "Subagent model");
+    subagent.right = state
+        .runtime_settings
+        .subagent_model
+        .as_deref()
+        .unwrap_or("inherit parent")
+        .into();
+    subagent.description = "Default model for native delegated tasks".into();
+    rows.push(subagent);
+    rows
+}
+
 fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
     let theme = Theme::GROK_NIGHT;
     let Some(image) = state.viewed_image() else {
@@ -326,14 +627,7 @@ fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
         height,
     );
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .title(" Image attachment ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent).bg(theme.background))
-            .style(Style::default().fg(theme.foreground).bg(theme.background)),
-        area,
-    );
+    frame.render_widget(picker::modal_block("Image attachment", theme), area);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -440,14 +734,7 @@ fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
         height,
     );
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .title(" Edit pasted text ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent).bg(theme.background))
-            .style(Style::default().fg(theme.foreground).bg(theme.background)),
-        area,
-    );
+    frame.render_widget(picker::modal_block("Edit pasted text", theme), area);
 
     let content_width = usize::from(area.width.saturating_sub(8)).max(1);
     let rows = paste_editor_rows(&state.overlay_query, content_width);
@@ -652,7 +939,7 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
     let max_rows = usize::from(frame_area.height.saturating_sub(10)).max(1);
     let start = centered_window(state.overlay_selected, entries.len(), max_rows);
     let end = (start + max_rows).min(entries.len());
-    let height = (end.saturating_sub(start) + 8) as u16;
+    let height = (end.saturating_sub(start) + 7) as u16;
     let area = centered(
         frame_area,
         frame_area.width.saturating_sub(2).max(1),
@@ -661,12 +948,6 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            " Session Tree",
-            Style::default()
-                .fg(theme.foreground)
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(Span::styled(
             " ↑/↓ navigate  ·  ←/→ page  ·  Ctrl+←/→ fold/jump  ·  Ctrl+O filter  ·  Shift+L label  ·  Shift+T time",
             Style::default().fg(theme.muted),
@@ -722,11 +1003,21 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
         Style::default().fg(theme.muted),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().bg(theme.background));
+    let block = picker::modal_block("Session Tree", theme);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    picker::render_scrollbar_for(
+        frame,
+        Rect::new(
+            area.x + 1,
+            area.y + 4,
+            area.width.saturating_sub(2),
+            end.saturating_sub(start) as u16,
+        ),
+        start,
+        end.saturating_sub(start),
+        entries.len(),
+        theme,
+    );
 }
 
 fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
@@ -741,7 +1032,7 @@ fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
         .max(1);
     let start = centered_window(state.overlay_selected, entries.len(), max_messages);
     let end = (start + max_messages).min(entries.len());
-    let height = (end.saturating_sub(start) * 3 + 7) as u16;
+    let height = (end.saturating_sub(start) * 3 + 6) as u16;
     let area = centered(
         frame_area,
         frame_area.width.saturating_sub(2).max(1),
@@ -750,12 +1041,6 @@ fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            " Fork from Message",
-            Style::default()
-                .fg(theme.foreground)
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(Span::styled(
             " Select a user message to copy the active path up to that point into a new session",
             Style::default().fg(theme.muted),
@@ -790,11 +1075,21 @@ fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
             Style::default().fg(theme.muted),
         )));
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().bg(theme.background));
+    let block = picker::modal_block("Fork from Message", theme);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    picker::render_scrollbar_for(
+        frame,
+        Rect::new(
+            area.x + 1,
+            area.y + 3,
+            area.width.saturating_sub(2),
+            end.saturating_sub(start).saturating_mul(3) as u16,
+        ),
+        start,
+        end.saturating_sub(start),
+        entries.len(),
+        theme,
+    );
 }
 
 fn centered_window(selected: usize, count: usize, capacity: usize) -> usize {
@@ -1072,16 +1367,17 @@ fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, us
     if matches.is_empty() {
         return None;
     }
-    let width = 72.min(usize::from(frame_area.width.saturating_sub(6).max(1))) as u16;
-    let capacity = usize::from(frame_area.height.saturating_sub(8)).clamp(4, 10);
+    let agent = AgentLayout::compute(frame_area, state);
+    let width = agent.prompt.width;
+    let available_above = agent.prompt.y.saturating_sub(frame_area.y);
+    let capacity = usize::from(available_above.saturating_sub(2)).clamp(1, 10);
     let start = centered_window(state.overlay_selected, matches.len(), capacity);
     let end = (start + capacity).min(matches.len());
     let height = (end.saturating_sub(start) + 2) as u16;
-    let composer_y = frame_area.bottom().saturating_sub(5);
     Some((
         Rect::new(
-            3.min(frame_area.width.saturating_sub(1)),
-            composer_y.saturating_sub(height),
+            agent.prompt.x,
+            agent.prompt.y.saturating_sub(height),
             width,
             height,
         ),
@@ -1090,7 +1386,8 @@ fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, us
     ))
 }
 
-fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
+#[allow(dead_code)]
+fn render_slash_suggestions_legacy(frame: &mut Frame<'_>, state: &AppState) {
     let Some((area, start, end)) = slash_suggestion_area(state, frame.area()) else {
         return;
     };
@@ -1163,13 +1460,13 @@ pub fn item_at_position(
             let max_rows = usize::from(height.saturating_sub(10)).max(1);
             let start = centered_window(state.overlay_selected, entries.len(), max_rows);
             let end = (start + max_rows).min(entries.len());
-            let area_height = (end.saturating_sub(start) + 8) as u16;
+            let area_height = (end.saturating_sub(start) + 7) as u16;
             let area = centered(
                 frame_area,
                 width.saturating_sub(2).max(1),
                 area_height.min(height.saturating_sub(1).max(1)),
             );
-            let first_row = area.y.saturating_add(5);
+            let first_row = area.y.saturating_add(4);
             let offset = usize::from(row.saturating_sub(first_row));
             (row >= first_row && offset < end.saturating_sub(start)).then_some(start + offset)
         }
@@ -1179,29 +1476,116 @@ pub fn item_at_position(
                 .max(1);
             let start = centered_window(state.overlay_selected, entries.len(), max_messages);
             let end = (start + max_messages).min(entries.len());
-            let area_height = (end.saturating_sub(start) * 3 + 7) as u16;
+            let area_height = (end.saturating_sub(start) * 3 + 6) as u16;
             let area = centered(
                 frame_area,
                 width.saturating_sub(2).max(1),
                 area_height.min(height.saturating_sub(1).max(1)),
             );
-            let first_row = area.y.saturating_add(4);
+            let first_row = area.y.saturating_add(3);
             let offset = usize::from(row.saturating_sub(first_row));
             let item = offset / 3;
             (row >= first_row && item < end.saturating_sub(start)).then_some(start + item)
         }
         _ => {
-            let items = state.overlay_items();
-            let overlay_width = frame_area.width.saturating_sub(6).clamp(30, 72);
-            let (area, first_row, start, end) =
-                generic_picker_layout(state, frame_area, items.len(), overlay_width);
-            if column <= area.x || column >= area.right().saturating_sub(1) || row < first_row {
-                return None;
-            }
-            let offset = usize::from(row - first_row);
-            (start + offset < end).then_some(start + offset)
+            let data = generic_picker_data(state);
+            let display_query = if state.overlay == OverlayKind::OauthPrompt {
+                "•".repeat(state.overlay_query.chars().count())
+            } else {
+                state.overlay_query.clone()
+            };
+            let spec = PickerSpec {
+                title: data.title,
+                query: data
+                    .query_label
+                    .map(|label| (label, display_query.as_str())),
+                notes: &data.notes,
+                rows: &data.rows,
+                footer: data.footer,
+                max_width: data.max_width,
+                max_height: data.max_height,
+            };
+            let layout = picker::layout(frame_area, &spec, state.overlay_selected);
+            picker::item_at(layout, &data.rows, column, row)
         }
     }
+}
+
+fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
+    let Some((area, start, end)) = slash_suggestion_area(state, frame.area()) else {
+        return;
+    };
+    let matches = state.slash_suggestions();
+    let theme = Theme::GROK_NIGHT;
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg_light)),
+        area,
+    );
+    let count_label = matches.len().to_string();
+    let divider_fill = usize::from(area.width).saturating_sub(count_label.width() + 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("─".repeat(divider_fill), Style::default().fg(theme.subtle)),
+            Span::styled(format!(" {count_label}"), Style::default().fg(theme.muted)),
+        ])),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let visible = &matches[start..end];
+    let label_width = visible
+        .iter()
+        .map(|(command, _)| command.width())
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(area.width) * 3 / 5)
+        .min(40);
+    let mut lines = Vec::with_capacity(end.saturating_sub(start));
+    for (relative, (command, description)) in visible.iter().enumerate() {
+        let index = start + relative;
+        let selected = index == state.overlay_selected;
+        let marker = if selected { "❯ " } else { "  " };
+        let bg = if selected {
+            theme.bg_highlight
+        } else {
+            theme.bg_light
+        };
+        let command_display = truncate_overlay_text(command, label_width);
+        let padding = label_width.saturating_sub(command_display.width());
+        let desc_width = usize::from(area.width).saturating_sub(label_width + 5);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{command_display}{}  ", " ".repeat(padding)),
+                Style::default()
+                    .fg(theme.foreground)
+                    .bg(bg)
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                truncate_overlay_text(description, desc_width),
+                Style::default().fg(theme.muted).bg(bg),
+            ),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(usize::from(area.width)),
+            Style::default().fg(theme.subtle),
+        )),
+        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+    );
 }
 
 fn overlay_has_query(overlay: OverlayKind) -> bool {
