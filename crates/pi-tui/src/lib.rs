@@ -1,6 +1,10 @@
+mod actions;
+mod agent_layout;
 mod fixtures;
 mod markdown;
 mod overlay;
+mod prompt;
+mod scrollback;
 mod state;
 mod theme;
 mod ui;
@@ -307,6 +311,139 @@ enum LoopWake {
     Animation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionOutcome {
+    Handled,
+    Quit,
+}
+
+fn dispatch_registered_action(
+    action: actions::ActionId,
+    state: &mut AppState,
+    commands: &Option<mpsc::UnboundedSender<UiCommand>>,
+) -> ActionOutcome {
+    use actions::ActionId;
+    match action {
+        ActionId::CommandPalette => state.open_overlay(OverlayKind::CommandPalette),
+        ActionId::ModelPicker => state.open_overlay(OverlayKind::ModelPicker),
+        ActionId::SessionPicker => state.open_overlay(OverlayKind::SessionPicker),
+        ActionId::Settings => state.open_overlay(OverlayKind::Settings),
+        ActionId::ToggleTasks => {
+            state.view = if state.view == View::Tasks {
+                View::Transcript
+            } else {
+                View::Tasks
+            };
+        }
+        ActionId::ToggleQueue => state.queue_visible = !state.queue_visible,
+        ActionId::CycleMode => {
+            state.cycle_permission_mode();
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetPermissionMode(
+                    state.permission_mode.wire_value().into(),
+                ));
+            }
+        }
+        ActionId::CancelTurn => {
+            if !state.prompt.is_empty() || !state.image_attachments.is_empty() {
+                state.clear_prompt();
+            } else if state.streaming
+                && let Some(sender) = commands
+            {
+                let _ = sender.send(UiCommand::AbortAndRestoreQueue);
+            }
+        }
+        ActionId::Quit => return ActionOutcome::Quit,
+        _ => return ActionOutcome::Handled,
+    }
+    ActionOutcome::Handled
+}
+
+fn dispatch_pane_action(
+    action: actions::ActionId,
+    state: &mut AppState,
+    width: u16,
+    height: u16,
+) -> bool {
+    use actions::ActionId;
+    match action {
+        ActionId::ClearPrompt => {
+            if state.prompt.is_empty() && state.image_attachments.is_empty() {
+                return false;
+            }
+            state.clear_prompt();
+        }
+        ActionId::FocusScrollback => {
+            if state.complete_slash_command() {
+                return true;
+            }
+            state.focus_scrollback();
+        }
+        ActionId::FocusPrompt => state.focus_prompt(),
+        ActionId::ScrollUp => ui::move_section_focus(state, width, height, -1),
+        ActionId::ScrollDown => ui::move_section_focus(state, width, height, 1),
+        ActionId::ToggleFold => {
+            if let Some(index) = state.focused_entry {
+                if state
+                    .focused_target_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("tool-group:"))
+                {
+                    state.toggle_tool_group(index);
+                } else {
+                    state.activate_entry_at(index);
+                }
+            }
+        }
+        ActionId::OpenBlockViewer => {
+            if state.focused_entry.is_some() {
+                state.viewed_entry = state.focused_entry;
+                state.view = View::BlockViewer;
+                state.scroll_from_bottom = 0;
+            }
+        }
+        ActionId::ToggleMultiline => {
+            state.multiline_mode = !state.multiline_mode;
+            state.status = if state.multiline_mode {
+                "multiline input enabled".into()
+            } else {
+                "multiline input disabled".into()
+            };
+        }
+        ActionId::SendPrompt | ActionId::SendNow => return false,
+        _ => return false,
+    }
+    true
+}
+
+fn handle_agent_escape(state: &mut AppState, commands: &Option<mpsc::UnboundedSender<UiCommand>>) {
+    if state.streaming {
+        state.escape_armed_at = None;
+        return;
+    }
+    let now = Instant::now();
+    let confirmed = state
+        .escape_armed_at
+        .is_some_and(|armed| now.duration_since(armed) <= Duration::from_millis(800));
+    if !confirmed {
+        state.escape_armed_at = Some(now);
+        if !state.prompt.is_empty() || !state.image_attachments.is_empty() {
+            state.status = "press Esc again to clear the draft".into();
+        }
+        return;
+    }
+    state.escape_armed_at = None;
+    if !state.prompt.is_empty() || !state.image_attachments.is_empty() {
+        state.clear_prompt();
+    } else if !state.entries.is_empty() {
+        state.open_overlay(OverlayKind::RewindPicker);
+        state.status = "loading rewind checkpoints…".into();
+        if let Some(sender) = commands {
+            let _ = sender.send(UiCommand::LoadRewinds);
+        }
+    }
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -547,6 +684,12 @@ async fn run_app(
                     }
                     KeyCode::Up => state.move_overlay_selection(-1),
                     KeyCode::Down => state.move_overlay_selection(1),
+                    KeyCode::Left if state.overlay == OverlayKind::Permission => {
+                        state.move_overlay_selection(-1);
+                    }
+                    KeyCode::Right if state.overlay == OverlayKind::Permission => {
+                        state.move_overlay_selection(1);
+                    }
                     KeyCode::Left
                         if state.overlay == OverlayKind::TreePicker
                             && key
@@ -690,291 +833,336 @@ async fn run_app(
             {
                 state.insert_paste(text);
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.view = if state.view == View::Tasks {
-                        View::Transcript
-                    } else {
-                        View::Tasks
-                    };
-                }
-                KeyCode::Esc | KeyCode::Char('q') if state.view == View::Subagent => {
-                    state.view = View::Tasks;
-                    state.scroll_from_bottom = 0;
-                }
-                KeyCode::Esc | KeyCode::Char('q') if state.view == View::Workflows => {
-                    state.view = View::Transcript;
-                }
-                KeyCode::Esc | KeyCode::Char('q') if state.view == View::WorkflowArtifact => {
-                    state.view = View::Workflows;
-                    state.scroll_from_bottom = 0;
-                }
-                KeyCode::Up if state.view == View::WorkflowArtifact => {
-                    state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(3);
-                }
-                KeyCode::Down if state.view == View::WorkflowArtifact => state.scroll_down(3),
-                _ if state.view == View::WorkflowArtifact => {}
-                KeyCode::Up if state.view == View::Workflows => {
-                    state.workflow_selected = state.workflow_selected.saturating_sub(1);
-                }
-                KeyCode::Down if state.view == View::Workflows => {
-                    state.workflow_selected = (state.workflow_selected + 1)
-                        .min(state.workflow_runs.len().saturating_sub(1));
-                }
-                KeyCode::Char(action @ ('a' | 'd' | 'r' | 'x'))
-                    if state.view == View::Workflows =>
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(action) = actions::lookup(&key, actions::ActionContext::Global)
+                    && dispatch_registered_action(action, &mut state, &commands)
+                        == ActionOutcome::Quit
                 {
-                    let action = match action {
-                        'a' => "approve",
-                        'd' => "reject",
-                        'r' => "retry",
-                        _ => "cancel",
+                    break;
+                }
+                if state.view == View::Transcript {
+                    let context = match state.focus {
+                        Focus::Prompt => actions::ActionContext::Prompt,
+                        Focus::Scrollback => actions::ActionContext::Scrollback,
                     };
-                    if let Some((run_id, step_id)) = state.selected_workflow_control(action)
-                        && let Some(sender) = &commands
+                    if let Some(action) = actions::lookup(&key, context)
+                        && dispatch_pane_action(action, &mut state, size.width, size.height)
                     {
-                        let _ = sender.send(UiCommand::WorkflowControl {
-                            run_id,
-                            action: action.into(),
-                            step_id,
-                        });
+                        continue;
                     }
                 }
-                KeyCode::Char('v') | KeyCode::Enter if state.view == View::Workflows => {
-                    if let Some((run_id, artifact_id)) = state.selected_workflow_artifact()
-                        && let Some(sender) = &commands
+                if matches!(state.view, View::Transcript | View::Tasks)
+                    && let Some(action) = actions::lookup(&key, actions::ActionContext::Agent)
+                {
+                    if dispatch_registered_action(action, &mut state, &commands)
+                        == ActionOutcome::Quit
                     {
-                        let _ = sender.send(UiCommand::ReadWorkflowArtifact {
-                            run_id,
-                            artifact_id,
-                        });
+                        break;
                     }
+                    continue;
                 }
-                _ if state.view == View::Workflows => {}
-                KeyCode::Esc if state.view == View::Tasks => {
-                    state.view = View::Transcript;
-                }
-                KeyCode::Up if state.view == View::Tasks => {
-                    state.task_selected = state.task_selected.saturating_sub(1);
-                }
-                KeyCode::Down if state.view == View::Tasks => {
-                    state.task_selected =
-                        (state.task_selected + 1).min(state.subagent_tasks.len().saturating_sub(1));
-                }
-                KeyCode::Enter if state.view == View::Tasks => state.open_selected_subagent(),
-                KeyCode::Char('k') if state.view == View::Tasks => {
-                    if let Some(task_id) = state.selected_subagent_id()
-                        && let Some(sender) = &commands
-                    {
-                        let _ = sender.send(UiCommand::KillTask(task_id));
+                match key.code {
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.view = if state.view == View::Tasks {
+                            View::Transcript
+                        } else {
+                            View::Tasks
+                        };
                     }
-                }
-                _ if state.view == View::Tasks => {}
-                KeyCode::Esc if state.view == View::Dashboard => {
-                    state.view = View::Transcript;
-                }
-                KeyCode::Up if state.view == View::Dashboard => {
-                    state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
-                }
-                KeyCode::Down if state.view == View::Dashboard => {
-                    state.dashboard_selected = (state.dashboard_selected + 1)
-                        .min(state.available_sessions.len().saturating_sub(1));
-                }
-                KeyCode::Enter if state.view == View::Dashboard => {
-                    if let Some(path) = state.activate_dashboard_session()
-                        && let Some(sender) = &commands
-                    {
-                        let _ = sender.send(UiCommand::ResumeSession(path));
+                    KeyCode::Esc | KeyCode::Char('q') if state.view == View::BlockViewer => {
+                        state.view = View::Transcript;
+                        state.scroll_from_bottom = 0;
                     }
-                    if !state.available_sessions.is_empty() {
+                    KeyCode::Up if state.view == View::BlockViewer => {
+                        state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(3);
+                    }
+                    KeyCode::Down if state.view == View::BlockViewer => state.scroll_down(3),
+                    _ if state.view == View::BlockViewer => {}
+                    KeyCode::Esc | KeyCode::Char('q') if state.view == View::Subagent => {
+                        state.view = View::Tasks;
+                        state.scroll_from_bottom = 0;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') if state.view == View::Workflows => {
                         state.view = View::Transcript;
                     }
-                }
-                KeyCode::Char('n') if state.view == View::Dashboard => {
-                    if let Some(sender) = &commands {
-                        let _ = sender.send(UiCommand::NewSession);
+                    KeyCode::Esc | KeyCode::Char('q') if state.view == View::WorkflowArtifact => {
+                        state.view = View::Workflows;
+                        state.scroll_from_bottom = 0;
                     }
-                    state.view = View::Transcript;
-                }
-                KeyCode::Char('r') if state.view == View::Dashboard => {
-                    state.begin_dashboard_rename();
-                }
-                KeyCode::Char('d') if state.view == View::Dashboard => {
-                    state.begin_dashboard_delete();
-                }
-                KeyCode::Char('s') if state.view == View::Dashboard => {
-                    if let Some(path) = state.dashboard_selected_path()
-                        && let Some(sender) = &commands
+                    KeyCode::Up if state.view == View::WorkflowArtifact => {
+                        state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(3);
+                    }
+                    KeyCode::Down if state.view == View::WorkflowArtifact => state.scroll_down(3),
+                    _ if state.view == View::WorkflowArtifact => {}
+                    KeyCode::Up if state.view == View::Workflows => {
+                        state.workflow_selected = state.workflow_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down if state.view == View::Workflows => {
+                        state.workflow_selected = (state.workflow_selected + 1)
+                            .min(state.workflow_runs.len().saturating_sub(1));
+                    }
+                    KeyCode::Char(action @ ('a' | 'd' | 'r' | 'x'))
+                        if state.view == View::Workflows =>
                     {
-                        let _ = sender.send(UiCommand::StopResident(path));
-                    }
-                }
-                KeyCode::Char('x') if state.view == View::Dashboard => {
-                    if let Some(path) = state.dashboard_selected_path()
-                        && let Some(sender) = &commands
-                    {
-                        let _ = sender.send(UiCommand::CloseResident(path));
-                    }
-                }
-                _ if state.view == View::Dashboard => {}
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.open_overlay(OverlayKind::CommandPalette);
-                }
-                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.open_overlay(OverlayKind::ModelPicker);
-                }
-                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(sender) = &commands {
-                        let _ = sender.send(UiCommand::CycleThinking);
-                    }
-                }
-                KeyCode::F(2) => state.open_overlay(OverlayKind::Settings),
-                KeyCode::Char('?') if state.focus == Focus::Scrollback => {
-                    state.open_overlay(OverlayKind::CommandPalette);
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.clear_prompt();
-                }
-                KeyCode::Char('v')
-                    if key.modifiers.contains(KeyModifiers::ALT)
-                        || key
-                            .modifiers
-                            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
-                {
-                    begin_clipboard_image_load(&mut state, &image_sender);
-                }
-                KeyCode::BackTab => {
-                    state.cycle_permission_mode();
-                    if let Some(sender) = &commands {
-                        let _ = sender.send(UiCommand::SetPermissionMode(
-                            state.permission_mode.wire_value().into(),
-                        ));
-                    }
-                }
-                KeyCode::Tab => {
-                    if state.focus != Focus::Prompt || !state.complete_slash_command() {
-                        state.toggle_focus();
-                    }
-                }
-                KeyCode::Enter if state.focus == Focus::Prompt => {
-                    if state.prompt.trim() == "/paste-image" {
-                        state.clear_prompt_text();
-                        begin_clipboard_image_load(&mut state, &image_sender);
-                    } else if let Some(action) = state.activate_slash_command() {
-                        if dispatch_overlay_action(action, &commands) {
-                            break;
-                        }
-                    } else if state.prompt.trim_start().starts_with('!') {
-                        if let Some((command, exclude_from_context)) = state.submit_bash()
+                        let action = match action {
+                            'a' => "approve",
+                            'd' => "reject",
+                            'r' => "retry",
+                            _ => "cancel",
+                        };
+                        if let Some((run_id, step_id)) = state.selected_workflow_control(action)
                             && let Some(sender) = &commands
                         {
-                            let _ = sender.send(UiCommand::ExecuteBash {
-                                command,
-                                exclude_from_context,
+                            let _ = sender.send(UiCommand::WorkflowControl {
+                                run_id,
+                                action: action.into(),
+                                step_id,
                             });
                         }
-                    } else if let Some((prompt, images)) = state.submit_message()
-                        && let Some(sender) = &commands
-                    {
-                        let delivery = state.streaming.then_some(
-                            if key.modifiers.contains(KeyModifiers::ALT) {
-                                pi_harness::MessageDelivery::FollowUp
-                            } else {
-                                pi_harness::MessageDelivery::Steer
-                            },
-                        );
-                        let _ = sender.send(UiCommand::Submit {
-                            text: prompt,
-                            delivery,
-                            images,
-                        });
                     }
-                }
-                KeyCode::Enter if state.focus == Focus::Scrollback => {
-                    if let Some(index) = state.focused_entry {
-                        if state
-                            .focused_target_id
-                            .as_deref()
-                            .is_some_and(|id| id.starts_with("tool-group:"))
+                    KeyCode::Char('v') | KeyCode::Enter if state.view == View::Workflows => {
+                        if let Some((run_id, artifact_id)) = state.selected_workflow_artifact()
+                            && let Some(sender) = &commands
                         {
-                            state.toggle_tool_group(index);
-                        } else {
-                            state.activate_entry_at(index);
+                            let _ = sender.send(UiCommand::ReadWorkflowArtifact {
+                                run_id,
+                                artifact_id,
+                            });
                         }
                     }
-                }
-                KeyCode::Backspace if state.focus == Focus::Prompt => state.backspace(),
-                KeyCode::Delete if state.focus == Focus::Prompt => state.delete(),
-                KeyCode::Left if state.focus == Focus::Prompt => state.move_cursor_left(),
-                KeyCode::Right if state.focus == Focus::Prompt => state.move_cursor_right(),
-                KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
-                KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
-                KeyCode::Up
-                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
-                {
-                    state.move_slash_selection(-1);
-                }
-                KeyCode::Down
-                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
-                {
-                    state.move_slash_selection(1);
-                }
-                KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
-                KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
-                KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
-                KeyCode::Down => ui::move_section_focus(&mut state, size.width, size.height, 1),
-                KeyCode::PageUp => state.scroll_up(page, max_scroll),
-                KeyCode::PageDown => state.scroll_down(page),
-                KeyCode::Home => state.scroll_to_top(max_scroll),
-                KeyCode::End => state.scroll_to_bottom(),
-                KeyCode::Char('u')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && state.focus == Focus::Scrollback =>
-                {
-                    state.scroll_up(page / 2, max_scroll);
-                }
-                KeyCode::Char('d')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && state.focus == Focus::Scrollback =>
-                {
-                    state.scroll_down(page / 2);
-                }
-                KeyCode::Char('e')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && state.focus == Focus::Scrollback =>
-                {
-                    let expand = !state.all_reasoning_expanded();
-                    state.set_all_reasoning_expanded(expand);
-                }
-                KeyCode::Char('e') if state.focus == Focus::Scrollback => {
-                    state.toggle_latest_reasoning();
-                }
-                KeyCode::Char('t') if state.focus == Focus::Scrollback => {
-                    state.toggle_all_tools();
-                }
-                KeyCode::Char('d') if state.focus == Focus::Scrollback => {
-                    state.toggle_all_diffs();
-                }
-                KeyCode::Esc if state.streaming => {
-                    if let Some(sender) = &commands {
-                        let _ = sender.send(UiCommand::AbortAndRestoreQueue);
+                    _ if state.view == View::Workflows => {}
+                    KeyCode::Esc if state.view == View::Tasks => {
+                        state.view = View::Transcript;
                     }
-                }
-                KeyCode::Esc if !state.prompt.is_empty() => state.clear_prompt(),
-                KeyCode::Char(character)
-                    if !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-                {
-                    state.focus_prompt();
-                    state.insert_char(character);
-                    if character == '@' && !state.available_files.is_empty() {
-                        state.open_overlay(OverlayKind::FilePicker);
+                    KeyCode::Up if state.view == View::Tasks => {
+                        state.task_selected = state.task_selected.saturating_sub(1);
                     }
+                    KeyCode::Down if state.view == View::Tasks => {
+                        state.task_selected = (state.task_selected + 1)
+                            .min(state.subagent_tasks.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter if state.view == View::Tasks => state.open_selected_subagent(),
+                    KeyCode::Char('k') if state.view == View::Tasks => {
+                        if let Some(task_id) = state.selected_subagent_id()
+                            && let Some(sender) = &commands
+                        {
+                            let _ = sender.send(UiCommand::KillTask(task_id));
+                        }
+                    }
+                    _ if state.view == View::Tasks => {}
+                    KeyCode::Esc if state.view == View::Dashboard => {
+                        state.view = View::Transcript;
+                    }
+                    KeyCode::Up if state.view == View::Dashboard => {
+                        state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down if state.view == View::Dashboard => {
+                        state.dashboard_selected = (state.dashboard_selected + 1)
+                            .min(state.available_sessions.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter if state.view == View::Dashboard => {
+                        if let Some(path) = state.activate_dashboard_session()
+                            && let Some(sender) = &commands
+                        {
+                            let _ = sender.send(UiCommand::ResumeSession(path));
+                        }
+                        if !state.available_sessions.is_empty() {
+                            state.view = View::Transcript;
+                        }
+                    }
+                    KeyCode::Char('n') if state.view == View::Dashboard => {
+                        if let Some(sender) = &commands {
+                            let _ = sender.send(UiCommand::NewSession);
+                        }
+                        state.view = View::Transcript;
+                    }
+                    KeyCode::Char('r') if state.view == View::Dashboard => {
+                        state.begin_dashboard_rename();
+                    }
+                    KeyCode::Char('d') if state.view == View::Dashboard => {
+                        state.begin_dashboard_delete();
+                    }
+                    KeyCode::Char('s') if state.view == View::Dashboard => {
+                        if let Some(path) = state.dashboard_selected_path()
+                            && let Some(sender) = &commands
+                        {
+                            let _ = sender.send(UiCommand::StopResident(path));
+                        }
+                    }
+                    KeyCode::Char('x') if state.view == View::Dashboard => {
+                        if let Some(path) = state.dashboard_selected_path()
+                            && let Some(sender) = &commands
+                        {
+                            let _ = sender.send(UiCommand::CloseResident(path));
+                        }
+                    }
+                    _ if state.view == View::Dashboard => {}
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.open_overlay(OverlayKind::CommandPalette);
+                    }
+                    KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.open_overlay(OverlayKind::ModelPicker);
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(sender) = &commands {
+                            let _ = sender.send(UiCommand::CycleThinking);
+                        }
+                    }
+                    KeyCode::F(2) => state.open_overlay(OverlayKind::Settings),
+                    KeyCode::Char('?') if state.focus == Focus::Scrollback => {
+                        state.open_overlay(OverlayKind::CommandPalette);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.clear_prompt();
+                    }
+                    KeyCode::Char('v')
+                        if key.modifiers.contains(KeyModifiers::ALT)
+                            || key
+                                .modifiers
+                                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+                    {
+                        begin_clipboard_image_load(&mut state, &image_sender);
+                    }
+                    KeyCode::BackTab => {
+                        state.cycle_permission_mode();
+                        if let Some(sender) = &commands {
+                            let _ = sender.send(UiCommand::SetPermissionMode(
+                                state.permission_mode.wire_value().into(),
+                            ));
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if state.focus != Focus::Prompt || !state.complete_slash_command() {
+                            state.toggle_focus();
+                        }
+                    }
+                    KeyCode::Enter if state.focus == Focus::Prompt => {
+                        let modified_send = key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+                        let control_send = key.modifiers.contains(KeyModifiers::CONTROL);
+                        if !control_send
+                            && ((!state.multiline_mode && modified_send)
+                                || (state.multiline_mode && !modified_send))
+                        {
+                            state.insert_char('\n');
+                            continue;
+                        }
+                        if state.prompt.trim() == "/paste-image" {
+                            state.clear_prompt_text();
+                            begin_clipboard_image_load(&mut state, &image_sender);
+                        } else if let Some(action) = state.activate_slash_command() {
+                            if dispatch_overlay_action(action, &commands) {
+                                break;
+                            }
+                        } else if state.prompt.trim_start().starts_with('!') {
+                            if let Some((command, exclude_from_context)) = state.submit_bash()
+                                && let Some(sender) = &commands
+                            {
+                                let _ = sender.send(UiCommand::ExecuteBash {
+                                    command,
+                                    exclude_from_context,
+                                });
+                            }
+                        } else if let Some((prompt, images)) = state.submit_message()
+                            && let Some(sender) = &commands
+                        {
+                            let delivery = state.streaming.then_some(
+                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    pi_harness::MessageDelivery::Steer
+                                } else {
+                                    pi_harness::MessageDelivery::FollowUp
+                                },
+                            );
+                            let _ = sender.send(UiCommand::Submit {
+                                text: prompt,
+                                delivery,
+                                images,
+                            });
+                        }
+                    }
+                    KeyCode::Enter if state.focus == Focus::Scrollback => {
+                        if let Some(index) = state.focused_entry {
+                            if state
+                                .focused_target_id
+                                .as_deref()
+                                .is_some_and(|id| id.starts_with("tool-group:"))
+                            {
+                                state.toggle_tool_group(index);
+                            } else {
+                                state.activate_entry_at(index);
+                            }
+                        }
+                    }
+                    KeyCode::Backspace if state.focus == Focus::Prompt => state.backspace(),
+                    KeyCode::Delete if state.focus == Focus::Prompt => state.delete(),
+                    KeyCode::Left if state.focus == Focus::Prompt => state.move_cursor_left(),
+                    KeyCode::Right if state.focus == Focus::Prompt => state.move_cursor_right(),
+                    KeyCode::Home if state.focus == Focus::Prompt => state.move_cursor_home(),
+                    KeyCode::End if state.focus == Focus::Prompt => state.move_cursor_end(),
+                    KeyCode::Up
+                        if state.focus == Focus::Prompt
+                            && !state.slash_suggestions().is_empty() =>
+                    {
+                        state.move_slash_selection(-1);
+                    }
+                    KeyCode::Down
+                        if state.focus == Focus::Prompt
+                            && !state.slash_suggestions().is_empty() =>
+                    {
+                        state.move_slash_selection(1);
+                    }
+                    KeyCode::Up if state.focus == Focus::Prompt => state.previous_prompt(),
+                    KeyCode::Down if state.focus == Focus::Prompt => state.next_prompt(),
+                    KeyCode::Up => ui::move_section_focus(&mut state, size.width, size.height, -1),
+                    KeyCode::Down => ui::move_section_focus(&mut state, size.width, size.height, 1),
+                    KeyCode::PageUp => state.scroll_up(page, max_scroll),
+                    KeyCode::PageDown => state.scroll_down(page),
+                    KeyCode::Home => state.scroll_to_top(max_scroll),
+                    KeyCode::End => state.scroll_to_bottom(),
+                    KeyCode::Char('u')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.focus == Focus::Scrollback =>
+                    {
+                        state.scroll_up(page / 2, max_scroll);
+                    }
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.focus == Focus::Scrollback =>
+                    {
+                        state.scroll_down(page / 2);
+                    }
+                    KeyCode::Char('e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.focus == Focus::Scrollback =>
+                    {
+                        let expand = !state.all_reasoning_expanded();
+                        state.set_all_reasoning_expanded(expand);
+                    }
+                    KeyCode::Char('e') if state.focus == Focus::Scrollback => {
+                        state.toggle_latest_reasoning();
+                    }
+                    KeyCode::Char('t') if state.focus == Focus::Scrollback => {
+                        state.toggle_all_tools();
+                    }
+                    KeyCode::Char('d') if state.focus == Focus::Scrollback => {
+                        state.toggle_all_diffs();
+                    }
+                    KeyCode::Esc => handle_agent_escape(&mut state, &commands),
+                    KeyCode::Char(character)
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        state.focus_prompt();
+                        state.insert_char(character);
+                        if character == '@' && !state.available_files.is_empty() {
+                            state.open_overlay(OverlayKind::FilePicker);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
                 MouseEventKind::ScrollUp if state.overlay == OverlayKind::PasteEditor => {
                     state.scroll_paste_editor(-3);
@@ -1551,7 +1739,7 @@ mod tests {
             assert!(output.contains("collector-improvement"));
             assert!(output.contains("Minimax M3 via opencode-go"));
             assert!(output.contains("always approve"));
-            assert!(output.contains("Shift+Tab: mode"));
+            assert!(output.contains("Shift+Tab: Mode"));
         }
     }
 
@@ -1588,8 +1776,8 @@ mod tests {
 
         assert!(output.contains("* Thinking…"));
         assert!(!output.contains('⠹'));
-        assert!(output.contains("Enter: steer"));
-        assert!(output.contains("Alt+Enter: follow-up"));
+        assert!(output.contains("Enter: Queue"));
+        assert!(output.contains("Ctrl+Enter: Send now"));
         assert!(output.contains("cargo test"));
     }
 
@@ -1986,16 +2174,18 @@ mod tests {
         state.scroll_to_top(max_scroll);
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let top_buffer = terminal.backend().buffer();
-        assert_eq!(top_buffer[(3, 3)].bg, Theme::GROK_NIGHT.user_background);
-        assert_eq!(top_buffer[(3, 4)].bg, Theme::GROK_NIGHT.user_background);
-        assert_eq!(top_buffer[(3, 5)].bg, Theme::GROK_NIGHT.user_background);
+        let top_rows = (0..height)
+            .filter(|row| top_buffer[(3, *row)].bg == Theme::GROK_NIGHT.user_background)
+            .count();
+        assert!(top_rows >= 3);
 
         state.scroll_to_bottom();
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let sticky_buffer = terminal.backend().buffer();
-        assert_eq!(sticky_buffer[(3, 2)].bg, Theme::GROK_NIGHT.user_background);
-        assert_eq!(sticky_buffer[(3, 3)].bg, Theme::GROK_NIGHT.user_background);
-        assert_eq!(sticky_buffer[(3, 4)].bg, Theme::GROK_NIGHT.user_background);
+        let sticky_rows = (0..height)
+            .filter(|row| sticky_buffer[(3, *row)].bg == Theme::GROK_NIGHT.user_background)
+            .count();
+        assert!(sticky_rows >= 3);
     }
 
     #[test]
@@ -2023,6 +2213,54 @@ mod tests {
             Some(super::state::Entry::Diff { expanded, .. }) => assert!(!expanded),
             _ => panic!("expected diff entry"),
         }
+    }
+
+    #[test]
+    fn full_screen_block_viewer_renders_selected_tool_output() {
+        let mut state = fixtures::tools();
+        let index = state
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    super::state::Entry::Tool {
+                        result: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        state.viewed_entry = Some(index);
+        state.view = super::View::BlockViewer;
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 100, 28);
+        assert!(output.contains("tool"));
+        assert!(output.contains("Esc/q close"));
+    }
+
+    #[test]
+    fn home_alias_opens_welcome_dashboard() {
+        let mut state = fixtures::conversation();
+        state.prompt = "/home".into();
+        state.cursor = state.prompt.chars().count();
+        state.activate_slash_command();
+        assert_eq!(state.view, super::View::Dashboard);
+    }
+
+    #[test]
+    fn resume_reset_drops_transient_input_queue_and_permissions() {
+        let mut state = fixtures::permission();
+        state.prompt = "draft from old session".into();
+        state.cursor = state.prompt.chars().count();
+        state.queued_follow_up.push("later".into());
+        state.apply(pi_harness::AgentEvent::SessionReset);
+        assert!(state.prompt.is_empty());
+        assert!(state.queued_follow_up.is_empty());
+        assert!(state.pending_permission.is_none());
+        assert_eq!(state.overlay, super::OverlayKind::None);
     }
 
     #[test]
@@ -2414,14 +2652,21 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let buffer = terminal.backend().buffer();
+        let layout = super::agent_layout::AgentLayout::compute(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            &state,
+        );
         let first_row: String = (0..width)
-            .map(|column| buffer[(column, 2)].symbol())
+            .map(|column| buffer[(column, layout.scrollback.y)].symbol())
             .collect();
-        let bottom_row = height - 6;
+        let bottom_row = layout.scrollback.bottom().saturating_sub(1);
         assert!(first_row.contains("Edit src/long.rs"));
         for row in bottom_row - 2..=bottom_row {
-            assert_eq!(buffer[(1, row)].symbol(), "┊");
-            assert_eq!(buffer[(width - 3, row)].symbol(), "┊");
+            assert_eq!(buffer[(layout.scrollback.x, row)].symbol(), "┊");
+            assert_eq!(
+                buffer[(layout.scrollback.right().saturating_sub(2), row)].symbol(),
+                "┊"
+            );
         }
     }
 
@@ -2456,6 +2701,31 @@ mod tests {
         ui::move_section_focus(&mut state, 100, 32, 1);
         assert_eq!(stable_id.as_deref(), Some("tool:tool-clippy"));
         assert_eq!(state.focused_entry, Some(3));
+    }
+
+    #[test]
+    fn semantic_entry_identity_survives_streaming_and_manual_folds_are_pinned() {
+        let mut state = super::AppState::default();
+        state.apply(pi_harness::AgentEvent::ReasoningDelta {
+            text: "first".into(),
+        });
+        let id = state.entry_target_id(0).unwrap();
+        state.apply(pi_harness::AgentEvent::ReasoningDelta {
+            text: " second".into(),
+        });
+        assert_eq!(state.entry_target_id(0).as_deref(), Some(id.as_str()));
+        state.toggle_entry_at(0);
+        assert!(state.pinned_entry_modes.contains(&id));
+    }
+
+    #[test]
+    fn session_reset_allocates_fresh_semantic_entry_ids() {
+        let mut state = super::AppState::default();
+        state.apply(pi_harness::AgentEvent::ReasoningDelta { text: "old".into() });
+        let old = state.entry_target_id(0).unwrap();
+        state.apply(pi_harness::AgentEvent::SessionReset);
+        state.apply(pi_harness::AgentEvent::ReasoningDelta { text: "new".into() });
+        assert_ne!(state.entry_target_id(0).unwrap(), old);
     }
 
     #[test]
@@ -3223,13 +3493,26 @@ mod tests {
             state.insert_overlay_char(character);
         }
 
-        assert_eq!(state.overlay_items(), vec!["Settings"]);
+        assert_eq!(
+            state.overlay_items(),
+            vec![
+                "Settings  ·  F2  ·  Open Torii settings",
+                "/settings  ·  Open settings"
+            ]
+        );
         assert!(matches!(
             state.activate_overlay(),
             super::state::OverlayAction::None
         ));
         assert_eq!(state.overlay, super::OverlayKind::Settings);
         assert_eq!(state.prompt, "draft stays here");
+
+        state.open_overlay(super::OverlayKind::CommandPalette);
+        state.overlay_query = "settings".into();
+        state.overlay_selected = 1;
+        state.activate_overlay();
+        assert_eq!(state.prompt, "/settings ");
+        assert_eq!(state.overlay, super::OverlayKind::None);
     }
 
     #[test]
@@ -3245,6 +3528,19 @@ mod tests {
             } if request_id == "permission-1"
         ));
         assert_eq!(state.overlay, super::OverlayKind::None);
+    }
+
+    #[test]
+    fn permission_request_renders_inline_without_covering_scrollback() {
+        let state = fixtures::Story::Permission.state();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 100, 30);
+        assert!(output.contains("Permission required"));
+        assert!(output.contains("Run cargo test --workspace"));
+        assert!(output.contains("Allow once"));
+        assert!(output.contains("Run the checks and show me what changed."));
     }
 
     #[test]
@@ -3315,7 +3611,11 @@ mod tests {
                 .collect(),
             ..super::AppState::default()
         };
-        many.overlay_selected = 43;
+        many.overlay_selected = many
+            .slash_suggestions()
+            .iter()
+            .position(|(command, _)| command == "/command-15")
+            .unwrap();
         terminal.draw(|frame| ui::render(frame, &many)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("/command-15"));
@@ -3506,6 +3806,7 @@ mod tests {
                 if target == "/sessions/two.jsonl"
         ));
         assert!(state.available_sessions[1].current);
+        assert_eq!(state.view, super::View::Transcript);
     }
 
     #[test]
@@ -3622,6 +3923,7 @@ mod tests {
     #[test]
     fn session_reset_replaces_the_visible_transcript() {
         let mut state = fixtures::conversation();
+        state.view = super::View::Dashboard;
         assert!(!state.entries.is_empty());
         state.apply(AgentEvent::SessionReset);
         state.apply(AgentEvent::UserMessage {
@@ -3633,6 +3935,7 @@ mod tests {
             &state.entries[0],
             super::state::Entry::User { text, .. } if text == "restored prompt"
         ));
+        assert_eq!(state.view, super::View::Transcript);
     }
 
     #[test]

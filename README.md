@@ -93,6 +93,141 @@ torii list
 torii config
 ```
 
+## Usage tutorial
+
+### Start, continue, and resume sessions
+
+Start Torii in the current repository:
+
+```bash
+torii --backend pi
+```
+
+The welcome screen lists saved sessions and their live state. Use `Up`/`Down`
+to select one, `Enter` to resume it, or `n` to start a new session. From the
+transcript, `/home` returns to this screen and `/resume` opens the searchable
+session picker. You can also resume directly from the shell:
+
+```bash
+torii --backend pi --continue
+torii --backend pi --session <path-or-id>
+```
+
+During a running turn, `Enter` queues a follow-up for the next turn and
+`Ctrl+Enter` sends an immediate steering message. `Ctrl+C` clears a non-empty
+draft first; with an empty composer it cancels the active turn. `Ctrl+P` opens
+the command palette, `Ctrl+L` changes model, and `Ctrl+B` opens the task list.
+
+### Delegate an ad-hoc task to a subagent
+
+Ask the parent agent to delegate a bounded task. State the role, capability,
+and whether it should work in an isolated Git worktree:
+
+```text
+Use a read-only explore subagent in the background to inspect the authentication
+flow and report the relevant files. Do not modify anything.
+```
+
+For independent implementation work:
+
+```text
+Start a general-purpose subagent with read-write capability in an isolated
+worktree. Implement the parser fix and run its focused tests. Do not apply the
+worktree until I approve the result.
+```
+
+Torii gives each subagent its own context and persisted transcript. Background
+tasks return a task ID and do not bloat the parent transcript with the entire
+child conversation. Open the task dashboard with `Ctrl+B`, select a task with
+`Up`/`Down`, press `Enter` to inspect its transcript, or press `k` to cancel it.
+
+An isolated worktree is never merged automatically. After inspecting the result,
+ask the parent to apply it with `apply_subagent_worktree`, or discard it with
+`remove_subagent_worktree`. Subagents cannot spawn nested subagents. Use a
+workflow when the work needs several deterministic roles, checkpoints, retries,
+or model routes.
+
+Choose the default subagent model with `/subagent-model`. The setting is separate
+from the parent model and persists across sessions.
+
+### Run a built-in workflow
+
+Torii ships with three workflows:
+
+- `production-change` for connector evidence, approval, implementation,
+  independent reviews, conditional repair, and final verification.
+- `implement-review` for plan, approval, implementation, review, and repair.
+- `review` for parallel correctness, security, and test review followed by
+  synthesis.
+
+First inspect the resolved agents, exact models, tools, policies, and readiness:
+
+```text
+/workflow
+/workflow check implement-review
+```
+
+Then launch a background run with a complete root task:
+
+```text
+/workflow implement-review Add pagination to the session picker and verify it
+at narrow and wide terminal sizes.
+```
+
+Open `/workflows` to monitor runs. In the dashboard:
+
+- `Up`/`Down` selects a run.
+- `a` approves a waiting checkpoint; `d` rejects it.
+- `r` explicitly retries a failed or interrupted step.
+- `x` cancels an active run.
+- `v` or `Enter` opens the latest bounded artifact.
+- `Esc` returns to the transcript.
+
+Workflows are scheduled by Torii rather than by the parent model. Their resolved
+graph, model routes, contracts, budgets, attempts, checkpoints, and artifacts are
+journaled. Completed work is not repeated after `/resume`; interrupted
+write-capable steps fail closed and require an explicit retry. Persistent executor
+roles reopen their child session, while ephemeral reviewers receive clean contexts.
+
+### Use multiple models and MCP connectors safely
+
+Copy the multi-provider example into the global workflow directory, or into a
+trusted project's workflow directory:
+
+```bash
+mkdir -p .pi/workflows
+cp examples/workflows/production-multimodel-github.yaml .pi/workflows/
+```
+
+Edit its placeholder `provider/model` routes, then run:
+
+```text
+/workflow check production-multimodel-github
+```
+
+The example uses a fresh bounded GitHub connector context, an exact planner and
+executor, parallel reviewers on different models, and a persistent executor for
+repairs. Connector evidence is validated into bounded structured artifacts before
+downstream roles receive it. MCP tools are discovered with `tool_search` and only
+added to the active set; they are not removed during the session, preserving Pi's
+cache-friendly prompt prefix. The loaded set is restored before the next prompt
+after `/resume`.
+
+Project workflow definitions are ignored until the project is trusted. External
+MCP mutations additionally require an earlier named checkpoint, an exact tool
+allowlist, ephemeral execution, and a typed effect receipt.
+
+For a workflow with typed parameters:
+
+```text
+/workflow review --params {"target":"src","mode":"deep"} -- Review this change
+```
+
+See [Workflow architecture](docs/workflows.md) and the
+[`examples/workflows`](examples/workflows) directory for the full schema,
+composition, contracts, budgets, provider policies, and guarded GitHub mutation
+example.
+
 ## Workflows
 
 Torii includes `production-change`, `implement-review`, and `review` workflows.

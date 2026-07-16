@@ -1,5 +1,10 @@
 use ratatui::style::Color;
 
+/// Semantic GrokNight palette used throughout the agent UI.
+///
+/// Values track Grok Build's Apache-2.0 GrokNight theme. Compatibility aliases
+/// remain while Torii's older renderers move to semantic roles.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub background: Color,
@@ -15,22 +20,74 @@ pub struct Theme {
     pub border: Color,
     pub code_background: Color,
     pub code_foreground: Color,
+
+    pub bg_light: Color,
+    pub bg_dark: Color,
+    pub bg_highlight: Color,
+    pub bg_hover: Color,
+    pub text_secondary: Color,
+    pub gray_bright: Color,
+    pub accent_user: Color,
+    pub accent_assistant: Color,
+    pub accent_thinking: Color,
+    pub accent_tool: Color,
+    pub accent_system: Color,
+    pub accent_running: Color,
+    pub accent_model: Color,
+    pub accent_plan: Color,
+    pub prompt_border: Color,
+    pub prompt_border_active: Color,
+    pub selection_border: Color,
+    pub hover_border: Color,
+    pub path: Color,
+    pub command: Color,
+    pub running: Color,
+    pub diff_delete_bg: Color,
+    pub diff_delete_fg: Color,
+    pub diff_insert_bg: Color,
+    pub diff_insert_fg: Color,
 }
 
 impl Theme {
     pub const GROK_NIGHT: Self = Self {
-        background: Color::Rgb(0, 0, 0),
-        foreground: Color::Rgb(229, 229, 229),
-        muted: Color::Rgb(139, 139, 139),
+        background: Color::Rgb(20, 20, 20),
+        foreground: Color::Rgb(225, 225, 225),
+        muted: Color::Rgb(108, 108, 108),
         subtle: Color::Rgb(88, 88, 88),
-        user_background: Color::Rgb(143, 143, 143),
-        user_foreground: Color::White,
-        accent: Color::Rgb(211, 114, 255),
-        success: Color::Rgb(0, 232, 0),
-        warning: Color::Rgb(255, 204, 0),
-        error: Color::Rgb(255, 82, 82),
-        border: Color::Rgb(218, 218, 218),
-        code_background: Color::Rgb(24, 24, 24),
-        code_foreground: Color::Rgb(214, 214, 214),
+        user_background: Color::Rgb(36, 36, 36),
+        user_foreground: Color::Rgb(225, 225, 225),
+        accent: Color::Rgb(187, 154, 247),
+        success: Color::Rgb(158, 206, 106),
+        warning: Color::Rgb(224, 175, 104),
+        error: Color::Rgb(247, 118, 142),
+        border: Color::Rgb(80, 80, 88),
+        code_background: Color::Rgb(28, 28, 28),
+        code_foreground: Color::Rgb(200, 200, 200),
+
+        bg_light: Color::Rgb(36, 36, 36),
+        bg_dark: Color::Rgb(28, 28, 28),
+        bg_highlight: Color::Rgb(36, 36, 36),
+        bg_hover: Color::Rgb(44, 44, 44),
+        text_secondary: Color::Rgb(200, 200, 200),
+        gray_bright: Color::Rgb(120, 120, 120),
+        accent_user: Color::Rgb(200, 200, 200),
+        accent_assistant: Color::Rgb(187, 154, 247),
+        accent_thinking: Color::Rgb(187, 154, 247),
+        accent_tool: Color::Rgb(120, 120, 120),
+        accent_system: Color::Rgb(122, 162, 247),
+        accent_running: Color::Rgb(187, 154, 247),
+        accent_model: Color::Rgb(26, 188, 156),
+        accent_plan: Color::Rgb(255, 219, 141),
+        prompt_border: Color::Rgb(50, 50, 55),
+        prompt_border_active: Color::Rgb(80, 80, 88),
+        selection_border: Color::Rgb(60, 60, 65),
+        hover_border: Color::Rgb(30, 30, 34),
+        path: Color::Rgb(255, 158, 100),
+        command: Color::Rgb(224, 175, 104),
+        running: Color::Rgb(125, 207, 255),
+        diff_delete_bg: Color::Rgb(66, 14, 20),
+        diff_delete_fg: Color::Rgb(247, 118, 142),
+        diff_insert_bg: Color::Rgb(6, 56, 6),
+        diff_insert_fg: Color::Rgb(158, 206, 106),
     };
 }

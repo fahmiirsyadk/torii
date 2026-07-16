@@ -431,7 +431,7 @@ fn with_overlay(overlay: OverlayKind) -> AppState {
     state
 }
 
-fn permission() -> AppState {
+pub(crate) fn permission() -> AppState {
     let mut state = tools();
     state.pending_permission = Some(PendingPermission {
         id: "permission-1".into(),

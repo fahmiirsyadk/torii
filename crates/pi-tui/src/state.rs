@@ -9,17 +9,12 @@ use std::{
     time::Instant,
 };
 
-const COMMANDS: &[&str] = &[
-    "Resume session",
-    "Model picker",
-    "Settings",
-    "Cycle mode",
-    "Quit",
-];
 pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/dashboard",
+    "/home",
+    "/welcome",
     "/workflow",
     "/workflows",
     "/model",
@@ -55,6 +50,7 @@ const SLASH_COMMANDS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum View {
     Dashboard,
+    BlockViewer,
     Workflows,
     WorkflowArtifact,
     Tasks,
@@ -340,6 +336,20 @@ pub enum OverlayAction {
     ExportTrace(Option<String>),
 }
 
+#[derive(Clone, Debug)]
+enum CommandPaletteTarget {
+    Action(crate::actions::ActionId),
+    Slash(String),
+}
+
+#[derive(Clone, Debug)]
+struct CommandPaletteEntry {
+    target: CommandPaletteTarget,
+    label: String,
+    description: String,
+    key: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TreeFilter {
     #[default]
@@ -542,6 +552,7 @@ pub struct AppState {
     pub task_selected: usize,
     pub workflow_selected: usize,
     pub inspected_subagent: Option<String>,
+    pub viewed_entry: Option<usize>,
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
     pub composer_hover: Option<u8>,
@@ -555,6 +566,9 @@ pub struct AppState {
     pub tasks_total: usize,
     pub plan_entries: Vec<pi_harness::PlanEntry>,
     pub entries: Vec<Entry>,
+    pub(crate) entry_ids: RefCell<Vec<u64>>,
+    pub(crate) next_entry_id: Cell<u64>,
+    pub pinned_entry_modes: HashSet<String>,
     pub prompt: String,
     pub cursor: usize,
     pub paste_blocks: Vec<PasteBlock>,
@@ -583,6 +597,7 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub status: String,
     pub streaming: bool,
+    pub escape_armed_at: Option<Instant>,
     /// Wall-clock time the LLM started the current turn (the first TextDelta
     /// or ReasoningDelta of a turn). Used by the working banner above the
     /// composer to render a ticking elapsed-time counter while the model is
@@ -599,10 +614,12 @@ pub struct AppState {
     /// `output_tokens` on TurnComplete.
     pub turn_output_chars: u64,
     pub thinking_level: String,
+    pub multiline_mode: bool,
     pub thinking_levels: Vec<String>,
     pub pending_thinking_picker: bool,
     pub queued_steering: Vec<String>,
     pub queued_follow_up: Vec<String>,
+    pub queue_visible: bool,
     pub scroll_from_bottom: usize,
     pub focus: Focus,
     pub inside_think_tag: bool,
@@ -681,6 +698,7 @@ impl Default for AppState {
             task_selected: 0,
             workflow_selected: 0,
             inspected_subagent: None,
+            viewed_entry: None,
             dashboard_list_rect: Cell::new(None),
             composer_targets: RefCell::new(Vec::new()),
             composer_hover: None,
@@ -694,6 +712,9 @@ impl Default for AppState {
             tasks_total: 0,
             plan_entries: Vec::new(),
             entries: Vec::new(),
+            entry_ids: RefCell::new(Vec::new()),
+            next_entry_id: Cell::new(1),
+            pinned_entry_modes: HashSet::new(),
             prompt: String::new(),
             cursor: 0,
             paste_blocks: Vec::new(),
@@ -722,15 +743,18 @@ impl Default for AppState {
             permission_mode: PermissionMode::Normal,
             status: "idle".into(),
             streaming: false,
+            escape_armed_at: None,
             turn_started_at: None,
             image_processing_started_at: None,
             turn_input_tokens: 0,
             turn_output_chars: 0,
             thinking_level: "off".into(),
+            multiline_mode: false,
             thinking_levels: Vec::new(),
             pending_thinking_picker: false,
             queued_steering: Vec::new(),
             queued_follow_up: Vec::new(),
+            queue_visible: true,
             scroll_from_bottom: 0,
             focus: Focus::Prompt,
             inside_think_tag: false,
@@ -781,6 +805,86 @@ impl Default for AppState {
 }
 
 impl AppState {
+    fn command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
+        let query = self.overlay_query.trim().to_ascii_lowercase();
+        let mut entries = crate::actions::palette(&query)
+            .into_iter()
+            .map(|action| CommandPaletteEntry {
+                target: CommandPaletteTarget::Action(action.id),
+                label: action.label.into(),
+                description: action.description.into(),
+                key: Some(action.primary.display()),
+            })
+            .collect::<Vec<_>>();
+        let mut slash = SLASH_COMMANDS
+            .iter()
+            .map(|command| {
+                (
+                    (*command).to_string(),
+                    builtin_description(command).to_string(),
+                )
+            })
+            .chain(self.runtime_commands.iter().map(|command| {
+                let name = if command.name.starts_with('/') {
+                    command.name.clone()
+                } else {
+                    format!("/{}", command.name)
+                };
+                (name, command.description.clone())
+            }))
+            .collect::<Vec<_>>();
+        slash.sort_by(|left, right| left.0.cmp(&right.0));
+        slash.dedup_by(|left, right| left.0 == right.0);
+        entries.extend(
+            slash
+                .into_iter()
+                .filter(|(label, description)| {
+                    query.is_empty()
+                        || label.to_ascii_lowercase().contains(&query)
+                        || description.to_ascii_lowercase().contains(&query)
+                })
+                .map(|(label, description)| CommandPaletteEntry {
+                    target: CommandPaletteTarget::Slash(label.clone()),
+                    label,
+                    description,
+                    key: None,
+                }),
+        );
+        entries
+    }
+
+    pub fn stable_entry_id(&self, index: usize) -> u64 {
+        let mut ids = self.entry_ids.borrow_mut();
+        while ids.len() <= index {
+            let id = self.next_entry_id.get();
+            self.next_entry_id.set(id.saturating_add(1));
+            ids.push(id);
+        }
+        ids[index]
+    }
+
+    pub fn entry_target_id(&self, index: usize) -> Option<String> {
+        let entry = self.entries.get(index)?;
+        let id = match entry {
+            Entry::Tool { id, .. } => format!("tool:{id}"),
+            Entry::Diff { id, .. } => format!("diff:{id}"),
+            Entry::User { .. } => format!("user:{}", self.stable_entry_id(index)),
+            Entry::Reasoning { .. } => format!("reasoning:{}", self.stable_entry_id(index)),
+            Entry::Assistant { .. } => format!("assistant:{}", self.stable_entry_id(index)),
+            Entry::Plan { .. } => format!("plan:{}", self.stable_entry_id(index)),
+            Entry::Compaction { .. } => format!("compaction:{}", self.stable_entry_id(index)),
+            Entry::CompactionIndicator { .. } => {
+                format!("compaction-indicator:{}", self.stable_entry_id(index))
+            }
+        };
+        Some(id)
+    }
+
+    fn reset_entry_ids(&mut self) {
+        self.entry_ids.borrow_mut().clear();
+        self.pinned_entry_modes.clear();
+    }
+
     pub fn sorted_workflows(&self) -> Vec<&WorkflowRunSnapshot> {
         let mut workflows: Vec<_> = self.workflow_runs.values().collect();
         workflows.sort_by_key(|workflow| std::cmp::Reverse(workflow.updated_at_ms));
@@ -984,7 +1088,7 @@ impl AppState {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let action = match command.as_str() {
-            "/dashboard" => {
+            "/dashboard" | "/home" | "/welcome" => {
                 self.view = View::Dashboard;
                 self.dashboard_selected = self
                     .available_sessions
@@ -1115,6 +1219,7 @@ impl AppState {
             }
             "/clear" => {
                 self.entries.clear();
+                self.reset_entry_ids();
                 self.subagent_tasks.clear();
                 self.subagent_transcripts.clear();
                 self.workflow_runs.clear();
@@ -1236,9 +1341,17 @@ impl AppState {
 
     pub fn overlay_items(&self) -> Vec<String> {
         let source = match self.overlay {
-            OverlayKind::CommandPalette => {
-                COMMANDS.iter().map(|item| (*item).to_string()).collect()
-            }
+            OverlayKind::CommandPalette => self
+                .command_palette_entries()
+                .into_iter()
+                .map(|entry| {
+                    if let Some(key) = entry.key {
+                        format!("{}  ·  {key}  ·  {}", entry.label, entry.description)
+                    } else {
+                        format!("{}  ·  {}", entry.label, entry.description)
+                    }
+                })
+                .collect(),
             OverlayKind::ModelPicker => self
                 .filtered_models()
                 .into_iter()
@@ -1764,20 +1877,52 @@ impl AppState {
             return OverlayAction::None;
         };
         match self.overlay {
-            OverlayKind::CommandPalette => match item.as_str() {
-                "Resume session" => self.open_overlay(OverlayKind::SessionPicker),
-                "Model picker" => self.open_overlay(OverlayKind::ModelPicker),
-                "Settings" => self.open_overlay(OverlayKind::Settings),
-                "Cycle mode" => {
-                    self.cycle_permission_mode();
+            OverlayKind::CommandPalette => {
+                let Some(target) = self
+                    .command_palette_entries()
+                    .get(self.overlay_selected)
+                    .map(|entry| entry.target.clone())
+                else {
+                    return OverlayAction::None;
+                };
+                let CommandPaletteTarget::Action(action) = target else {
+                    let CommandPaletteTarget::Slash(command) = target else {
+                        unreachable!()
+                    };
+                    self.prompt = format!("{command} ");
+                    self.cursor = self.prompt.chars().count();
+                    self.focus = Focus::Prompt;
                     self.close_overlay();
-                    return OverlayAction::SetPermissionMode(
-                        self.permission_mode.wire_value().into(),
-                    );
+                    return OverlayAction::None;
+                };
+                match action {
+                    crate::actions::ActionId::SessionPicker => {
+                        self.open_overlay(OverlayKind::SessionPicker)
+                    }
+                    crate::actions::ActionId::ModelPicker => {
+                        self.open_overlay(OverlayKind::ModelPicker)
+                    }
+                    crate::actions::ActionId::Settings => self.open_overlay(OverlayKind::Settings),
+                    crate::actions::ActionId::CycleMode => {
+                        self.cycle_permission_mode();
+                        self.close_overlay();
+                        return OverlayAction::SetPermissionMode(
+                            self.permission_mode.wire_value().into(),
+                        );
+                    }
+                    crate::actions::ActionId::ToggleTasks => {
+                        self.close_overlay();
+                        self.view = if self.view == View::Tasks {
+                            View::Transcript
+                        } else {
+                            View::Tasks
+                        };
+                    }
+                    crate::actions::ActionId::CommandPalette => {}
+                    crate::actions::ActionId::Quit => return OverlayAction::Quit,
+                    _ => {}
                 }
-                "Quit" => return OverlayAction::Quit,
-                _ => {}
-            },
+            }
             OverlayKind::ModelPicker => {
                 let Some(model) = self
                     .filtered_models()
@@ -1842,6 +1987,7 @@ impl AppState {
                     session.current = session.path == target;
                 }
                 self.close_overlay();
+                self.view = View::Transcript;
                 return OverlayAction::ResumeSession { target };
             }
             OverlayKind::TreePicker | OverlayKind::ForkPicker => {
@@ -2522,6 +2668,7 @@ impl AppState {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        self.escape_armed_at = None;
         self.focused_image = None;
         let position = self.cursor;
         let byte = char_to_byte(&self.prompt, self.cursor);
@@ -2572,6 +2719,29 @@ impl AppState {
                         .saturating_sub(block.end - block.start)
                 })
                 .sum::<usize>()
+    }
+
+    pub fn composer_display_text(&self) -> String {
+        if self.paste_blocks.is_empty() {
+            return self.prompt.clone();
+        }
+        let chars = self.prompt.chars().collect::<Vec<_>>();
+        let mut output = String::new();
+        let mut cursor = 0usize;
+        for block in &self.paste_blocks {
+            if block.start > cursor {
+                output.extend(chars[cursor..block.start.min(chars.len())].iter());
+            }
+            output.push_str(&format!(
+                "[paste#{}]",
+                block.end.saturating_sub(block.start)
+            ));
+            cursor = block.end.min(chars.len());
+        }
+        if cursor < chars.len() {
+            output.extend(chars[cursor..].iter());
+        }
+        output
     }
 
     pub fn paste_at_cursor(&self) -> Option<u64> {
@@ -2843,7 +3013,7 @@ impl AppState {
         self.prompt.replace_range(start..end, "");
         self.cursor -= 1;
         for block in &mut self.paste_blocks {
-            if block.start >= self.cursor + 1 {
+            if block.start > self.cursor {
                 block.start -= 1;
                 block.end -= 1;
             }
@@ -3055,6 +3225,8 @@ impl AppState {
     pub fn toggle_entry_at(&mut self, index: usize) {
         self.focused_entry = Some(index);
         self.focused_section = None;
+        let target_id = self.entry_target_id(index);
+        let mut toggled = false;
         match self.entries.get_mut(index) {
             Some(
                 Entry::Reasoning { expanded, .. }
@@ -3062,9 +3234,16 @@ impl AppState {
                 | Entry::Plan { expanded, .. },
             ) => {
                 *expanded = !*expanded;
+                toggled = true;
             }
-            Some(Entry::Tool { .. }) => self.toggle_tool_at(index),
+            Some(Entry::Tool { .. }) => {
+                self.toggle_tool_at(index);
+                toggled = true;
+            }
             _ => {}
+        }
+        if toggled && let Some(target_id) = target_id {
+            self.pinned_entry_modes.insert(target_id);
         }
     }
 
@@ -3288,7 +3467,16 @@ impl AppState {
                     .collect();
             }
             AgentEvent::SessionReset => {
+                self.view = View::Transcript;
                 self.entries.clear();
+                self.reset_entry_ids();
+                self.clear_prompt();
+                self.queued_steering.clear();
+                self.queued_follow_up.clear();
+                self.pending_permission = None;
+                self.pending_oauth = None;
+                self.overlay = OverlayKind::None;
+                self.escape_armed_at = None;
                 self.context_used = 0;
                 self.scroll_from_bottom = 0;
                 self.status = "session resumed".into();
@@ -3803,6 +3991,7 @@ fn model_provider(model: &ModelInfo) -> &str {
 fn builtin_description(command: &str) -> &'static str {
     match command {
         "/dashboard" => "Open the session dashboard",
+        "/home" | "/welcome" => "Return to the welcome screen",
         "/workflow" => "Start a durable workflow: /workflow <name> <task>",
         "/workflows" => "Open durable workflow runs and checkpoint controls",
         "/model" => "Switch model",

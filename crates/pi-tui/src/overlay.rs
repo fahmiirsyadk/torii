@@ -431,8 +431,8 @@ fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
     frame
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
-    let width = frame_area.width.saturating_sub(2).min(120).max(1);
-    let height = frame_area.height.saturating_sub(2).min(40).max(1);
+    let width = frame_area.width.saturating_sub(2).clamp(1, 120);
+    let height = frame_area.height.saturating_sub(2).clamp(1, 40);
     let area = Rect::new(
         frame_area.x + frame_area.width.saturating_sub(width) / 2,
         frame_area.y + frame_area.height.saturating_sub(height) / 2,
