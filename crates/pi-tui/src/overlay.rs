@@ -44,7 +44,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
 
     let items = state.overlay_items();
-    let width = frame_area.width.saturating_sub(6).clamp(30, 72);
+    let max_width = if state.overlay == OverlayKind::WorkflowPreview {
+        104
+    } else {
+        72
+    };
+    let width = frame_area.width.saturating_sub(6).clamp(30, max_width);
     let (area, _, visible_start, visible_end) =
         generic_picker_layout(state, frame_area, items.len(), width);
     frame.render_widget(Clear, area);
@@ -52,6 +57,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let title = match state.overlay {
         OverlayKind::CommandPalette => " Commands ",
         OverlayKind::ModelPicker => " Select model ",
+        OverlayKind::WorkflowPicker => " Workflow catalog ",
+        OverlayKind::WorkflowPreview => " Workflow preflight ",
         OverlayKind::SessionPicker => " Resume session ",
         OverlayKind::SessionRename => " Rename Session ",
         OverlayKind::SessionDeleteConfirm => " Delete Session? ",
@@ -79,6 +86,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         state.overlay,
         OverlayKind::CommandPalette
             | OverlayKind::ModelPicker
+            | OverlayKind::WorkflowPicker
             | OverlayKind::SessionPicker
             | OverlayKind::SessionRename
             | OverlayKind::TreePicker

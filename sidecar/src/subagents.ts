@@ -11,7 +11,61 @@ export interface SubagentRequest {
   capabilityMode?: CapabilityMode;
   isolation: IsolationMode;
   resumeFrom?: string;
+  continueFrom?: string;
+  model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  tools?: string[];
+  workflowRunId?: string;
   cwd?: string;
+  guardrails?: SubagentRuntimeGuardrails;
+}
+
+export interface SubagentRuntimeGuardrails {
+  allowedModels?: string[];
+  allowedTools?: string[];
+  requireStableCachePrefix: boolean;
+  expectedCachePrefix?: string;
+  onViolation: "warn" | "fail";
+}
+
+export interface SubagentUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+export interface SubagentRuntimeObservability {
+  activeTools: string[];
+  toolSchemaFingerprint: string;
+  cachePrefixFingerprint: string;
+  systemPromptBytes: number;
+  cachePrefixChangedDuringRun?: boolean;
+  policyViolations?: string[];
+}
+
+export function runtimeGuardrailViolations(
+  guardrails: SubagentRuntimeGuardrails | undefined,
+  observability: SubagentRuntimeObservability,
+  actualModel: string | undefined,
+): string[] {
+  if (guardrails === undefined) return [];
+  const violations: string[] = [];
+  if (guardrails.allowedModels !== undefined && (actualModel === undefined || !guardrails.allowedModels.includes(actualModel))) {
+    violations.push(`active model ${actualModel ?? "<none>"} is not allowed`);
+  }
+  if (guardrails.allowedTools !== undefined) {
+    const denied = observability.activeTools.filter((tool) => !guardrails.allowedTools!.includes(tool));
+    if (denied.length > 0) violations.push(`active tools are not allowed: ${denied.join(", ")}`);
+  }
+  if (guardrails.requireStableCachePrefix && guardrails.expectedCachePrefix !== undefined
+    && observability.cachePrefixFingerprint !== guardrails.expectedCachePrefix) {
+    violations.push("cache prefix differs from the previous persistent attempt");
+  }
+  if (guardrails.requireStableCachePrefix && observability.cachePrefixChangedDuringRun === true) {
+    violations.push("cache prefix changed during execution");
+  }
+  return [...new Set(violations)];
 }
 
 export interface ChildRuntimeHandle {
@@ -21,6 +75,7 @@ export interface ChildRuntimeHandle {
   thinkingLevel?: string;
   worktreePath?: string;
   cwd: string;
+  observability?: SubagentRuntimeObservability;
   abort(): Promise<void>;
   dispose(): Promise<void>;
 }
@@ -43,10 +98,14 @@ export interface SubagentRecord {
   completedAt?: number;
   output?: string;
   error?: string;
+  failureKind?: "launch" | "task_failed";
   model?: string;
   thinkingLevel?: string;
   worktreePath?: string;
   cwd?: string;
+  workflowRunId?: string;
+  observability?: SubagentRuntimeObservability;
+  usage?: SubagentUsage;
   runtime?: ChildRuntimeHandle;
 }
 
@@ -56,9 +115,10 @@ export interface LaunchContext {
   parentSessionPath?: string;
   request: SubagentRequest;
   source?: SubagentRecord;
+  continueExisting: boolean;
   update(activity: string): void;
   outputUpdate(text: string): void;
-  complete(output: string): void;
+  complete(output: string, usage?: SubagentUsage, observability?: SubagentRuntimeObservability): void;
   fail(error: string): void;
   cancelled(): void;
 }
@@ -80,21 +140,29 @@ export interface TaskSnapshot {
   duration_ms: number;
   output?: string;
   error?: string;
+  failure_kind?: "launch" | "task_failed";
   model?: string;
   thinking_level?: string;
   worktree_path?: string;
   cwd?: string;
+  workflow_run_id?: string;
 }
 
 type Listener = (record: SubagentRecord) => void;
 type Launcher = (context: LaunchContext) => Promise<ChildRuntimeHandle>;
 
 const terminalStatuses = new Set<SubagentStatus>(["completed", "failed", "cancelled", "interrupted"]);
-const MAX_ACTIVE_SUBAGENTS = 8;
+export const MAX_ACTIVE_SUBAGENTS = 8;
+
+export interface SpawnSchedulingOptions {
+  waitForCapacity?: boolean;
+  signal?: AbortSignal;
+}
 
 export class NativeSubagentCoordinator {
   private readonly tasks = new Map<string, SubagentRecord>();
   private readonly listeners = new Set<Listener>();
+  private readonly capacityReservations = new Map<string, number>();
   private nextId = 1;
   private readonly launchChild: Launcher;
 
@@ -123,18 +191,24 @@ export class NativeSubagentCoordinator {
     if (Number.isFinite(numeric)) this.nextId = Math.max(this.nextId, numeric + 1);
   }
 
-  async spawn(parentSessionId: string, parentSessionPath: string | undefined, request: SubagentRequest): Promise<SubagentRecord> {
-    const active = this.listForParent(parentSessionId).filter((task) => task.status === "running").length;
-    if (active >= MAX_ACTIVE_SUBAGENTS) throw new Error(`subagent concurrency limit reached (${MAX_ACTIVE_SUBAGENTS})`);
+  async spawn(parentSessionId: string, parentSessionPath: string | undefined, request: SubagentRequest, scheduling: SpawnSchedulingOptions = {}): Promise<SubagentRecord> {
+    if (request.resumeFrom !== undefined && request.continueFrom !== undefined) throw new Error("cannot use resume_from and continue_from together");
+    const sourceId = request.continueFrom ?? request.resumeFrom;
     let source: SubagentRecord | undefined;
-    if (request.resumeFrom !== undefined) {
-      source = this.tasks.get(request.resumeFrom);
-      if (source === undefined) throw new Error(`unknown resume_from task: ${request.resumeFrom}`);
+    if (sourceId !== undefined) {
+      source = this.tasks.get(sourceId);
+      if (source === undefined) throw new Error(`unknown source task: ${sourceId}`);
       if (source.parentSessionId !== parentSessionId) throw new Error("resume_from must belong to the current parent session");
       if (source.parentSessionPath !== parentSessionPath) throw new Error("resume_from must belong to the current parent session file");
       if (source.status !== "completed") throw new Error("resume_from source must be a completed subagent");
       if (source.subagentType !== request.subagentType) throw new Error("resume_from must use the same subagent_type");
       if (source.childSessionPath === undefined) throw new Error("resume_from source has no persisted child session");
+    }
+
+    await this.reserveCapacity(parentSessionId, scheduling);
+    if (scheduling.signal?.aborted) {
+      this.releaseCapacityReservation(parentSessionId);
+      throw scheduling.signal.reason instanceof Error ? scheduling.signal.reason : new Error("subagent launch cancelled");
     }
 
     const taskId = `task-${Date.now().toString(36)}-${this.nextId++}`;
@@ -148,10 +222,12 @@ export class NativeSubagentCoordinator {
       capabilityMode: request.capabilityMode ?? defaultCapability(request.subagentType),
       isolation: request.isolation,
       background: request.background,
+      workflowRunId: request.workflowRunId,
       status: "running",
       activity: "Starting",
       startedAt: Date.now(),
     };
+    this.releaseCapacityReservation(parentSessionId);
     this.tasks.set(taskId, record);
     this.notify(record);
 
@@ -162,10 +238,18 @@ export class NativeSubagentCoordinator {
         parentSessionPath,
         request: { ...request, capabilityMode: record.capabilityMode },
         source,
+        continueExisting: request.continueFrom !== undefined,
         update: (activity) => this.update(taskId, activity),
         outputUpdate: (text) => this.appendOutput(taskId, text),
-        complete: (output) => this.finish(taskId, "completed", output),
-        fail: (error) => this.finish(taskId, "failed", undefined, error),
+        complete: (output, usage, observability) => {
+          record.usage = usage;
+          if (observability !== undefined) record.observability = observability;
+          this.finish(taskId, "completed", output);
+        },
+        fail: (error) => {
+          record.failureKind = "task_failed";
+          this.finish(taskId, "failed", undefined, error);
+        },
         cancelled: () => this.finish(taskId, "cancelled"),
       });
       record.childSessionId = record.runtime.childSessionId;
@@ -174,8 +258,10 @@ export class NativeSubagentCoordinator {
       record.thinkingLevel = record.runtime.thinkingLevel;
       record.worktreePath = record.runtime.worktreePath;
       record.cwd = record.runtime.cwd;
+      record.observability ??= record.runtime.observability;
       this.notify(record);
     } catch (error) {
+      record.failureKind = "launch";
       this.finish(taskId, "failed", undefined, error instanceof Error ? error.message : String(error));
     }
     return record;
@@ -268,10 +354,12 @@ export class NativeSubagentCoordinator {
       duration_ms: Math.max(0, end - record.startedAt),
       output: record.output,
       error: record.error,
+      failure_kind: record.failureKind,
       model: record.model,
       thinking_level: record.thinkingLevel,
       worktree_path: record.worktreePath,
       cwd: record.cwd,
+      workflow_run_id: record.workflowRunId,
     };
   }
 
@@ -279,6 +367,42 @@ export class NativeSubagentCoordinator {
     const record = this.tasks.get(taskId);
     if (record === undefined) throw new Error(`unknown task: ${taskId}`);
     return record;
+  }
+
+  private async reserveCapacity(parentSessionId: string, scheduling: SpawnSchedulingOptions): Promise<void> {
+    const available = () => this.listForParent(parentSessionId).filter((task) => task.status === "running").length + (this.capacityReservations.get(parentSessionId) ?? 0) < MAX_ACTIVE_SUBAGENTS;
+    const reserve = () => this.capacityReservations.set(parentSessionId, (this.capacityReservations.get(parentSessionId) ?? 0) + 1);
+    if (available()) {
+      reserve();
+      return;
+    }
+    if (scheduling.waitForCapacity !== true) throw new Error(`subagent concurrency limit reached (${MAX_ACTIVE_SUBAGENTS})`);
+    await new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error) => {
+        unsubscribe();
+        scheduling.signal?.removeEventListener("abort", abort);
+        if (error === undefined) resolve(); else reject(error);
+      };
+      const abort = () => finish(scheduling.signal?.reason instanceof Error ? scheduling.signal.reason : new Error("subagent launch cancelled"));
+      const unsubscribe = this.subscribe(() => {
+        if (available()) {
+          reserve();
+          finish();
+        }
+      });
+      if (scheduling.signal?.aborted) abort();
+      else scheduling.signal?.addEventListener("abort", abort, { once: true });
+    });
+    if (scheduling.signal?.aborted) {
+      this.releaseCapacityReservation(parentSessionId);
+      throw scheduling.signal.reason instanceof Error ? scheduling.signal.reason : new Error("subagent launch cancelled");
+    }
+  }
+
+  private releaseCapacityReservation(parentSessionId: string): void {
+    const remaining = Math.max(0, (this.capacityReservations.get(parentSessionId) ?? 1) - 1);
+    if (remaining === 0) this.capacityReservations.delete(parentSessionId);
+    else this.capacityReservations.set(parentSessionId, remaining);
   }
 
   private notify(record: SubagentRecord): void {

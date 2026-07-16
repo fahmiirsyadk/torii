@@ -223,6 +223,17 @@ impl PiHarness {
             .await
     }
 
+    fn emit_internal_error(&self, id: &SessionId, message: String) {
+        if let Ok(sessions) = self.inner.sessions.read()
+            && let Some(sender) = sessions.get(id)
+        {
+            let _ = sender.send(AgentEvent::Error {
+                kind: pi_harness::AgentErrorKind::Internal,
+                message,
+            });
+        }
+    }
+
     async fn request_with_timeout(
         &self,
         mut command: Value,
@@ -396,6 +407,83 @@ impl AgentHarness for PiHarness {
     async fn kill_task(&self, id: &SessionId, task_id: String) -> Result<()> {
         self.request(
             json!({ "type": "kill_task", "session_id": id.0, "task_id": task_id }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn control_workflow(
+        &self,
+        id: &SessionId,
+        run_id: String,
+        action: String,
+        step_id: Option<String>,
+    ) -> Result<()> {
+        self.request(
+            json!({ "type": "workflow_control", "session_id": id.0, "run_id": run_id, "action": action, "step_id": step_id }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn start_workflow(
+        &self,
+        id: &SessionId,
+        workflow: String,
+        input: String,
+        parameters: Option<Value>,
+        expected_definition_hash: Option<String>,
+    ) -> Result<()> {
+        let mut request = json!({
+            "type": "workflow_start", "session_id": id.0, "workflow": workflow,
+            "input": input
+        });
+        if let Some(parameters) = parameters {
+            request["parameters"] = parameters;
+        }
+        if let Some(hash) = expected_definition_hash {
+            request["expected_definition_hash"] = Value::String(hash);
+        }
+        if let Err(error) = self.request(request, None).await {
+            self.emit_internal_error(id, error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn workflow_catalog(&self, id: &SessionId) -> Result<()> {
+        self.request(
+            json!({ "type": "workflow_catalog", "session_id": id.0 }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn preview_workflow(&self, id: &SessionId, workflow: String) -> Result<()> {
+        if let Err(error) = self
+            .request(
+                json!({ "type": "workflow_preview", "session_id": id.0, "workflow": workflow }),
+                None,
+            )
+            .await
+        {
+            self.emit_internal_error(id, error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn read_workflow_artifact(
+        &self,
+        id: &SessionId,
+        run_id: String,
+        artifact_id: String,
+    ) -> Result<()> {
+        self.request(
+            json!({ "type": "workflow_artifact_read", "session_id": id.0, "run_id": run_id, "artifact_id": artifact_id }),
             None,
         )
         .await?;
@@ -888,6 +976,113 @@ mod tests {
                 event: AgentEvent::SubagentTranscript { task_id, event },
                 ..
             } if task_id == "task-1" && matches!(*event, AgentEvent::TextDelta { ref text } if text == "child output")
+        ));
+    }
+
+    #[test]
+    fn decodes_workflow_snapshot_and_artifact_events() {
+        let observability = json!({
+            "model": "openai/gpt-5", "capability": "read-only", "session": "ephemeral",
+            "root_input_bytes": 10, "prompt_bytes": 100, "artifact_count": 1,
+            "artifact_bytes": 50, "truncated_artifact_count": 0,
+            "requested_tools": ["read"], "active_tools": ["read"],
+            "tool_schema_fingerprint": "schema", "cache_prefix_fingerprint": "prefix",
+            "cache_prefix_changed": false, "system_prompt_bytes": 200,
+            "input_tokens": 20, "output_tokens": 5, "cache_read_tokens": 80,
+            "cache_write_tokens": 0, "cache_hit_rate": 0.8
+        });
+        let update: WireMessage = serde_json::from_value(json!({
+            "type": "event",
+            "session_id": "parent-1",
+            "event": {
+                "type": "workflow_update",
+                "workflow": {
+                    "run_id": "wf-1", "name": "review", "status": "paused",
+                    "current_step": "approve", "completed_steps": 1, "total_steps": 2,
+                    "artifact_ids": ["artifact-1"], "created_at_ms": 1, "updated_at_ms": 2,
+                    "steps": [{
+                        "id": "approve", "type": "checkpoint", "status": "waiting",
+                        "task_ids": [], "artifact_ids": [],
+                        "observability": observability
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            update,
+            WireMessage::Event { event: AgentEvent::WorkflowUpdate { workflow }, .. }
+                if workflow.run_id == "wf-1"
+                    && workflow.status == "paused"
+                    && workflow.steps[0].observability.as_ref().and_then(|value| value.cache_hit_rate) == Some(0.8)
+        ));
+
+        let artifact: WireMessage = serde_json::from_value(json!({
+            "type": "event",
+            "session_id": "parent-1",
+            "event": {
+                "type": "workflow_artifact",
+                "artifact": {
+                    "run_id": "wf-1", "artifact_id": "artifact-1", "step_id": "plan",
+                    "summary": "plan", "producer_role": "planner", "content": "evidence",
+                    "truncated": false
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            artifact,
+            WireMessage::Event { event: AgentEvent::WorkflowArtifact { artifact }, .. }
+                if artifact.artifact_id == "artifact-1" && artifact.content == "evidence"
+        ));
+
+        let catalog: WireMessage = serde_json::from_value(json!({
+            "type": "event",
+            "session_id": "parent-1",
+            "event": {
+                "type": "workflow_catalog",
+                "workflows": [
+                    { "name": "review", "description": "Review changes", "source": "builtin", "valid": true },
+                    { "name": "broken", "source": "global", "valid": false, "error": "invalid steps" }
+                ]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            catalog,
+            WireMessage::Event { event: AgentEvent::WorkflowCatalog { workflows }, .. }
+                if workflows.len() == 2
+                    && workflows[0].name == "review"
+                    && workflows[1].error.as_deref() == Some("invalid steps")
+        ));
+
+        let preview: WireMessage = serde_json::from_value(json!({
+            "type": "event",
+            "session_id": "parent-1",
+            "event": {
+                "type": "workflow_preview",
+                "preview": {
+                    "name": "review",
+                    "description": "Review changes",
+                    "definition_hash": "abc123",
+                    "resolved_at_ms": 10,
+                    "steps": [{
+                        "id": "inspect", "type": "agent", "role": "reviewer",
+                        "agent": "review", "model": "openai/gpt-5", "capability": "read-only",
+                        "isolation": "none", "session": "ephemeral", "tools": ["read"],
+                        "forced_read_only": true, "timeout_ms": 1200000,
+                        "max_attempts": 2, "retry_on": ["failed", "timeout"], "children": []
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            preview,
+            WireMessage::Event { event: AgentEvent::WorkflowPreview { preview }, .. }
+                if preview.name == "review"
+                    && preview.steps[0].forced_read_only
+                    && preview.steps[0].model.as_deref() == Some("openai/gpt-5")
         ));
     }
 }

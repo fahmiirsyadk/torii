@@ -232,6 +232,14 @@ pub enum UiCommand {
     },
     DeleteSession(String),
     RefreshSessions,
+    LoadWorkflowCatalog,
+    PreviewWorkflow(String),
+    StartWorkflow {
+        workflow: String,
+        input: String,
+        parameters: Option<serde_json::Value>,
+        expected_definition_hash: Option<String>,
+    },
     NewSession,
     NameSession(String),
     SessionInfo,
@@ -281,6 +289,15 @@ pub enum UiCommand {
     StopResident(String),
     CloseResident(String),
     KillTask(String),
+    WorkflowControl {
+        run_id: String,
+        action: String,
+        step_id: Option<String>,
+    },
+    ReadWorkflowArtifact {
+        run_id: String,
+        artifact_id: String,
+    },
 }
 
 enum LoopWake {
@@ -686,6 +703,55 @@ async fn run_app(
                     state.view = View::Tasks;
                     state.scroll_from_bottom = 0;
                 }
+                KeyCode::Esc | KeyCode::Char('q') if state.view == View::Workflows => {
+                    state.view = View::Transcript;
+                }
+                KeyCode::Esc | KeyCode::Char('q') if state.view == View::WorkflowArtifact => {
+                    state.view = View::Workflows;
+                    state.scroll_from_bottom = 0;
+                }
+                KeyCode::Up if state.view == View::WorkflowArtifact => {
+                    state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(3);
+                }
+                KeyCode::Down if state.view == View::WorkflowArtifact => state.scroll_down(3),
+                _ if state.view == View::WorkflowArtifact => {}
+                KeyCode::Up if state.view == View::Workflows => {
+                    state.workflow_selected = state.workflow_selected.saturating_sub(1);
+                }
+                KeyCode::Down if state.view == View::Workflows => {
+                    state.workflow_selected = (state.workflow_selected + 1)
+                        .min(state.workflow_runs.len().saturating_sub(1));
+                }
+                KeyCode::Char(action @ ('a' | 'd' | 'r' | 'x'))
+                    if state.view == View::Workflows =>
+                {
+                    let action = match action {
+                        'a' => "approve",
+                        'd' => "reject",
+                        'r' => "retry",
+                        _ => "cancel",
+                    };
+                    if let Some((run_id, step_id)) = state.selected_workflow_control(action)
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::WorkflowControl {
+                            run_id,
+                            action: action.into(),
+                            step_id,
+                        });
+                    }
+                }
+                KeyCode::Char('v') | KeyCode::Enter if state.view == View::Workflows => {
+                    if let Some((run_id, artifact_id)) = state.selected_workflow_artifact()
+                        && let Some(sender) = &commands
+                    {
+                        let _ = sender.send(UiCommand::ReadWorkflowArtifact {
+                            run_id,
+                            artifact_id,
+                        });
+                    }
+                }
+                _ if state.view == View::Workflows => {}
                 KeyCode::Esc if state.view == View::Tasks => {
                     state.view = View::Transcript;
                 }
@@ -1234,6 +1300,34 @@ fn dispatch_overlay_action(
             }
             false
         }
+        OverlayAction::LoadWorkflowCatalog => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::LoadWorkflowCatalog);
+            }
+            false
+        }
+        OverlayAction::PreviewWorkflow { workflow } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::PreviewWorkflow(workflow));
+            }
+            false
+        }
+        OverlayAction::StartWorkflow {
+            workflow,
+            input,
+            parameters,
+            expected_definition_hash,
+        } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::StartWorkflow {
+                    workflow,
+                    input,
+                    parameters,
+                    expected_definition_hash,
+                });
+            }
+            false
+        }
         OverlayAction::Quit => true,
         OverlayAction::Permission {
             request_id,
@@ -1717,12 +1811,12 @@ mod tests {
     #[test]
     fn copied_file_uri_is_decoded_and_portrait_preview_keeps_aspect_ratio() {
         assert_eq!(
-            super::clipboard_image_path("file:///home/void/Pictures/flower%202.jpg"),
-            Some(std::path::PathBuf::from("/home/void/Pictures/flower 2.jpg"))
+            super::percent_decode_path("/home/void/Pictures/flower%202.jpg"),
+            Some("/home/void/Pictures/flower 2.jpg".into())
         );
         assert_eq!(
-            super::clipboard_image_path("file:///home/void/Pictures/flower2.jpg\0"),
-            Some(std::path::PathBuf::from("/home/void/Pictures/flower2.jpg"))
+            super::percent_decode_path("/home/void/Pictures/flower2.jpg"),
+            Some("/home/void/Pictures/flower2.jpg".into())
         );
         let pixels = vec![255; 1060 * 1500 * 4];
         let (width, height, _) = super::image_preview(1060, 1500, &pixels);
@@ -2474,10 +2568,12 @@ mod tests {
             duration_ms: 25,
             output: None,
             error: None,
+            failure_kind: None,
             model: Some("test/model".into()),
             thinking_level: Some("high".into()),
             worktree_path: None,
             cwd: None,
+            workflow_run_id: None,
         };
         state.apply(AgentEvent::SubagentUpdate {
             task: Box::new(task.clone()),
@@ -2521,6 +2617,175 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let transcript = buffer_text(terminal.backend().buffer(), 100, 24);
         assert!(transcript.contains("evidence"));
+    }
+
+    #[test]
+    fn workflow_dashboard_exposes_checkpoint_controls_and_artifacts() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::WorkflowUpdate {
+            workflow: Box::new(pi_harness::WorkflowRunSnapshot {
+                run_id: "wf-1".into(),
+                name: "implement-review".into(),
+                description: Some("Plan, implement, review".into()),
+                status: "paused".into(),
+                current_step: Some("approve-plan".into()),
+                completed_steps: 1,
+                total_steps: 3,
+                artifact_ids: vec!["artifact-plan".into()],
+                budget: Some(pi_harness::WorkflowBudgetSnapshot {
+                    max_agent_attempts: Some(8),
+                    max_prompt_tokens: Some(100_000),
+                    max_output_tokens: Some(10_000),
+                    max_cache_write_tokens: Some(20_000),
+                    agent_attempts: 1,
+                    prompt_tokens: 400,
+                    output_tokens: 20,
+                    cache_write_tokens: 0,
+                    reserved_prompt_tokens: 0,
+                    reserved_output_tokens: 0,
+                    reserved_cache_write_tokens: 0,
+                    unknown_usage_attempts: 0,
+                }),
+                provider_states: vec![pi_harness::WorkflowProviderStateSnapshot {
+                    provider: "test".into(),
+                    max_concurrency: Some(2),
+                    max_starts: Some(10),
+                    window_ms: Some(60_000),
+                    failure_threshold: Some(3),
+                    cooldown_ms: Some(30_000),
+                    active_attempts: 0,
+                    starts_in_window: 1,
+                    consecutive_failures: 0,
+                    circuit: "closed".into(),
+                    retry_at_ms: None,
+                    rate_retry_at_ms: None,
+                }],
+                steps: vec![
+                    pi_harness::WorkflowStepSnapshot {
+                        id: "plan".into(),
+                        r#type: "agent".into(),
+                        status: "completed".into(),
+                        role: Some("planner".into()),
+                        model: Some("test/planner".into()),
+                        task_ids: vec!["task-1".into()],
+                        artifact_ids: vec!["artifact-plan".into()],
+                        error: None,
+                        attempt_count: 1,
+                        timeout_ms: Some(60_000),
+                        max_attempts: None,
+                        output_contract: None,
+                        condition: None,
+                        children: Vec::new(),
+                        observability: Some(pi_harness::WorkflowAttemptObservability {
+                            model: Some("test/planner".into()),
+                            thinking: Some("high".into()),
+                            capability: "read-only".into(),
+                            session: "ephemeral".into(),
+                            session_key: None,
+                            root_input_bytes: 100,
+                            prompt_bytes: 4_096,
+                            artifact_count: 1,
+                            artifact_bytes: 2_048,
+                            truncated_artifact_count: 1,
+                            requested_tools: vec!["read".into()],
+                            active_tools: Some(vec!["read".into(), "search".into()]),
+                            tool_schema_fingerprint: Some("schema123456789".into()),
+                            cache_prefix_fingerprint: Some("prefix123456789".into()),
+                            cache_prefix_changed: Some(true),
+                            system_prompt_bytes: Some(8_192),
+                            input_tokens: Some(100),
+                            output_tokens: Some(20),
+                            cache_read_tokens: Some(300),
+                            cache_write_tokens: Some(0),
+                            cache_hit_rate: Some(0.75),
+                            policy_action: Some("warn".into()),
+                            policy_violations: vec!["cache prefix changed during execution".into()],
+                            provider_outcome: Some("success".into()),
+                            provider_failure_kind: None,
+                        }),
+                    },
+                    pi_harness::WorkflowStepSnapshot {
+                        id: "approve-plan".into(),
+                        r#type: "checkpoint".into(),
+                        status: "waiting".into(),
+                        role: None,
+                        model: None,
+                        task_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        error: None,
+                        attempt_count: 0,
+                        timeout_ms: None,
+                        max_attempts: None,
+                        output_contract: None,
+                        condition: None,
+                        children: Vec::new(),
+                        observability: None,
+                    },
+                    pi_harness::WorkflowStepSnapshot {
+                        id: "repair".into(),
+                        r#type: "agent".into(),
+                        status: "skipped".into(),
+                        role: Some("executor".into()),
+                        model: Some("test/executor".into()),
+                        task_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        error: Some("condition not met".into()),
+                        attempt_count: 0,
+                        timeout_ms: Some(60_000),
+                        max_attempts: None,
+                        output_contract: None,
+                        condition: Some("review.verdict needs_changes (any)".into()),
+                        children: Vec::new(),
+                        observability: None,
+                    },
+                ],
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                error: None,
+            }),
+        });
+        state.view = super::View::Workflows;
+        assert_eq!(
+            state.selected_workflow_control("approve"),
+            Some(("wf-1".into(), Some("approve-plan".into())))
+        );
+        assert_eq!(
+            state.selected_workflow_artifact(),
+            Some(("wf-1".into(), "artifact-plan".into()))
+        );
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 120, 30);
+        assert!(output.contains("implement-review"));
+        assert!(output.contains("approve-plan"));
+        assert!(output.contains("repair  skipped"));
+        assert!(output.contains("cache hit 75%"));
+        assert!(output.contains("prefix1234 (changed)"));
+        assert!(output.contains("guardrail warn"));
+        assert!(output.contains("attempts 1/8"));
+        assert!(output.contains("prompt 400+0 reserved/100000"));
+        assert!(output.contains("Provider test"));
+        assert!(output.contains("circuit closed"));
+        assert!(output.contains("a approve"));
+
+        state.apply(AgentEvent::WorkflowArtifact {
+            artifact: Box::new(pi_harness::WorkflowArtifactSnapshot {
+                run_id: "wf-1".into(),
+                artifact_id: "artifact-plan".into(),
+                step_id: "plan".into(),
+                summary: "implementation plan".into(),
+                producer_role: "planner".into(),
+                producer_model: Some("test/planner".into()),
+                content: "Evidence retained outside parent context".into(),
+                truncated: false,
+            }),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 120, 30);
+        assert!(output.contains("artifact-plan"));
+        assert!(output.contains("Evidence retained outside parent context"));
     }
 
     #[test]
@@ -3677,6 +3942,34 @@ mod tests {
         ));
         assert_eq!(state.view, super::View::Dashboard);
 
+        state.prompt = "/workflow implement-review Fix the resume bug".into();
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::StartWorkflow { workflow, input, .. })
+                if workflow == "implement-review" && input == "Fix the resume bug"
+        ));
+
+        state.prompt =
+            "/workflow review --params {\"target\":\"src\",\"depth\":2} -- Inspect the patch"
+                .into();
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::StartWorkflow { workflow, input, parameters: Some(parameters), .. })
+                if workflow == "review"
+                    && input == "Inspect the patch"
+                    && parameters == serde_json::json!({"target": "src", "depth": 2})
+        ));
+
+        state.prompt = "/workflow".into();
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::LoadWorkflowCatalog)
+        ));
+        assert!(state.prompt.is_empty());
+
         state.prompt = "/mode".into();
         state.cursor = 5;
         let previous = state.permission_mode.label();
@@ -3732,6 +4025,292 @@ mod tests {
             state.activate_overlay(),
             super::state::OverlayAction::BeginOauth(provider) if provider == "anthropic"
         ));
+    }
+
+    #[test]
+    fn workflow_catalog_opens_resolved_preflight_and_keeps_invalid_entries_visible() {
+        let workflows = vec![
+            pi_harness::WorkflowCatalogEntry {
+                name: "review".into(),
+                description: Some("Review changes".into()),
+                source: "builtin".into(),
+                valid: true,
+                error: None,
+            },
+            pi_harness::WorkflowCatalogEntry {
+                name: "broken".into(),
+                description: None,
+                source: "global".into(),
+                valid: false,
+                error: Some("steps must be an array".into()),
+            },
+        ];
+        let mut state = super::AppState::default();
+        state.prompt = "/workflow check review".into();
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::PreviewWorkflow { workflow }) if workflow == "review"
+        ));
+        state.apply(pi_harness::AgentEvent::WorkflowCatalog {
+            workflows: workflows.clone(),
+        });
+        assert_eq!(state.overlay, super::OverlayKind::WorkflowPicker);
+        assert!(state.overlay_items()[1].contains("[invalid]"));
+
+        state.overlay_query = "review".into();
+        assert_eq!(state.overlay_items().len(), 1);
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::PreviewWorkflow { workflow } if workflow == "review"
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::None);
+
+        let preview = pi_harness::WorkflowPreview {
+            name: "review".into(),
+            version: Some(serde_json::json!(1)),
+            description: Some("Review changes".into()),
+            definition_hash: "abc123def456".into(),
+            resolved_at_ms: 10,
+            budget: Some(pi_harness::WorkflowBudgetSnapshot {
+                max_agent_attempts: Some(5),
+                max_prompt_tokens: Some(100_000),
+                max_output_tokens: Some(10_000),
+                max_cache_write_tokens: Some(20_000),
+                agent_attempts: 0,
+                prompt_tokens: 0,
+                output_tokens: 0,
+                cache_write_tokens: 0,
+                reserved_prompt_tokens: 0,
+                reserved_output_tokens: 0,
+                reserved_cache_write_tokens: 0,
+                unknown_usage_attempts: 0,
+            }),
+            provider_policies: vec![pi_harness::WorkflowProviderPolicySnapshot {
+                provider: "openai".into(),
+                max_concurrency: Some(2),
+                max_starts: Some(10),
+                window_ms: Some(60_000),
+                failure_threshold: Some(3),
+                cooldown_ms: Some(30_000),
+            }],
+            steps: vec![pi_harness::WorkflowPreviewStep {
+                id: "inspect".into(),
+                r#type: "agent".into(),
+                description: None,
+                role: Some("reviewer".into()),
+                agent: Some("review".into()),
+                model: Some("openai/gpt-5".into()),
+                model_route: Some("reviewer".into()),
+                model_candidates: Some(vec!["openai/gpt-5".into(), "fallback/model".into()]),
+                thinking: Some("high".into()),
+                capability: Some("read-only".into()),
+                isolation: Some("none".into()),
+                session: Some("ephemeral".into()),
+                session_key: None,
+                tools: vec!["read".into(), "search".into()],
+                forced_read_only: true,
+                reports: Some("previous".into()),
+                timeout_ms: Some(1_200_000),
+                max_attempts: Some(2),
+                retry_backoff_ms: Some(1_000),
+                retry_on: vec!["failed".into(), "timeout".into()],
+                output_contract: Some("review_verdict".into()),
+                condition: None,
+                guardrails: Some(pi_harness::WorkflowGuardrailsPreview {
+                    max_prompt_bytes: Some(65_536),
+                    max_artifact_bytes: Some(49_152),
+                    max_artifacts: Some(4),
+                    max_prompt_tokens: Some(20_000),
+                    max_output_tokens: Some(2_000),
+                    max_cache_write_tokens: Some(5_000),
+                    min_cache_hit_rate: Some(0.5),
+                    allowed_models: Some(vec!["openai/gpt-5".into()]),
+                    allowed_tools: Some(vec!["read".into(), "search".into()]),
+                    require_stable_cache_prefix: true,
+                    on_violation: "fail".into(),
+                }),
+                external_effects: Some(pi_harness::WorkflowExternalEffectsPreview {
+                    approved_by: "approve-review".into(),
+                }),
+                source: Some("shared-review:inspect via audit".into()),
+                parameter_scope: Some("audit".into()),
+                parameter_keys: vec!["target".into()],
+                children: vec![],
+            }],
+            contracts: vec![pi_harness::WorkflowContractPreview {
+                name: "audit.plan".into(),
+                description: Some("Bounded implementation plan".into()),
+                max_bytes: 16_384,
+                schema_hash: "schema1234567890".into(),
+            }],
+            parameters: Some(pi_harness::WorkflowParameterPreview {
+                description: Some("Review scope".into()),
+                max_bytes: 4096,
+                schema_hash: "params123456789".into(),
+                required: vec!["target".into()],
+                defaults: serde_json::json!({"depth": 2}),
+            }),
+            components: vec![pi_harness::WorkflowComponentPreview {
+                invocation: "audit".into(),
+                workflow: "shared-review".into(),
+                version: Some(serde_json::json!(1)),
+                definition_hash: "component123456789".into(),
+                parameter_binding_hash: Some("bindings123456789".into()),
+                parameter_bindings: std::collections::BTreeMap::from([(
+                    "target".into(),
+                    "root:[\"target\"]".into(),
+                )]),
+            }],
+            readiness: pi_harness::WorkflowReadiness {
+                status: "warning".into(),
+                issues: vec![pi_harness::WorkflowReadinessIssue {
+                    severity: "warning".into(),
+                    code: "model_route_fallback".into(),
+                    message: "route reviewer selected fallback openai/gpt-5".into(),
+                    step_id: Some("inspect".into()),
+                }],
+            },
+        };
+        state.apply(pi_harness::AgentEvent::WorkflowPreview {
+            preview: Box::new(preview),
+        });
+        assert_eq!(state.overlay, super::OverlayKind::WorkflowPreview);
+        let preview_lines = state.overlay_items();
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("openai/gpt-5"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("capability=read-only (forced)"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("retry=failed/timeout"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("guardrails=fail"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("Workflow budget: attempts<=5"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("Provider openai: concurrency<=2"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("source=shared-review:inspect via audit"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("parameters=audit [target]"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("Contract audit.plan"))
+        );
+        assert!(preview_lines.iter().any(|line| {
+            line.contains("Parameters: max 4096B")
+                && line.contains("required target")
+                && line.contains("\"depth\":2")
+        }));
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("Component audit: shared-review@1")
+                    && line.contains("bindings bindings123"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("parameter map: target=root:[\"target\"]"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("allow models=openai/gpt-5"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("Readiness: warning"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("route=reviewer"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line.contains("model_route_fallback"))
+        );
+        assert!(
+            preview_lines
+                .iter()
+                .any(|line| line
+                    .contains("external effects · approved by checkpoint approve-review"))
+        );
+        let mut blocked_preview = state.workflow_preview.clone().unwrap();
+        blocked_preview.readiness = pi_harness::WorkflowReadiness {
+            status: "blocked".into(),
+            issues: vec![pi_harness::WorkflowReadinessIssue {
+                severity: "blocker".into(),
+                code: "model_unavailable".into(),
+                message: "model fallback/model is not available".into(),
+                step_id: Some("inspect".into()),
+            }],
+        };
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.prompt, "/workflow review ");
+        state.prompt.push_str("Inspect the patch");
+        state.cursor = state.prompt.chars().count();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::StartWorkflow {
+                workflow,
+                input,
+                parameters: _,
+                expected_definition_hash: Some(hash),
+            }) if workflow == "review" && input == "Inspect the patch" && hash == "abc123def456"
+        ));
+
+        state.apply(pi_harness::AgentEvent::WorkflowCatalog { workflows });
+        state.overlay_selected = 1;
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::WorkflowPicker);
+        assert!(state.status.contains("steps must be an array"));
+
+        state.apply(pi_harness::AgentEvent::WorkflowPreview {
+            preview: Box::new(blocked_preview),
+        });
+        let prompt_before = state.prompt.clone();
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::WorkflowPreview);
+        assert_eq!(state.prompt, prompt_before);
+        assert!(state.status.contains("readiness is blocked"));
     }
 
     #[test]

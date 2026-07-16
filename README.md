@@ -17,7 +17,12 @@ A terminal interface for coding-agent sessions powered by the Pi SDK. (WIP). The
 - Clickable image previews with aspect-ratio-preserving terminal rendering.
 - Non-blocking clipboard image decoding with processing, success, and error states.
 - Project file references, shell commands, prompt history, plans, MCP tools, and package management.
+- Durable multi-agent workflows with frozen model/role routing, checkpoints, parallel read-only review, compact artifacts, and resume recovery.
+- On-demand MCP tool discovery that grows the active tool set monotonically and restores it on session resume.
 - Interactive and headless operation.
+
+See [Workflow architecture](docs/workflows.md) for authoring, multi-model
+routing, context and cache policies, and `/resume` behavior.
 
 ## Screenshots
 <img width="1337" height="896" alt="screenshot-20260713-185523" src="https://github.com/user-attachments/assets/3512820a-733a-4439-95c0-065cf89da725" />
@@ -87,3 +92,40 @@ torii update [package]
 torii list
 torii config
 ```
+
+## Workflows
+
+Torii includes `production-change`, `implement-review`, and `review` workflows.
+The production workflow isolates optional MCP evidence, requires plan approval,
+and applies context/cache guardrails through implementation and review. Custom YAML or JSON
+definitions can be placed in `~/.pi/agent/workflows` (using Pi's resolved agent
+directory) or, for trusted projects, `.pi/workflows`. Project definitions
+shadow global definitions only after the project is trusted.
+
+The agent controls workflows with `workflow_start`, `workflow_status`,
+`workflow_control`, and `artifact_read`. MCP connectors are discovered through
+`tool_search` and enabled only when needed. See [Workflow architecture](docs/workflows.md)
+for the schema, model routing, trust boundaries, and `/resume` behavior.
+
+Open `/workflow` to search the trusted workflow catalog and inspect its resolved
+models, permissions, tools and policies before launch, or start one directly with
+`/workflow <name> <task>`. Use `/workflow check <name>` for live model, agent,
+tool, MCP, and context-fan-in readiness without launching. Open
+`/workflows` for the native execution dashboard, checkpoint controls, retry and
+cancel actions, artifact inspection, context budgets, tool-schema/cache-prefix
+fingerprints, declarative guardrail violations, and enforceable provider
+prompt/output/cache budgets. Optional workflow-wide budgets reserve headroom
+across parallel calls and retain cumulative consumption across `/resume`.
+Provider concurrency, journal-backed rate limits, and circuit breakers prevent
+retry storms without changing a run's frozen model route.
+Bounded custom JSON contracts create validated handoff artifacts, while static
+workflow composition namespaces and freezes reusable fragments before launch.
+Closed typed launch parameters use the `/workflow <name> --params ... -- <task>`
+form and are validated, canonicalized, and frozen across `/resume` without
+being interpolated into workflow prompts. Composed fragments can be pinned to
+an exact declared version and receive only statically bound parameter views, so
+incompatible changes or broader-than-declared context fail during preflight.
+
+External MCP mutations require an earlier named checkpoint, an exact fail-closed
+tool allowlist, ephemeral execution, and a typed `effect_receipt`. Interrupted
+writers never replay automatically after `/resume`; retry is an explicit operator action.

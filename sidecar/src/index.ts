@@ -21,6 +21,8 @@ import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
 import * as pi from "./pi-adapter.ts";
 import { NativeSubagentCoordinator, type TaskSnapshot } from "./subagents.ts";
+import { WorkflowCoordinator, workflowBelongsToSession } from "./workflows/coordinator.ts";
+import { WorkflowRunStore } from "./workflows/store.ts";
 
 // -----------------------------------------------------------------------------
 // Per-session state at the protocol layer.
@@ -40,7 +42,9 @@ const subagents = new NativeSubagentCoordinator(async (context) => {
   if (parent === undefined) throw new Error(`subagent parent session is not resident: ${context.parentSessionId}`);
   return pi.launchNativeSubagent(context, openHooks, subagents, parent);
 });
+const workflows = new WorkflowCoordinator(new WorkflowRunStore(pi.workflowRunRoot()), subagents);
 const persistedTaskStates = new Map<string, string>();
+const persistedWorkflowStates = new Map<string, string>();
 
 subagents.subscribe((record) => {
   const parent = sessions.get(record.parentSessionId);
@@ -52,13 +56,32 @@ subagents.subscribe((record) => {
     parent.session.sessionManager.appendCustomEntry("torii.subagent", snapshot);
     persistedTaskStates.set(record.taskId, persistenceKey);
   }
-  if (record.completedAt === undefined || persistedTaskStates.has(`${record.taskId}:notified`)) return;
+  if (record.completedAt === undefined || record.workflowRunId !== undefined || persistedTaskStates.has(`${record.taskId}:notified`)) return;
   persistedTaskStates.set(`${record.taskId}:notified`, "true");
-  const fullResult = record.output ?? record.error ?? `Subagent ${record.status}`;
-  const result = fullResult.length > 50_000 ? `${fullResult.slice(0, 50_000)}\n\n[Subagent result truncated; full output remains in task metadata.]` : fullResult;
-  const content = `[Subagent ${record.status}: ${record.description} (${record.taskId})]\n${result}`;
+  const content = `[Subagent ${record.status}: ${record.description} (${record.taskId})]\nResult retained outside the parent context. Use get_command_or_subagent_output with task_id=${record.taskId} to inspect it.`;
+  const compact = { ...snapshot, output: undefined, error: snapshot.error?.slice(0, 1000) };
   void parent.session.sendCustomMessage(
-    { customType: "torii.subagent-result", content, display: true, details: snapshot },
+    { customType: "torii.subagent-result", content, display: true, details: compact },
+    parent.session.isStreaming ? { triggerTurn: false, deliverAs: "nextTurn" } : { triggerTurn: false },
+  );
+});
+
+workflows.subscribe((state) => {
+  const parent = sessions.get(state.rootSessionId);
+  if (parent === undefined) return;
+  writeMessage({ type: "event", session_id: state.rootSessionId, event: { type: "workflow_update", workflow: workflows.snapshot(state) } });
+  const summary = workflows.summary(state);
+  const notable = new Set(["paused", "completed", "failed", "cancelled"]).has(state.status);
+  const persistenceKey = `${summary.status}:${summary.current_step ?? ""}:${summary.completed_steps}`;
+  if (notable && persistedWorkflowStates.get(state.runId) !== persistenceKey) {
+    parent.session.sessionManager.appendCustomEntry("torii.workflow", summary);
+    persistedWorkflowStates.set(state.runId, persistenceKey);
+  }
+  if (!notable || persistedWorkflowStates.has(`${state.runId}:notified:${state.status}`)) return;
+  persistedWorkflowStates.set(`${state.runId}:notified:${state.status}`, "true");
+  const content = `[Workflow ${state.status}: ${state.plan.name} (${state.runId})]\n${summary.completed_steps}/${summary.total_steps} steps completed. Use workflow_status for details and artifact references.`;
+  void parent.session.sendCustomMessage(
+    { customType: "torii.workflow-result", content, display: true, details: summary },
     parent.session.isStreaming ? { triggerTurn: false, deliverAs: "nextTurn" } : { triggerTurn: false },
   );
 });
@@ -85,6 +108,7 @@ const openHooks: pi.OpenSessionHooks = {
   unregisterPermissionReply: (id) => permissionReplies.delete(id),
   mcpClients,
   subagents,
+  workflows,
 };
 
 function restoreSubagents(active: pi.ActiveSession): AgentEvent[] {
@@ -115,10 +139,12 @@ function restoreSubagents(active: pi.ActiveSession): AgentEvent[] {
       completedAt: task.completed_at_ms,
       output: task.output,
       error: task.error,
+      failureKind: task.failure_kind,
       model: task.model,
       thinkingLevel: task.thinking_level,
       worktreePath: task.worktree_path,
       cwd: task.cwd,
+      workflowRunId: task.workflow_run_id,
     });
     const restored = subagents.get(task.task_id);
     if (restored !== undefined) {
@@ -132,6 +158,24 @@ function restoreSubagents(active: pi.ActiveSession): AgentEvent[] {
     }
   }
   return events;
+}
+
+function restoreWorkflows(active: pi.ActiveSession): AgentEvent[] {
+  return workflows.list()
+    .filter((run) => workflowBelongsToSession(run, active.wireSessionId, active.session.sessionFile))
+    .map((run) => workflows.attachSession(run.runId, active.wireSessionId, active.session.sessionFile))
+    .map((run) => ({ type: "workflow_update" as const, workflow: workflows.snapshot(run) }));
+}
+
+function resumeResidentWorkflows(active: pi.ActiveSession): void {
+  for (const run of workflows.list()) {
+    if (
+      run.rootSessionPath === active.session.sessionFile
+      && (run.status === "pending" || run.status === "running" || run.status === "interrupted")
+    ) {
+      void workflows.resume(run.runId).catch(() => undefined);
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -160,6 +204,9 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
     const { active, history } = await pi.openSession(command, openHooks);
     sessions.set(active.wireSessionId, active);
     history.push(...restoreSubagents(active));
+    restoreWorkflows(active);
+    resumeResidentWorkflows(active);
+    history.push(...restoreWorkflows(active));
     writeMessage({ type: "response", request_id: command.request_id, session_id: active.wireSessionId, history });
     return;
   }
@@ -173,6 +220,73 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
     const task = subagents.get(command.task_id);
     if (task === undefined || task.parentSessionId !== sessionId || task.parentSessionPath !== active.session.sessionFile) throw new Error(`unknown task for session: ${command.task_id}`);
     await subagents.kill(command.task_id);
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "workflow_control") {
+    const run = workflows.get(command.run_id);
+    if (run.rootSessionId !== sessionId || run.rootSessionPath !== active.session.sessionFile) throw new Error(`unknown workflow for session: ${command.run_id}`);
+    await workflows.control(command.run_id, command.action, command.step_id);
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "workflow_start") {
+    const plan = await pi.resolveNamedWorkflow(active, command.workflow);
+    pi.assertWorkflowReady(await pi.workflowReadinessForActive(active, plan));
+    if (command.expected_definition_hash !== undefined && plan.definitionHash !== command.expected_definition_hash) {
+      throw new Error(`workflow ${command.workflow} changed after preflight; inspect it again before starting`);
+    }
+    const started = workflows.start({
+      rootSessionId: sessionId,
+      rootSessionPath: active.session.sessionFile,
+      cwd: active.cwd,
+      input: command.input,
+      parameters: command.parameters,
+      background: true,
+      plan,
+    });
+    void started.completion.catch(() => undefined);
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "workflow_catalog") {
+    writeMessage({ type: "event", session_id: sessionId, event: { type: "workflow_catalog", workflows: pi.workflowCatalog(active) } });
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "workflow_preview") {
+    writeMessage({ type: "event", session_id: sessionId, event: { type: "workflow_preview", preview: await pi.workflowPreview(active, command.workflow) } });
+    writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "workflow_artifact_read") {
+    const run = workflows.get(command.run_id);
+    if (run.rootSessionId !== sessionId || run.rootSessionPath !== active.session.sessionFile) throw new Error(`unknown workflow for session: ${command.run_id}`);
+    const artifact = workflows.readArtifact(command.run_id, command.artifact_id);
+    const raw = typeof artifact.data === "string" ? artifact.data : JSON.stringify(artifact.data, null, 2);
+    const content = Buffer.from(raw, "utf8").subarray(0, 100_000).toString("utf8").replace(/\uFFFD$/, "");
+    writeMessage({
+      type: "event",
+      session_id: sessionId,
+      event: {
+        type: "workflow_artifact",
+        artifact: {
+          run_id: command.run_id,
+          artifact_id: artifact.id,
+          step_id: artifact.stepId,
+          summary: artifact.summary,
+          producer_role: artifact.producer.role,
+          producer_model: artifact.producer.model,
+          content,
+          truncated: Buffer.byteLength(raw, "utf8") > 100_000,
+        },
+      },
+    });
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }
@@ -330,10 +444,13 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   if (command.type === "resume_session") {
     await pi.switchSession(active, command.target);
     const subagentHistory = restoreSubagents(active);
+    restoreWorkflows(active);
+    resumeResidentWorkflows(active);
+    const workflowHistory = restoreWorkflows(active);
     writeMessage({
       type: "response",
       request_id: command.request_id,
-      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory],
+      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory, ...workflowHistory],
     });
     return;
   }

@@ -93,6 +93,28 @@ impl Resident {
                     }
                 }
             }
+            AgentEvent::WorkflowUpdate { workflow } => {
+                let key = format!("workflow:{}", workflow.run_id);
+                if workflow.status == "running" || workflow.status == "pending" {
+                    self.background_tasks.insert(key);
+                    self.status = RuntimeStatus::Running;
+                    self.started_at.get_or_insert_with(Instant::now);
+                } else {
+                    self.background_tasks.remove(&key);
+                    if workflow.status == "failed"
+                        || workflow.status == "interrupted"
+                        || workflow.status == "paused"
+                    {
+                        self.status = RuntimeStatus::Attention;
+                    } else if !self.turn_running
+                        && self.running_tools.is_empty()
+                        && self.background_tasks.is_empty()
+                    {
+                        self.status = RuntimeStatus::Idle;
+                        self.started_at = None;
+                    }
+                }
+            }
             AgentEvent::TurnComplete { .. } => {
                 self.turn_running = false;
                 if self.running_tools.is_empty() && self.background_tasks.is_empty() {
@@ -126,6 +148,10 @@ impl Resident {
                 task.status == "failed" || task.status == "interrupted"
             }
             AgentEvent::Error { .. } => true,
+            AgentEvent::WorkflowUpdate { workflow } => matches!(
+                workflow.status.as_str(),
+                "failed" | "interrupted" | "paused"
+            ),
             _ => false,
         });
         self.status = if needs_attention {
@@ -550,7 +576,7 @@ fn runtime_infos(residents: &HashMap<String, Resident>) -> Vec<RuntimeSessionInf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_harness::{MockHarness, SubagentTask, Usage};
+    use pi_harness::{MockHarness, SubagentTask, Usage, WorkflowRunSnapshot};
 
     fn task(status: &str) -> SubagentTask {
         SubagentTask {
@@ -570,10 +596,31 @@ mod tests {
             duration_ms: 1,
             output: None,
             error: None,
+            failure_kind: None,
             model: None,
             thinking_level: None,
             worktree_path: None,
             cwd: None,
+            workflow_run_id: None,
+        }
+    }
+
+    fn workflow(status: &str) -> WorkflowRunSnapshot {
+        WorkflowRunSnapshot {
+            run_id: "wf-1".into(),
+            name: "implement-review".into(),
+            description: None,
+            status: status.into(),
+            current_step: None,
+            completed_steps: 0,
+            total_steps: 1,
+            artifact_ids: Vec::new(),
+            budget: None,
+            provider_states: Vec::new(),
+            steps: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            error: None,
         }
     }
 
@@ -618,6 +665,51 @@ mod tests {
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(supervisor.snapshots().await[0].status, RuntimeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn workflow_lifecycle_drives_resident_running_and_attention_states() {
+        let harness: Arc<dyn AgentHarness> = Arc::new(MockHarness::default());
+        let supervisor = SessionSupervisor::new(harness);
+        let (sender, receiver) = broadcast::channel(16);
+        supervisor
+            .adopt(
+                "/session.jsonl".into(),
+                SessionId("session-1".into()),
+                receiver,
+            )
+            .await;
+        settle().await;
+
+        sender
+            .send(AgentEvent::WorkflowUpdate {
+                workflow: Box::new(workflow("running")),
+            })
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            supervisor.snapshots().await[0].status,
+            RuntimeStatus::Running
+        );
+
+        sender
+            .send(AgentEvent::WorkflowUpdate {
+                workflow: Box::new(workflow("paused")),
+            })
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            supervisor.snapshots().await[0].status,
+            RuntimeStatus::Attention
+        );
+
+        sender
+            .send(AgentEvent::WorkflowUpdate {
+                workflow: Box::new(workflow("completed")),
+            })
+            .unwrap();
+        settle().await;
         assert_eq!(supervisor.snapshots().await[0].status, RuntimeStatus::Idle);
     }
 

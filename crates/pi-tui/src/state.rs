@@ -1,6 +1,7 @@
 use pi_harness::{
     AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
-    SessionTreeEntry, SubagentTask, ToolResult, Usage,
+    SessionTreeEntry, SubagentTask, ToolResult, Usage, WorkflowArtifactSnapshot,
+    WorkflowCatalogEntry, WorkflowPreview, WorkflowPreviewStep, WorkflowRunSnapshot,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -19,6 +20,8 @@ pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/dashboard",
+    "/workflow",
+    "/workflows",
     "/model",
     "/resume",
     "/new",
@@ -52,10 +55,171 @@ const SLASH_COMMANDS: &[&str] = &[
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum View {
     Dashboard,
+    Workflows,
+    WorkflowArtifact,
     Tasks,
     Subagent,
     #[default]
     Transcript,
+}
+
+fn append_workflow_preview_step(
+    lines: &mut Vec<String>,
+    step: &WorkflowPreviewStep,
+    number: &str,
+    indent: &str,
+) {
+    lines.push(format!("{indent}{number}. {} [{}]", step.id, step.r#type));
+    if let Some(source) = step.source.as_deref() {
+        lines.push(format!("{indent}   source={source}"));
+    }
+    if let Some(scope) = step.parameter_scope.as_deref() {
+        lines.push(format!(
+            "{indent}   parameters={} [{}]",
+            scope,
+            step.parameter_keys.join(", ")
+        ));
+    }
+    if step.r#type == "checkpoint" {
+        lines.push(format!(
+            "{indent}   {}",
+            step.description.as_deref().unwrap_or("Manual approval")
+        ));
+        return;
+    }
+    if step.r#type == "parallel" {
+        lines.push(format!(
+            "{indent}   {} read-only member(s)",
+            step.children.len()
+        ));
+        for (index, child) in step.children.iter().enumerate() {
+            append_workflow_preview_step(lines, child, &format!("{number}.{}", index + 1), "  ");
+        }
+        return;
+    }
+    lines.push(format!(
+        "{indent}   role={} · agent={} · model={}",
+        step.role.as_deref().unwrap_or("default"),
+        step.agent.as_deref().unwrap_or("default"),
+        step.model.as_deref().unwrap_or("parent")
+    ));
+    if let Some(route) = step.model_route.as_deref() {
+        lines.push(format!(
+            "{indent}   route={} · candidates={}",
+            route,
+            step.model_candidates
+                .as_ref()
+                .map(|models| models.join(" -> "))
+                .unwrap_or_else(|| "none".into())
+        ));
+    }
+    lines.push(format!(
+        "{indent}   capability={}{} · isolation={} · session={}{}",
+        step.capability.as_deref().unwrap_or("all"),
+        if step.forced_read_only {
+            " (forced)"
+        } else {
+            ""
+        },
+        step.isolation.as_deref().unwrap_or("none"),
+        step.session.as_deref().unwrap_or("ephemeral"),
+        step.session_key
+            .as_deref()
+            .map(|key| format!(" ({key})"))
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "{indent}   thinking={} · tools={} · reports={}",
+        step.thinking.as_deref().unwrap_or("default"),
+        if step.tools.is_empty() {
+            "role defaults".into()
+        } else {
+            step.tools.join(", ")
+        },
+        step.reports.as_deref().unwrap_or("previous")
+    ));
+    if let Some(policy) = step.guardrails.as_ref() {
+        let limits = [
+            policy
+                .max_prompt_bytes
+                .map(|value| format!("prompt<={value}B")),
+            policy
+                .max_artifact_bytes
+                .map(|value| format!("artifacts<={value}B")),
+            policy.max_artifacts.map(|value| format!("count<={value}")),
+            policy
+                .max_prompt_tokens
+                .map(|value| format!("prompt_tokens<={value}")),
+            policy
+                .max_output_tokens
+                .map(|value| format!("output_tokens<={value}")),
+            policy
+                .max_cache_write_tokens
+                .map(|value| format!("cache_write<={value}")),
+            policy
+                .min_cache_hit_rate
+                .map(|value| format!("cache_hit>={:.0}%", value * 100.0)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        lines.push(format!(
+            "{indent}   guardrails={} · cache={} · {}",
+            policy.on_violation,
+            if policy.require_stable_cache_prefix {
+                "stable"
+            } else {
+                "observe"
+            },
+            if limits.is_empty() {
+                "runtime routing only".into()
+            } else {
+                limits.join(", ")
+            }
+        ));
+        if policy.allowed_models.is_some() || policy.allowed_tools.is_some() {
+            lines.push(format!(
+                "{indent}   allow models={} · tools={}",
+                policy
+                    .allowed_models
+                    .as_ref()
+                    .map(|models| models.join(", "))
+                    .unwrap_or_else(|| "any".into()),
+                policy
+                    .allowed_tools
+                    .as_ref()
+                    .map(|tools| tools.join(", "))
+                    .unwrap_or_else(|| "any".into())
+            ));
+        }
+    }
+    if let Some(effects) = step.external_effects.as_ref() {
+        lines.push(format!(
+            "{indent}   external effects · approved by checkpoint {}",
+            effects.approved_by
+        ));
+    }
+    lines.push(format!(
+        "{indent}   timeout={}ms · attempts={}{}",
+        step.timeout_ms.unwrap_or_default(),
+        step.max_attempts.unwrap_or(1),
+        if step.retry_on.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · retry={} after {}ms",
+                step.retry_on.join("/"),
+                step.retry_backoff_ms.unwrap_or_default()
+            )
+        }
+    ));
+    if step.output_contract.is_some() || step.condition.is_some() {
+        lines.push(format!(
+            "{indent}   output={} · when={}",
+            step.output_contract.as_deref().unwrap_or("text"),
+            step.condition.as_deref().unwrap_or("always")
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +227,8 @@ pub enum OverlayKind {
     None,
     CommandPalette,
     ModelPicker,
+    WorkflowPicker,
+    WorkflowPreview,
     SessionPicker,
     SessionRename,
     SessionDeleteConfirm,
@@ -103,6 +269,16 @@ pub struct PendingOauth {
 pub enum OverlayAction {
     None,
     RefreshSessions,
+    LoadWorkflowCatalog,
+    PreviewWorkflow {
+        workflow: String,
+    },
+    StartWorkflow {
+        workflow: String,
+        input: String,
+        parameters: Option<serde_json::Value>,
+        expected_definition_hash: Option<String>,
+    },
     Quit,
     Permission {
         request_id: String,
@@ -364,6 +540,7 @@ pub struct AppState {
     pub view: View,
     pub dashboard_selected: usize,
     pub task_selected: usize,
+    pub workflow_selected: usize,
     pub inspected_subagent: Option<String>,
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
@@ -440,6 +617,10 @@ pub struct AppState {
     pub runtime_sessions: HashMap<String, pi_harness::RuntimeSessionInfo>,
     pub subagent_tasks: HashMap<String, SubagentTask>,
     pub subagent_transcripts: HashMap<String, Vec<AgentEvent>>,
+    pub workflow_runs: HashMap<String, WorkflowRunSnapshot>,
+    pub workflow_catalog: Vec<WorkflowCatalogEntry>,
+    pub workflow_preview: Option<WorkflowPreview>,
+    pub workflow_artifact: Option<WorkflowArtifactSnapshot>,
     pub session_sort: SessionSort,
     pub session_named_only: bool,
     pub session_show_path: bool,
@@ -466,12 +647,39 @@ pub struct AppState {
     pub transcript_hit_regions: RefCell<Vec<TranscriptHitRegion>>,
 }
 
+fn parse_workflow_start_argument(
+    value: &str,
+) -> Result<(String, String, Option<serde_json::Value>), ()> {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let workflow = parts.next().unwrap_or_default().trim();
+    let remainder = parts.next().unwrap_or_default().trim();
+    if workflow.is_empty() || remainder.is_empty() {
+        return Err(());
+    }
+    let Some(json_source) = remainder.strip_prefix("--params ").map(str::trim_start) else {
+        return Ok((workflow.into(), remainder.into(), None));
+    };
+    let mut values = serde_json::Deserializer::from_str(json_source).into_iter();
+    let parameters: serde_json::Value = values.next().ok_or(())?.map_err(|_| ())?;
+    if !parameters.is_object() {
+        return Err(());
+    }
+    let task = json_source[values.byte_offset()..]
+        .trim_start()
+        .strip_prefix("--")
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .ok_or(())?;
+    Ok((workflow.into(), task.into(), Some(parameters)))
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
             view: View::Transcript,
             dashboard_selected: 0,
             task_selected: 0,
+            workflow_selected: 0,
             inspected_subagent: None,
             dashboard_list_rect: Cell::new(None),
             composer_targets: RefCell::new(Vec::new()),
@@ -540,6 +748,10 @@ impl Default for AppState {
             runtime_sessions: HashMap::new(),
             subagent_tasks: HashMap::new(),
             subagent_transcripts: HashMap::new(),
+            workflow_runs: HashMap::new(),
+            workflow_catalog: Vec::new(),
+            workflow_preview: None,
+            workflow_artifact: None,
             session_sort: SessionSort::default(),
             session_named_only: false,
             session_show_path: false,
@@ -569,6 +781,38 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn sorted_workflows(&self) -> Vec<&WorkflowRunSnapshot> {
+        let mut workflows: Vec<_> = self.workflow_runs.values().collect();
+        workflows.sort_by_key(|workflow| std::cmp::Reverse(workflow.updated_at_ms));
+        workflows
+    }
+
+    pub fn selected_workflow(&self) -> Option<&WorkflowRunSnapshot> {
+        self.sorted_workflows().get(self.workflow_selected).copied()
+    }
+
+    pub fn selected_workflow_control(&self, action: &str) -> Option<(String, Option<String>)> {
+        let workflow = self.selected_workflow()?;
+        let allowed = match action {
+            "approve" | "reject" => workflow.status == "paused",
+            "cancel" => matches!(
+                workflow.status.as_str(),
+                "pending" | "running" | "paused" | "interrupted"
+            ),
+            "retry" => matches!(workflow.status.as_str(), "failed" | "interrupted"),
+            _ => false,
+        };
+        allowed.then(|| (workflow.run_id.clone(), workflow.current_step.clone()))
+    }
+
+    pub fn selected_workflow_artifact(&self) -> Option<(String, String)> {
+        let workflow = self.selected_workflow()?;
+        workflow
+            .artifact_ids
+            .last()
+            .map(|artifact_id| (workflow.run_id.clone(), artifact_id.clone()))
+    }
+
     pub fn sorted_subagent_tasks(&self) -> Vec<&SubagentTask> {
         let mut tasks: Vec<_> = self.subagent_tasks.values().collect();
         tasks.sort_by_key(|task| std::cmp::Reverse(task.started_at_ms));
@@ -749,6 +993,49 @@ impl AppState {
                     .unwrap_or(0);
                 OverlayAction::RefreshSessions
             }
+            "/workflows" => {
+                self.view = View::Workflows;
+                self.workflow_selected = self
+                    .workflow_selected
+                    .min(self.workflow_runs.len().saturating_sub(1));
+                OverlayAction::None
+            }
+            "/workflow" => {
+                if argument.is_none() {
+                    self.clear_prompt();
+                    return Some(OverlayAction::LoadWorkflowCatalog);
+                }
+                if let Some(workflow) = argument
+                    .and_then(|value| value.strip_prefix("check "))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                {
+                    self.clear_prompt();
+                    self.status = format!("checking workflow {workflow}…");
+                    return Some(OverlayAction::PreviewWorkflow { workflow });
+                }
+                let parsed = argument.and_then(|value| parse_workflow_start_argument(value).ok());
+                if let Some((workflow, input, parameters)) = parsed {
+                    let expected_definition_hash = self
+                        .workflow_preview
+                        .as_ref()
+                        .filter(|preview| preview.name == workflow)
+                        .map(|preview| preview.definition_hash.clone());
+                    self.workflow_preview = None;
+                    OverlayAction::StartWorkflow {
+                        workflow,
+                        input,
+                        parameters,
+                        expected_definition_hash,
+                    }
+                } else {
+                    self.push_command_usage(
+                        "Usage: /workflow <name> [--params <json-object> --] <task>",
+                    );
+                    OverlayAction::None
+                }
+            }
             "/model" => {
                 self.open_overlay(OverlayKind::ModelPicker);
                 OverlayAction::None
@@ -830,6 +1117,8 @@ impl AppState {
                 self.entries.clear();
                 self.subagent_tasks.clear();
                 self.subagent_transcripts.clear();
+                self.workflow_runs.clear();
+                self.workflow_artifact = None;
                 self.context_used = 0;
                 self.scroll_from_bottom = 0;
                 OverlayAction::None
@@ -955,6 +1244,23 @@ impl AppState {
                 .into_iter()
                 .map(|model| model.display_name.clone())
                 .collect(),
+            OverlayKind::WorkflowPicker => self
+                .filtered_workflows()
+                .into_iter()
+                .map(|workflow| {
+                    let description = workflow
+                        .description
+                        .as_deref()
+                        .or(workflow.error.as_deref())
+                        .unwrap_or("No description");
+                    let invalid = if workflow.valid { "" } else { " [invalid]" };
+                    format!(
+                        "{}  · {}{}  · {}",
+                        workflow.name, workflow.source, invalid, description
+                    )
+                })
+                .collect(),
+            OverlayKind::WorkflowPreview => self.workflow_preview_items(),
             OverlayKind::SessionPicker => self
                 .filtered_sessions()
                 .into_iter()
@@ -1082,6 +1388,7 @@ impl AppState {
                     self.overlay,
                     OverlayKind::SessionPicker
                         | OverlayKind::ModelPicker
+                        | OverlayKind::WorkflowPicker
                         | OverlayKind::ScopedModels
                         | OverlayKind::SubagentModelPicker
                 ) || query.is_empty()
@@ -1107,6 +1414,188 @@ impl AppState {
                 .then_with(|| left.display_name.cmp(&right.display_name))
         });
         models
+    }
+
+    pub(crate) fn filtered_workflows(&self) -> Vec<&WorkflowCatalogEntry> {
+        let query = self.overlay_query.to_ascii_lowercase();
+        self.workflow_catalog
+            .iter()
+            .filter(|workflow| {
+                query.is_empty()
+                    || workflow.name.to_ascii_lowercase().contains(&query)
+                    || workflow.source.to_ascii_lowercase().contains(&query)
+                    || workflow
+                        .description
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+                    || workflow
+                        .error
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
+    fn workflow_preview_items(&self) -> Vec<String> {
+        let Some(preview) = self.workflow_preview.as_ref() else {
+            return vec!["No resolved workflow available".into()];
+        };
+        let mut lines = vec![
+            preview
+                .description
+                .clone()
+                .unwrap_or_else(|| "No description".into()),
+            format!(
+                "Definition {}",
+                &preview.definition_hash[..preview.definition_hash.len().min(12)]
+            ),
+            format!("Readiness: {}", preview.readiness.status),
+        ];
+        if let Some(budget) = preview.budget.as_ref() {
+            let limits = [
+                budget
+                    .max_agent_attempts
+                    .map(|value| format!("attempts<={value}")),
+                budget
+                    .max_prompt_tokens
+                    .map(|value| format!("prompt<={value}")),
+                budget
+                    .max_output_tokens
+                    .map(|value| format!("output<={value}")),
+                budget
+                    .max_cache_write_tokens
+                    .map(|value| format!("cache_write<={value}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            lines.push(format!("Workflow budget: {}", limits.join(" Â· ")));
+        }
+        for policy in &preview.provider_policies {
+            let limits = [
+                policy
+                    .max_concurrency
+                    .map(|value| format!("concurrency<={value}")),
+                policy
+                    .max_starts
+                    .zip(policy.window_ms)
+                    .map(|(starts, window)| format!("rate<={starts}/{window}ms")),
+                policy
+                    .failure_threshold
+                    .zip(policy.cooldown_ms)
+                    .map(|(failures, cooldown)| {
+                        format!("circuit={failures} failures/{cooldown}ms")
+                    }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            lines.push(format!(
+                "Provider {}: {}",
+                policy.provider,
+                limits.join(" Â· ")
+            ));
+        }
+        for component in &preview.components {
+            lines.push(format!(
+                "Component {}: {}{} Â· definition {}{}",
+                component.invocation,
+                component.workflow,
+                component
+                    .version
+                    .as_ref()
+                    .map(|version| format!("@{version}"))
+                    .unwrap_or_default(),
+                &component.definition_hash[..component.definition_hash.len().min(12)],
+                component
+                    .parameter_binding_hash
+                    .as_deref()
+                    .map(|hash| format!(" Â· bindings {}", &hash[..hash.len().min(12)]))
+                    .unwrap_or_default()
+            ));
+            if !component.parameter_bindings.is_empty() {
+                let mut bindings = component
+                    .parameter_bindings
+                    .iter()
+                    .take(8)
+                    .map(|(name, source)| {
+                        let source = if source.chars().count() > 120 {
+                            format!("{}...", source.chars().take(117).collect::<String>())
+                        } else {
+                            source.clone()
+                        };
+                        format!("{name}={source}")
+                    })
+                    .collect::<Vec<_>>();
+                if component.parameter_bindings.len() > bindings.len() {
+                    bindings.push(format!(
+                        "+{} more",
+                        component.parameter_bindings.len() - bindings.len()
+                    ));
+                }
+                lines.push(format!("  parameter map: {}", bindings.join(", ")));
+            }
+        }
+        for contract in &preview.contracts {
+            lines.push(format!(
+                "Contract {}: max {}B Â· schema {}{}",
+                contract.name,
+                contract.max_bytes,
+                contract.schema_hash,
+                contract
+                    .description
+                    .as_deref()
+                    .map(|description| format!(" Â· {description}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Some(parameters) = preview.parameters.as_ref() {
+            let defaults = parameters.defaults.to_string();
+            let defaults = if defaults.chars().count() > 240 {
+                format!("{}...", defaults.chars().take(237).collect::<String>())
+            } else {
+                defaults
+            };
+            let required = if parameters.required.is_empty() {
+                "none".into()
+            } else {
+                parameters.required.join(", ")
+            };
+            lines.push(format!(
+                "Parameters: max {}B Â· schema {} Â· required {} Â· defaults {}{}",
+                parameters.max_bytes,
+                parameters.schema_hash,
+                required,
+                defaults,
+                parameters
+                    .description
+                    .as_deref()
+                    .map(|description| format!(" Â· {description}"))
+                    .unwrap_or_default()
+            ));
+        }
+        for issue in &preview.readiness.issues {
+            lines.push(format!(
+                "{} [{}] {}: {}",
+                if issue.severity == "blocker" {
+                    "BLOCK"
+                } else {
+                    "WARN"
+                },
+                issue.code,
+                issue.step_id.as_deref().unwrap_or("workflow"),
+                issue.message
+            ));
+        }
+        lines.push(if preview.readiness.status == "blocked" {
+            "Resolve blockers before starting  ·  Esc: back".into()
+        } else {
+            "Enter: use this workflow  ·  Esc: back".into()
+        });
+        for (index, step) in preview.steps.iter().enumerate() {
+            append_workflow_preview_step(&mut lines, step, &format!("{}", index + 1), "");
+        }
+        lines
     }
 
     pub fn move_overlay_selection(&mut self, delta: isize) {
@@ -1153,6 +1642,7 @@ impl AppState {
             self.overlay,
             OverlayKind::CommandPalette
                 | OverlayKind::ModelPicker
+                | OverlayKind::WorkflowPicker
                 | OverlayKind::SessionPicker
                 | OverlayKind::SessionRename
                 | OverlayKind::TreePicker
@@ -1301,6 +1791,46 @@ impl AppState {
                 self.pending_thinking_picker = true;
                 self.close_overlay();
                 return OverlayAction::SetModel { id: model.id };
+            }
+            OverlayKind::WorkflowPicker => {
+                let Some(workflow) = self
+                    .filtered_workflows()
+                    .get(self.overlay_selected)
+                    .cloned()
+                    .cloned()
+                else {
+                    return OverlayAction::None;
+                };
+                if !workflow.valid {
+                    self.status = format!(
+                        "workflow {} is invalid: {}",
+                        workflow.name,
+                        workflow
+                            .error
+                            .as_deref()
+                            .unwrap_or("unknown definition error")
+                    );
+                    return OverlayAction::None;
+                }
+                let workflow = workflow.name;
+                self.close_overlay();
+                self.status = format!("resolving workflow {workflow}…");
+                return OverlayAction::PreviewWorkflow { workflow };
+            }
+            OverlayKind::WorkflowPreview => {
+                let Some(preview) = self.workflow_preview.as_ref() else {
+                    return OverlayAction::None;
+                };
+                if preview.readiness.status == "blocked" {
+                    self.status =
+                        "workflow readiness is blocked; resolve preflight errors first".into();
+                    return OverlayAction::None;
+                }
+                self.prompt = format!("/workflow {} ", preview.name);
+                self.cursor = self.prompt.chars().count();
+                self.focus = Focus::Prompt;
+                self.close_overlay();
+                return OverlayAction::None;
             }
             OverlayKind::SessionPicker => {
                 let sessions = self.filtered_sessions();
@@ -2773,6 +3303,9 @@ impl AppState {
                 self.focused_target_id = None;
                 self.hovered_entry = None;
                 self.hovered_target_id = None;
+                self.workflow_runs.clear();
+                self.workflow_selected = 0;
+                self.workflow_artifact = None;
             }
             AgentEvent::UserMessage { text } => {
                 self.entries.push(Entry::User {
@@ -3087,6 +3620,36 @@ impl AppState {
                     .or_default()
                     .push(*event);
             }
+            AgentEvent::WorkflowUpdate { workflow } => {
+                let workflow = *workflow;
+                self.status = match workflow.status.as_str() {
+                    "paused" => format!("workflow waiting: {}", workflow.name),
+                    "failed" => format!("workflow failed: {}", workflow.name),
+                    "running" => format!("workflow running: {}", workflow.name),
+                    _ => format!("workflow {}: {}", workflow.status, workflow.name),
+                };
+                self.workflow_runs.insert(workflow.run_id.clone(), workflow);
+                self.workflow_selected = self
+                    .workflow_selected
+                    .min(self.workflow_runs.len().saturating_sub(1));
+            }
+            AgentEvent::WorkflowCatalog { workflows } => {
+                self.workflow_catalog = workflows;
+                self.status = format!("{} workflows available", self.workflow_catalog.len());
+                self.open_overlay(OverlayKind::WorkflowPicker);
+            }
+            AgentEvent::WorkflowPreview { preview } => {
+                let preview = *preview;
+                self.status = format!("workflow preflight: {}", preview.name);
+                self.workflow_preview = Some(preview);
+                self.open_overlay(OverlayKind::WorkflowPreview);
+            }
+            AgentEvent::WorkflowArtifact { artifact } => {
+                self.workflow_artifact = Some(*artifact);
+                self.view = View::WorkflowArtifact;
+                self.scroll_from_bottom = 0;
+                self.status = "workflow artifact loaded".into();
+            }
             AgentEvent::ToolCallResult {
                 id,
                 result: ToolResult { content, details },
@@ -3240,6 +3803,8 @@ fn model_provider(model: &ModelInfo) -> &str {
 fn builtin_description(command: &str) -> &'static str {
     match command {
         "/dashboard" => "Open the session dashboard",
+        "/workflow" => "Start a durable workflow: /workflow <name> <task>",
+        "/workflows" => "Open durable workflow runs and checkpoint controls",
         "/model" => "Switch model",
         "/resume" => "Resume a saved session",
         "/new" => "Start a new session",

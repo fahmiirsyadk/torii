@@ -1,0 +1,57 @@
+# Copy this file and shared-code-audit.yaml into the same trusted workflow
+# directory, then replace the provider/model placeholders.
+name: composed-code-audit
+version: 1
+description: Statically compose a reusable typed audit and summarize its exported handoff
+
+parameters:
+  description: Bounded audit scope supplied once at launch
+  max_bytes: 4096
+  defaults: { depth: 2 }
+  schema:
+    type: object
+    additionalProperties: false
+    required: [target, depth]
+    properties:
+      target: { type: string, minLength: 1, maxLength: 500 }
+      depth: { type: integer, minimum: 1, maximum: 5 }
+
+budget:
+  max_agent_attempts: 3
+  max_prompt_tokens: 130000
+  max_output_tokens: 15000
+  max_cache_write_tokens: 60000
+
+provider_policies:
+  provider:
+    max_concurrency: 1
+    rate_limit: { max_starts: 6, window_ms: 60000 }
+    circuit_breaker: { failure_threshold: 2, cooldown_ms: 30000 }
+
+roles:
+  summarizer:
+    agent: explore
+    model: provider/summarizer
+    capability: read-only
+    thinking: low
+
+steps:
+  - type: workflow
+    id: audit
+    workflow: shared-code-audit
+    version: 1
+    with:
+      target: { from: [target] }
+      depth: { from: [depth] }
+
+  # `audit` exports only the fragment's final reconcile artifact. Internal
+  # steps remain addressable as audit.inspect and audit.reconcile in preflight.
+  - id: summarize
+    role: summarizer
+    prompt: Summarize the validated audit handoff without adding unsupported claims.
+    reports: [audit]
+    guardrails:
+      max_prompt_tokens: 40000
+      max_output_tokens: 5000
+      max_cache_write_tokens: 20000
+      on_violation: fail

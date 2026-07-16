@@ -10,12 +10,13 @@
     "check": "tsc --noEmit",
     "test": "node --test --experimental-strip-types src/*.test.ts",
     "start": "node --experimental-strip-types src/index.ts",
-    "smoke": "printf '{\"type\":\"health\"}\\n' | npm run --silent start"
+    "smoke": "node -e \"process.stdout.write(JSON.stringify({type:'health'})+'\\n')\" | npm run --silent start"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "typebox": "^1.3.6"
+    "typebox": "^1.3.6",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

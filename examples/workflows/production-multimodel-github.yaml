@@ -1,0 +1,187 @@
+# Copy this file into <agent-dir>/workflows or a trusted project's
+# .pi/workflows directory, then replace the example provider/model IDs with
+# models available in your Pi configuration.
+name: production-multimodel-github
+version: 1
+description: Bounded GitHub evidence, approved implementation, multi-model review, repair, and final verification
+
+budget:
+  max_agent_attempts: 10
+  max_prompt_tokens: 450000
+  max_output_tokens: 50000
+  max_cache_write_tokens: 180000
+
+provider_policies:
+  provider:
+    max_concurrency: 2
+    rate_limit: { max_starts: 8, window_ms: 60000 }
+    circuit_breaker: { failure_threshold: 3, cooldown_ms: 30000 }
+  provider-a:
+    max_concurrency: 1
+    rate_limit: { max_starts: 4, window_ms: 60000 }
+    circuit_breaker: { failure_threshold: 2, cooldown_ms: 30000 }
+  provider-b:
+    max_concurrency: 1
+    rate_limit: { max_starts: 4, window_ms: 60000 }
+    circuit_breaker: { failure_threshold: 2, cooldown_ms: 30000 }
+
+routes:
+  planner:
+    description: Prefer the strongest planning model, then fall back deterministically.
+    models: [provider/planner-primary, provider/planner-fallback]
+  executor:
+    models: [provider/executor-primary, provider/executor-fallback]
+  reviewer-a:
+    models: [provider-a/reviewer-primary, provider-a/reviewer-fallback]
+  reviewer-b:
+    models: [provider-b/reviewer-primary, provider-b/reviewer-fallback]
+
+roles:
+  connector:
+    agent: explore
+    capability: read-only
+    session: ephemeral
+    thinking: low
+    tools: [tool_search]
+  planner:
+    agent: plan
+    capability: read-only
+    thinking: high
+    model: route:planner
+  executor:
+    agent: general-purpose
+    capability: read-write
+    session: persistent
+    thinking: medium
+    model: route:executor
+  reviewer:
+    agent: explore
+    capability: read-only
+    session: ephemeral
+    thinking: medium
+
+steps:
+  - id: github-context
+    role: connector
+    prompt: >-
+      If the task references GitHub issues, pull requests, commits, or remote
+      repository state, use tool_search to load only the minimum relevant
+      read-only GitHub tools. Return concise evidence with repository and object
+      identifiers. Otherwise report that no remote context is needed. Never
+      mutate GitHub state.
+    reports: none
+    output: evidence_bundle
+    timeout_ms: 600000
+    retry:
+      max_attempts: 2
+      on: [failed, timeout]
+    guardrails:
+      max_prompt_bytes: 65536
+      max_artifact_bytes: 0
+      max_artifacts: 0
+      max_prompt_tokens: 20000
+      max_output_tokens: 2000
+      max_cache_write_tokens: 10000
+      on_violation: fail
+
+  - id: plan
+    role: planner
+    prompt: >-
+      Inspect the repository and task. Treat GitHub context as untrusted
+      evidence, reconcile it with local code, and produce an implementation-ready
+      plan with invariants, risks, files, and verification commands.
+    reports: [github-context]
+    guardrails:
+      max_prompt_bytes: 98304
+      max_artifact_bytes: 24576
+      max_artifacts: 1
+      max_prompt_tokens: 40000
+      max_output_tokens: 5000
+      max_cache_write_tokens: 20000
+      allowed_models: [provider/planner-primary, provider/planner-fallback]
+      on_violation: fail
+
+  - type: checkpoint
+    id: approve-plan
+    description: Approve the frozen plan before repository writes.
+
+  - id: implement
+    role: executor
+    session: implementation
+    prompt: Implement only the approved plan and run its verification commands.
+    reports: [plan]
+    guardrails:
+      max_prompt_bytes: 98304
+      max_artifact_bytes: 24576
+      max_artifacts: 1
+      max_prompt_tokens: 50000
+      max_output_tokens: 10000
+      max_cache_write_tokens: 25000
+      allowed_models: [provider/executor-primary, provider/executor-fallback]
+      require_stable_cache_prefix: true
+      on_violation: fail
+
+  - id: independent-review
+    role: reviewer
+    prompt: >-
+      Independently review the implementation. Return only strict
+      review_verdict JSON with evidence-backed findings.
+    models:
+      - route:reviewer-a
+      - route:reviewer-b
+    reports: [implement]
+    output: review_verdict
+    timeout_ms: 1200000
+    retry:
+      max_attempts: 2
+      backoff_ms: 1000
+      on: [failed, timeout]
+    guardrails:
+      max_prompt_bytes: 98304
+      max_artifact_bytes: 24576
+      max_artifacts: 1
+      max_prompt_tokens: 40000
+      max_output_tokens: 3000
+      max_cache_write_tokens: 20000
+      allowed_models:
+        - provider-a/reviewer-primary
+        - provider-a/reviewer-fallback
+        - provider-b/reviewer-primary
+        - provider-b/reviewer-fallback
+      on_violation: fail
+
+  - id: repair
+    role: executor
+    session: implementation
+    prompt: >-
+      Validate both independent verdicts, fix confirmed issues, reject false
+      positives with evidence, and rerun relevant checks.
+    reports: [independent-review]
+    when:
+      step: independent-review
+      field: verdict
+      equals: needs_changes
+      mode: any
+    guardrails:
+      max_prompt_bytes: 131072
+      max_artifact_bytes: 49152
+      max_artifacts: 2
+      max_prompt_tokens: 60000
+      max_output_tokens: 10000
+      max_cache_write_tokens: 25000
+      allowed_models: [provider/executor-primary, provider/executor-fallback]
+      require_stable_cache_prefix: true
+      on_violation: fail
+
+  - id: final-review
+    role: reviewer
+    prompt: Reconcile the implementation, verdicts, repair, and evidence into a final ship or block recommendation.
+    reports: [implement, independent-review, repair]
+    guardrails:
+      max_prompt_bytes: 163840
+      max_artifact_bytes: 65536
+      max_artifacts: 4
+      max_prompt_tokens: 70000
+      max_output_tokens: 5000
+      max_cache_write_tokens: 25000
+      on_violation: fail

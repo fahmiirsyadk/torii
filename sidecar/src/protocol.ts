@@ -1,3 +1,5 @@
+import type { WorkflowAttemptObservabilitySnapshot, WorkflowBudgetSnapshot, WorkflowPreview, WorkflowProviderStateSnapshot } from "./workflows/types.ts";
+
 export type SidecarCommand =
   | { type: "health" }
   | { type: "list_models"; request_id: string }
@@ -58,6 +60,11 @@ export type SidecarCommand =
   | { type: "bash"; request_id: string; session_id: string; command: string; exclude_from_context?: boolean }
   | { type: "cancel"; request_id: string; session_id: string }
   | { type: "kill_task"; request_id: string; session_id: string; task_id: string }
+  | { type: "workflow_control"; request_id: string; session_id: string; run_id: string; action: "approve" | "reject" | "cancel" | "retry"; step_id?: string }
+  | { type: "workflow_start"; request_id: string; session_id: string; workflow: string; input: string; parameters?: Record<string, unknown>; expected_definition_hash?: string }
+  | { type: "workflow_catalog"; request_id: string; session_id: string }
+  | { type: "workflow_preview"; request_id: string; session_id: string; workflow: string }
+  | { type: "workflow_artifact_read"; request_id: string; session_id: string; run_id: string; artifact_id: string }
   | { type: "close_session"; request_id: string; session_id: string }
   | {
       type: "permission";
@@ -150,6 +157,10 @@ export type AgentEvent =
   | { type: "reasoning_delta"; text: string }
   | { type: "subagent_update"; task: SubagentTask }
   | { type: "subagent_transcript"; task_id: string; event: AgentEvent }
+  | { type: "workflow_update"; workflow: WorkflowRunSnapshot }
+  | { type: "workflow_artifact"; artifact: WorkflowArtifactSnapshot }
+  | { type: "workflow_catalog"; workflows: WorkflowCatalogEntry[] }
+  | { type: "workflow_preview"; preview: WorkflowPreview }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "permission_request"; id: string; tool: string; args: unknown; reason: string }
   | { type: "plan_update"; entries: Array<{ step: string; status: string }> }
@@ -198,10 +209,66 @@ export interface SubagentTask {
   duration_ms: number;
   output?: string;
   error?: string;
+  failure_kind?: "launch" | "task_failed";
   model?: string;
   thinking_level?: string;
   worktree_path?: string;
   cwd?: string;
+  workflow_run_id?: string;
+}
+
+export interface WorkflowStepSnapshot {
+  id: string;
+  type: "agent" | "parallel" | "checkpoint";
+  status: "pending" | "running" | "waiting" | "completed" | "skipped" | "failed" | "cancelled" | "interrupted";
+  role?: string;
+  model?: string;
+  task_ids: string[];
+  artifact_ids: string[];
+  error?: string;
+  attempt_count: number;
+  timeout_ms?: number;
+  max_attempts?: number;
+  output_contract?: string;
+  condition?: string;
+  children: WorkflowStepSnapshot[];
+  observability?: WorkflowAttemptObservabilitySnapshot;
+}
+
+export interface WorkflowRunSnapshot {
+  run_id: string;
+  name: string;
+  description?: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted";
+  current_step?: string;
+  completed_steps: number;
+  total_steps: number;
+  artifact_ids: string[];
+  budget?: WorkflowBudgetSnapshot;
+  provider_states: WorkflowProviderStateSnapshot[];
+  steps: WorkflowStepSnapshot[];
+  created_at_ms: number;
+  updated_at_ms: number;
+  error?: string;
+}
+
+export interface WorkflowArtifactSnapshot {
+  run_id: string;
+  artifact_id: string;
+  step_id: string;
+  summary: string;
+  producer_role: string;
+  producer_model?: string;
+  content: string;
+  truncated: boolean;
+}
+
+export interface WorkflowCatalogEntry {
+  name: string;
+  description?: string;
+  source: "project" | "global" | "builtin";
+  valid: boolean;
+  error?: string;
 }
 
 export function writeMessage(message: SidecarMessage): void {

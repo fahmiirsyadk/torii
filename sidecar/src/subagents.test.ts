@@ -1,7 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { NativeSubagentCoordinator, type LaunchContext } from "./subagents.ts";
+import { NativeSubagentCoordinator, runtimeGuardrailViolations, type LaunchContext } from "./subagents.ts";
+
+test("runtime guardrails validate actual model, tools, and cache prefix", () => {
+  const violations = runtimeGuardrailViolations({
+    allowedModels: ["provider/allowed"],
+    allowedTools: ["read"],
+    requireStableCachePrefix: true,
+    expectedCachePrefix: "stable",
+    onViolation: "fail",
+  }, {
+    activeTools: ["read", "write"],
+    toolSchemaFingerprint: "schema",
+    cachePrefixFingerprint: "changed",
+    systemPromptBytes: 100,
+    cachePrefixChangedDuringRun: true,
+  }, "provider/actual");
+  assert.deepEqual(violations, [
+    "active model provider/actual is not allowed",
+    "active tools are not allowed: write",
+    "cache prefix differs from the previous persistent attempt",
+    "cache prefix changed during execution",
+  ]);
+});
 
 function request(overrides: Partial<Parameters<NativeSubagentCoordinator["spawn"]>[2]> = {}) {
   return {
@@ -85,6 +107,30 @@ test("resume requires a completed child owned by the same parent and type", asyn
   );
 });
 
+test("persistent continuation reopens the same child instead of forking it", async () => {
+  const launches: LaunchContext[] = [];
+  const coordinator = new NativeSubagentCoordinator(async (context) => {
+    launches.push(context);
+    return {
+      childSessionId: context.source?.childSessionId ?? `child-${context.taskId}`,
+      childSessionPath: context.source?.childSessionPath ?? `/sessions/${context.taskId}.jsonl`,
+      cwd: "/workspace",
+      async abort() {},
+      async dispose() {},
+    };
+  });
+  const first = await coordinator.spawn("parent", "/sessions/parent.jsonl", request({ subagentType: "general-purpose" }));
+  coordinator.finish(first.taskId, "completed", "first pass");
+  await coordinator.spawn("parent", "/sessions/parent.jsonl", request({
+    subagentType: "general-purpose",
+    continueFrom: first.taskId,
+  }));
+
+  assert.equal(launches[1]?.continueExisting, true);
+  assert.equal(launches[1]?.source?.taskId, first.taskId);
+  assert.equal(launches[1]?.source?.childSessionPath, first.childSessionPath);
+});
+
 test("restored running tasks become interrupted", () => {
   const coordinator = new NativeSubagentCoordinator(async () => { throw new Error("not launched"); });
   coordinator.restore({
@@ -101,4 +147,82 @@ test("restored running tasks become interrupted", () => {
     startedAt: 1,
   });
   assert.equal(coordinator.get("task-7")?.status, "interrupted");
+});
+
+test("child launch failure classification survives snapshot restore", async () => {
+  const coordinator = new NativeSubagentCoordinator(async () => { throw new Error("provider launch failed"); });
+  const failed = await coordinator.spawn("parent", undefined, request());
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.failureKind, "launch");
+  const snapshot = coordinator.snapshot(failed);
+  assert.equal(snapshot.failure_kind, "launch");
+
+  const restored = new NativeSubagentCoordinator(async () => { throw new Error("not launched"); });
+  restored.restore({
+    taskId: snapshot.task_id,
+    parentSessionId: snapshot.parent_session_id,
+    prompt: "",
+    description: snapshot.description,
+    subagentType: snapshot.subagent_type,
+    capabilityMode: snapshot.capability_mode,
+    isolation: snapshot.isolation,
+    background: snapshot.background,
+    status: snapshot.status,
+    activity: snapshot.activity,
+    startedAt: snapshot.started_at_ms,
+    completedAt: snapshot.completed_at_ms,
+    error: snapshot.error,
+    failureKind: snapshot.failure_kind,
+  });
+  assert.equal(restored.get(snapshot.task_id)?.failureKind, "launch");
+});
+
+test("scheduled workflow children queue at the concurrency boundary", async () => {
+  const launches: LaunchContext[] = [];
+  const coordinator = new NativeSubagentCoordinator(async (context) => {
+    launches.push(context);
+    return {
+      childSessionId: `child-${context.taskId}`,
+      cwd: "/workspace",
+      async abort() {},
+      async dispose() {},
+    };
+  });
+  const pending = Array.from({ length: 9 }, () => coordinator.spawn(
+    "parent",
+    undefined,
+    request(),
+    { waitForCapacity: true },
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(launches.length, 8);
+  launches[0]!.complete("done");
+  const records = await Promise.all(pending);
+  assert.equal(launches.length, 9);
+  assert.equal(records.length, 9);
+});
+
+test("cancelling a queued workflow child does not leak capacity", async () => {
+  const launches: LaunchContext[] = [];
+  const coordinator = new NativeSubagentCoordinator(async (context) => {
+    launches.push(context);
+    return {
+      childSessionId: `child-${context.taskId}`,
+      cwd: "/workspace",
+      async abort() {},
+      async dispose() {},
+    };
+  });
+  await Promise.all(Array.from({ length: 8 }, () => coordinator.spawn("parent", undefined, request())));
+  const controller = new AbortController();
+  const queued = coordinator.spawn("parent", undefined, request(), {
+    waitForCapacity: true,
+    signal: controller.signal,
+  });
+  controller.abort(new Error("workflow cancelled"));
+  await assert.rejects(queued, /workflow cancelled/);
+
+  launches[0]!.complete("done");
+  await coordinator.spawn("parent", undefined, request());
+  assert.equal(launches.length, 9);
 });

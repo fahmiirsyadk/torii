@@ -1,0 +1,81 @@
+# Reusable fragment. Copy this file beside composed-code-audit.yaml.
+# Fragments intentionally omit workflow-wide budgets and provider policies;
+# the root workflow owns admission for the fully expanded graph.
+name: shared-code-audit
+version: 1
+description: Reusable typed repository audit handoff
+
+parameters:
+  description: Scope passed explicitly by the composing root
+  max_bytes: 4096
+  schema:
+    type: object
+    additionalProperties: false
+    required: [target, depth]
+    properties:
+      target: { type: string, minLength: 1, maxLength: 500 }
+      depth: { type: integer, minimum: 1, maximum: 5 }
+
+routes:
+  reviewer:
+    models: [provider/reviewer-primary, provider/reviewer-fallback]
+
+roles:
+  reviewer:
+    agent: explore
+    model: route:reviewer
+    capability: read-only
+    session: persistent
+    thinking: medium
+
+contracts:
+  audit_report:
+    description: Bounded evidence-backed code audit for a downstream agent
+    max_bytes: 16384
+    schema:
+      type: object
+      additionalProperties: false
+      required: [summary, findings, files_checked]
+      properties:
+        summary: { type: string, minLength: 1, maxLength: 2000 }
+        findings:
+          type: array
+          maxItems: 30
+          items:
+            type: object
+            additionalProperties: false
+            required: [severity, summary]
+            properties:
+              severity: { type: string, maxLength: 10, enum: [blocker, high, medium, low, info] }
+              summary: { type: string, minLength: 1, maxLength: 1000 }
+              evidence: { type: string, maxLength: 1000 }
+        files_checked:
+          type: array
+          maxItems: 100
+          items: { type: string, maxLength: 500 }
+
+steps:
+  - id: inspect
+    role: reviewer
+    session: audit
+    prompt: Inspect the requested code surface and collect only evidence-backed findings.
+    reports: none
+    output: contract:audit_report
+    guardrails:
+      max_prompt_tokens: 40000
+      max_output_tokens: 5000
+      max_cache_write_tokens: 20000
+      on_violation: fail
+
+  - id: reconcile
+    role: reviewer
+    session: audit
+    prompt: Reconcile the initial audit against the repository and return the final typed report.
+    reports: [inspect]
+    output: contract:audit_report
+    guardrails:
+      max_prompt_tokens: 50000
+      max_output_tokens: 5000
+      max_cache_write_tokens: 20000
+      require_stable_cache_prefix: true
+      on_violation: fail

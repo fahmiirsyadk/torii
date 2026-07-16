@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { childThinkingLevel, grokToolsExtension, loadedHistory, readToriiSettings, resolveSubagentRole, writeToriiSubagentModel } from "./pi-adapter.ts";
 import { NativeSubagentCoordinator } from "./subagents.ts";
+import type { WorkflowCoordinator } from "./workflows/coordinator.ts";
 
 test("loaded history preserves Pi compaction-aware entry order", () => {
   const contextEntries = [
@@ -93,6 +94,9 @@ test("subagent role resolution layers project role over persona defaults", () =>
     assert.deepEqual(role.model, { provider: "role", id: "model" });
     assert.equal(role.thinkingLevel, "low");
     assert.deepEqual(role.tools, ["read", "grep"]);
+    const untrusted = resolveSubagentRole(root, agentDir, "reviewer", false);
+    assert.doesNotMatch(untrusted.instructions, /Review correctness|Return concise evidence/);
+    assert.equal(untrusted.model, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -123,9 +127,15 @@ test("Torii subagent model override persists independently of Pi settings", () =
 test("parent Grok tool extension exposes native task and worktree controls", () => {
   const names: string[] = [];
   const coordinator = new NativeSubagentCoordinator(async () => { throw new Error("not launched"); });
-  const extension = grokToolsExtension("parent", process.cwd(), "/sessions/parent.jsonl", () => {}, coordinator, 0);
+  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, coordinator, {} as WorkflowCoordinator, 0);
   extension.factory({ registerTool: (tool: { name: string }) => { names.push(tool.name); } } as unknown as ExtensionAPI);
   for (const name of [
+    "tool_search",
+    "workflow_check",
+    "workflow_start",
+    "workflow_status",
+    "workflow_control",
+    "artifact_read",
     "spawn_subagent",
     "get_command_or_subagent_output",
     "wait_commands_or_subagents",
@@ -133,4 +143,59 @@ test("parent Grok tool extension exposes native task and worktree controls", () 
     "apply_subagent_worktree",
     "remove_subagent_worktree",
   ]) assert.ok(names.includes(name), `${name} was not registered`);
+});
+
+test("workflow connector children retain tool_search without delegation tools", () => {
+  const names: string[] = [];
+  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, undefined, 1);
+  extension.factory({ registerTool: (tool: { name: string }) => { names.push(tool.name); } } as unknown as ExtensionAPI);
+  assert.ok(names.includes("tool_search"));
+  assert.ok(!names.includes("spawn_subagent"));
+  assert.ok(!names.includes("workflow_start"));
+});
+
+test("read-only connector discovery enables only MCP tools with readOnlyHint metadata", async () => {
+  const registered: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
+  let active = ["read"];
+  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, undefined, 1, "read-only");
+  extension.factory({
+    registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => { registered.push(tool); },
+    getAllTools: () => [
+      { name: "mcp__github__get_issue", description: "GitHub issue", promptGuidelines: ["torii:mcp-read-only"] },
+      { name: "mcp__github__close_issue", description: "GitHub issue mutation", promptGuidelines: ["torii:mcp-mutation-unknown"] },
+    ],
+    getActiveTools: () => [...active],
+    setActiveTools: (names: string[]) => { active = [...names]; },
+    appendEntry: () => {},
+  } as unknown as ExtensionAPI);
+  const search = registered.find((tool) => tool.name === "tool_search");
+  if (search?.execute === undefined) throw new Error("tool_search was not registered");
+  await search.execute("call", { query: "GitHub issue", limit: 8 });
+  assert.deepEqual(active, ["read", "mcp__github__get_issue"]);
+});
+
+test("tool search only grows the active MCP tool set", async () => {
+  const registered: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
+  let active = ["read", "mcp__github__issues"];
+  const entries: unknown[] = [];
+  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, undefined, undefined, 0);
+  extension.factory({
+    registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => { registered.push(tool); },
+    getAllTools: () => [
+      { name: "read", description: "Read files" },
+      { name: "mcp__github__issues", description: "List GitHub issues" },
+      { name: "mcp__github__pull_requests", description: "Inspect GitHub pull request comments" },
+    ],
+    getActiveTools: () => [...active],
+    setActiveTools: (names: string[]) => { active = [...names]; },
+    appendEntry: (type: string, data: unknown) => { entries.push({ type, data }); },
+  } as unknown as ExtensionAPI);
+  const search = registered.find((tool) => tool.name === "tool_search");
+  if (search?.execute === undefined) throw new Error("tool_search was not registered");
+
+  await search.execute("call-1", { query: "pull request comments", limit: 5 });
+  assert.deepEqual(active, ["read", "mcp__github__issues", "mcp__github__pull_requests"]);
+  await search.execute("call-2", { query: "issues", limit: 5 });
+  assert.deepEqual(active, ["read", "mcp__github__issues", "mcp__github__pull_requests"]);
+  assert.equal(entries.length, 2);
 });

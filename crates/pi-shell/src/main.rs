@@ -252,6 +252,47 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::KillTask(task_id) => {
                         let _ = command_harness.kill_task(&command_session, task_id).await;
                     }
+                    pi_tui::UiCommand::WorkflowControl {
+                        run_id,
+                        action,
+                        step_id,
+                    } => {
+                        let _ = command_harness
+                            .control_workflow(&command_session, run_id, action, step_id)
+                            .await;
+                    }
+                    pi_tui::UiCommand::StartWorkflow {
+                        workflow,
+                        input,
+                        parameters,
+                        expected_definition_hash,
+                    } => {
+                        let _ = command_harness
+                            .start_workflow(
+                                &command_session,
+                                workflow,
+                                input,
+                                parameters,
+                                expected_definition_hash,
+                            )
+                            .await;
+                    }
+                    pi_tui::UiCommand::LoadWorkflowCatalog => {
+                        let _ = command_harness.workflow_catalog(&command_session).await;
+                    }
+                    pi_tui::UiCommand::PreviewWorkflow(workflow) => {
+                        let _ = command_harness
+                            .preview_workflow(&command_session, workflow)
+                            .await;
+                    }
+                    pi_tui::UiCommand::ReadWorkflowArtifact {
+                        run_id,
+                        artifact_id,
+                    } => {
+                        let _ = command_harness
+                            .read_workflow_artifact(&command_session, run_id, artifact_id)
+                            .await;
+                    }
                     pi_tui::UiCommand::ExecuteBash {
                         command,
                         exclude_from_context,

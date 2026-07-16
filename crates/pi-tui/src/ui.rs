@@ -318,6 +318,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         crate::overlay::render(frame, state);
         return;
     }
+    if state.view == View::Workflows {
+        render_workflows(frame, state, theme);
+        return;
+    }
+    if state.view == View::WorkflowArtifact {
+        render_workflow_artifact(frame, state, theme);
+        return;
+    }
     if state.view == View::Tasks {
         render_tasks(frame, state, theme);
         return;
@@ -359,6 +367,466 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     render_composer(frame, areas[4], state, theme);
     render_shortcuts(frame, areas[5], state, theme);
     crate::overlay::render(frame, state);
+}
+
+fn render_workflows(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
+    let area = frame.area().inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    let workflows = state.sorted_workflows();
+    let mut list = Vec::new();
+    for (index, workflow) in workflows.iter().enumerate() {
+        let selected = index == state.workflow_selected;
+        let color = match workflow.status.as_str() {
+            "completed" => theme.success,
+            "failed" => theme.error,
+            "cancelled" => theme.muted,
+            "paused" => theme.accent,
+            _ => theme.foreground,
+        };
+        list.push(Line::from(vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(
+                workflow.name.clone(),
+                Style::default().fg(if selected { theme.foreground } else { color }),
+            ),
+            Span::styled(format!("  {}", workflow.status), Style::default().fg(color)),
+        ]));
+        list.push(Line::from(Span::styled(
+            format!(
+                "    {}/{} steps  {}",
+                workflow.completed_steps, workflow.total_steps, workflow.run_id
+            ),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if list.is_empty() {
+        list.push(Line::from(Span::styled(
+            "No workflows in this session",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(list).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Workflows ")
+                .border_style(Style::default().fg(theme.accent)),
+        ),
+        columns[0],
+    );
+
+    let mut details = Vec::new();
+    if let Some(workflow) = state.selected_workflow() {
+        if let Some(description) = &workflow.description {
+            details.push(Line::from(Span::styled(
+                description.clone(),
+                Style::default().fg(theme.muted),
+            )));
+            details.push(Line::raw(""));
+        }
+        if let Some(budget) = workflow.budget.as_ref() {
+            let mut usage = Vec::new();
+            if let Some(limit) = budget.max_agent_attempts {
+                usage.push(format!("attempts {}/{}", budget.agent_attempts, limit));
+            }
+            if let Some(limit) = budget.max_prompt_tokens {
+                usage.push(format!(
+                    "prompt {}+{} reserved/{}",
+                    budget.prompt_tokens, budget.reserved_prompt_tokens, limit
+                ));
+            }
+            if let Some(limit) = budget.max_output_tokens {
+                usage.push(format!(
+                    "output {}+{} reserved/{}",
+                    budget.output_tokens, budget.reserved_output_tokens, limit
+                ));
+            }
+            if let Some(limit) = budget.max_cache_write_tokens {
+                usage.push(format!(
+                    "cache-write {}+{} reserved/{}",
+                    budget.cache_write_tokens, budget.reserved_cache_write_tokens, limit
+                ));
+            }
+            details.push(Line::from(Span::styled(
+                format!(" Budget  {}", usage.join(" Â· ")),
+                Style::default().fg(theme.accent),
+            )));
+            if budget.unknown_usage_attempts > 0 {
+                details.push(Line::from(Span::styled(
+                    format!(
+                        "         {} launched attempt(s) have unknown usage",
+                        budget.unknown_usage_attempts
+                    ),
+                    Style::default().fg(theme.error),
+                )));
+            }
+            details.push(Line::raw(""));
+        }
+        for provider in &workflow.provider_states {
+            let mut state = vec![format!(
+                "circuit {} Â· {} active Â· {} starts Â· {} failure streak",
+                provider.circuit,
+                provider.active_attempts,
+                provider.starts_in_window,
+                provider.consecutive_failures
+            )];
+            if let Some(limit) = provider.max_concurrency {
+                state.push(format!("max {limit} concurrent"));
+            }
+            details.push(Line::from(Span::styled(
+                format!(" Provider {}  {}", provider.provider, state.join(" Â· ")),
+                Style::default().fg(if provider.circuit == "closed" {
+                    theme.muted
+                } else {
+                    theme.warning
+                }),
+            )));
+        }
+        if !workflow.provider_states.is_empty() {
+            details.push(Line::raw(""));
+        }
+        for step in &workflow.steps {
+            let marker = match step.status.as_str() {
+                "completed" => "[x]",
+                "skipped" => "[~]",
+                "running" => "[>]",
+                "waiting" => "[!]",
+                "failed" => "[x]",
+                "cancelled" => "[-]",
+                _ => "[ ]",
+            };
+            let color = match step.status.as_str() {
+                "completed" => theme.success,
+                "skipped" => theme.muted,
+                "failed" => theme.error,
+                "waiting" | "running" => theme.accent,
+                _ => theme.muted,
+            };
+            details.push(Line::from(vec![
+                Span::styled(format!(" {marker} "), Style::default().fg(color)),
+                Span::styled(step.id.clone(), Style::default().fg(theme.foreground)),
+                Span::styled(format!("  {}", step.status), Style::default().fg(color)),
+            ]));
+            let metadata = [step.role.as_deref(), step.model.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if !metadata.is_empty() {
+                details.push(Line::from(Span::styled(
+                    format!("       {metadata}"),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            if let Some(error) = &step.error {
+                details.push(Line::from(Span::styled(
+                    format!("       {error}"),
+                    Style::default().fg(theme.error),
+                )));
+            }
+            if !step.artifact_ids.is_empty() {
+                details.push(Line::from(Span::styled(
+                    format!("       artifacts: {}", step.artifact_ids.join(", ")),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            if step.attempt_count > 0
+                || step.timeout_ms.is_some()
+                || step.max_attempts.is_some()
+                || step.output_contract.is_some()
+                || step.condition.is_some()
+            {
+                let mut policy = Vec::new();
+                if step.attempt_count > 0 {
+                    policy.push(format!(
+                        "{} attempt{}",
+                        step.attempt_count,
+                        if step.attempt_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if let Some(timeout) = step.timeout_ms {
+                    policy.push(format!("{} timeout", format_elapsed(timeout)));
+                }
+                if let Some(max_attempts) = step.max_attempts {
+                    policy.push(format!("max {max_attempts}"));
+                }
+                if let Some(contract) = &step.output_contract {
+                    policy.push(format!("output {contract}"));
+                }
+                if let Some(condition) = &step.condition {
+                    policy.push(format!("when {condition}"));
+                }
+                details.push(Line::from(Span::styled(
+                    format!("       {}", policy.join(" · ")),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            if let Some(observability) = &step.observability {
+                append_workflow_observability(&mut details, observability, "       ", theme);
+            }
+            for child in &step.children {
+                let marker = match child.status.as_str() {
+                    "completed" => "[x]",
+                    "skipped" => "[~]",
+                    "running" => "[>]",
+                    "waiting" => "[!]",
+                    "failed" => "[x]",
+                    "cancelled" => "[-]",
+                    _ => "[ ]",
+                };
+                let color = match child.status.as_str() {
+                    "completed" => theme.success,
+                    "failed" => theme.error,
+                    "waiting" | "running" => theme.accent,
+                    _ => theme.muted,
+                };
+                details.push(Line::from(vec![
+                    Span::styled(format!("    {marker} "), Style::default().fg(color)),
+                    Span::styled(child.id.clone(), Style::default().fg(theme.foreground)),
+                    Span::styled(format!("  {}", child.status), Style::default().fg(color)),
+                ]));
+                let mut metadata = [child.role.clone(), child.model.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if child.attempt_count > 0 {
+                    metadata.push(format!(
+                        "{} attempt{}",
+                        child.attempt_count,
+                        if child.attempt_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if let Some(timeout) = child.timeout_ms {
+                    metadata.push(format!("{} timeout", format_elapsed(timeout)));
+                }
+                if let Some(max_attempts) = child.max_attempts {
+                    metadata.push(format!("max {max_attempts}"));
+                }
+                if let Some(contract) = &child.output_contract {
+                    metadata.push(format!("output {contract}"));
+                }
+                if !metadata.is_empty() {
+                    details.push(Line::from(Span::styled(
+                        format!("          {}", metadata.join(" · ")),
+                        Style::default().fg(theme.muted),
+                    )));
+                }
+                if let Some(error) = &child.error {
+                    details.push(Line::from(Span::styled(
+                        format!("          {error}"),
+                        Style::default().fg(theme.error),
+                    )));
+                }
+                if let Some(observability) = &child.observability {
+                    append_workflow_observability(&mut details, observability, "          ", theme);
+                }
+            }
+        }
+        if let Some(error) = &workflow.error {
+            details.push(Line::raw(""));
+            details.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(theme.error),
+            )));
+        }
+    } else {
+        details.push(Line::from(Span::styled(
+            "Workflow details appear here",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(details).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Execution plan ")
+                .title_bottom(Line::from(" Up/Down select   v artifact   a approve   d reject   r retry   x cancel   Esc close ").alignment(Alignment::Center))
+                .border_style(Style::default().fg(theme.accent)),
+        ),
+        columns[1],
+    );
+}
+
+fn append_workflow_observability(
+    details: &mut Vec<Line<'static>>,
+    observation: &pi_harness::WorkflowAttemptObservability,
+    indent: &str,
+    theme: Theme,
+) {
+    details.push(Line::from(Span::styled(
+        format!(
+            "{indent}route: {} · thinking {} · {} {}",
+            observation.model.as_deref().unwrap_or("unknown"),
+            observation.thinking.as_deref().unwrap_or("default"),
+            observation.capability,
+            observation.session
+        ),
+        Style::default().fg(theme.muted),
+    )));
+    details.push(Line::from(Span::styled(
+        format!(
+            "{indent}context: {} prompt · {} artifacts ({}, {} truncated) · {} system",
+            format_bytes(observation.prompt_bytes),
+            observation.artifact_count,
+            format_bytes(observation.artifact_bytes),
+            observation.truncated_artifact_count,
+            observation
+                .system_prompt_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".into())
+        ),
+        Style::default().fg(theme.muted),
+    )));
+    if let Some(fingerprint) = observation.tool_schema_fingerprint.as_deref() {
+        let tools = observation.active_tools.as_ref().map_or(0, Vec::len);
+        let prefix = observation
+            .cache_prefix_fingerprint
+            .as_deref()
+            .map(short_fingerprint)
+            .unwrap_or("unknown");
+        let cache_state = match observation.cache_prefix_changed {
+            Some(true) => "changed",
+            Some(false) => "stable/new",
+            None => "unknown",
+        };
+        details.push(Line::from(Span::styled(
+            format!(
+                "{indent}tools: {tools} · schema {} · prefix {prefix} ({cache_state})",
+                short_fingerprint(fingerprint)
+            ),
+            Style::default().fg(if observation.cache_prefix_changed == Some(true) {
+                theme.warning
+            } else {
+                theme.muted
+            }),
+        )));
+    }
+    if observation.input_tokens.is_some()
+        || observation.output_tokens.is_some()
+        || observation.cache_read_tokens.is_some()
+        || observation.cache_write_tokens.is_some()
+    {
+        details.push(Line::from(Span::styled(
+            format!(
+                "{indent}usage: ↑{} ↓{} R{} W{} · cache hit {:.0}%",
+                observation.input_tokens.unwrap_or_default(),
+                observation.output_tokens.unwrap_or_default(),
+                observation.cache_read_tokens.unwrap_or_default(),
+                observation.cache_write_tokens.unwrap_or_default(),
+                observation.cache_hit_rate.unwrap_or_default() * 100.0
+            ),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if !observation.policy_violations.is_empty() {
+        details.push(Line::from(Span::styled(
+            format!(
+                "{indent}guardrail {}: {}",
+                observation.policy_action.as_deref().unwrap_or("warn"),
+                observation.policy_violations.join("; ")
+            ),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    if let Some(outcome) = observation.provider_outcome.as_deref() {
+        details.push(Line::from(Span::styled(
+            format!(
+                "{indent}provider: {outcome}{}",
+                observation
+                    .provider_failure_kind
+                    .as_deref()
+                    .map(|kind| format!(" ({kind})"))
+                    .unwrap_or_default()
+            ),
+            Style::default().fg(if outcome == "failure" {
+                theme.warning
+            } else {
+                theme.muted
+            }),
+        )));
+    }
+}
+
+fn short_fingerprint(value: &str) -> &str {
+    &value[..value.len().min(10)]
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+fn render_workflow_artifact(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
+    let area = frame.area().inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let Some(artifact) = state.workflow_artifact.as_ref() else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} · {}", artifact.step_id, artifact.producer_role),
+                Style::default().fg(theme.foreground),
+            ),
+            Span::styled(
+                artifact
+                    .producer_model
+                    .as_ref()
+                    .map(|model| format!(" · {model}"))
+                    .unwrap_or_default(),
+                Style::default().fg(theme.muted),
+            ),
+        ]),
+        Line::from(Span::styled(
+            artifact.summary.clone(),
+            Style::default().fg(theme.muted),
+        )),
+        Line::raw(""),
+    ];
+    lines.extend(
+        artifact
+            .content
+            .lines()
+            .map(|line| Line::raw(line.to_string())),
+    );
+    if artifact.truncated {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "[artifact truncated at 100 KB]",
+            Style::default().fg(theme.error),
+        )));
+    }
+    let viewport = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let scroll = max_scroll.saturating_sub(state.scroll_from_bottom.min(max_scroll));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Artifact · {} ", artifact.artifact_id))
+                    .title_bottom(
+                        Line::from(" Esc/q back   Up/Down scroll ").alignment(Alignment::Center),
+                    )
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+        area,
+    );
 }
 
 fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
