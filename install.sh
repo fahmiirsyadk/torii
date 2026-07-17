@@ -7,9 +7,6 @@ bin_dir="${TORII_BIN_DIR:-"$HOME/.local/bin"}"
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64) target="x86_64-unknown-linux-gnu" ;;
-  Linux:aarch64|Linux:arm64) target="aarch64-unknown-linux-gnu" ;;
-  Darwin:x86_64) target="x86_64-apple-darwin" ;;
-  Darwin:arm64|Darwin:aarch64) target="aarch64-apple-darwin" ;;
   *) echo "Torii does not publish a build for $(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac
 
