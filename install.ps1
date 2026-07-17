@@ -7,10 +7,16 @@ $installRoot = if ($env:TORII_HOME) { $env:TORII_HOME } else {
 $binDir = if ($env:TORII_BIN_DIR) { $env:TORII_BIN_DIR } else {
     Join-Path $installRoot "bin"
 }
-$architecture = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+$architecture = [string]$env:PROCESSOR_ARCHITEW6432
+if (-not $architecture) {
+    $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+}
 $target = switch ($architecture) {
-    "X64" { "x86_64-pc-windows-msvc" }
-    default { throw "Torii does not publish a Windows build for $architecture" }
+    "AMD64" { "x86_64-pc-windows-msvc" }
+    default {
+        $displayArchitecture = if ($architecture) { $architecture } else { "unknown architecture" }
+        throw "Torii does not publish a Windows build for $displayArchitecture"
+    }
 }
 
 $release = Invoke-RestMethod `
