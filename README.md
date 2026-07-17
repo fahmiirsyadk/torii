@@ -20,6 +20,11 @@ interaction and visual design inspired by Grok Build CLI.
 - Project file references, shell commands, prompt history, plans, MCP tools, and package management.
 - Durable multi-agent workflows with frozen model/role routing, checkpoints, parallel read-only review, compact artifacts, and resume recovery.
 - On-demand MCP tool discovery that grows the active tool set monotonically and restores it on session resume.
+- Pi-authoritative context usage and working state, including after session resume
+  and compaction.
+- Searchable Pi extension controls that show resolved source and scope and
+  persist enable or disable choices.
+- A paged session dashboard with live resident state and background OTA status.
 - Interactive and headless operation.
 
 See [Workflow architecture](docs/workflows.md) for authoring, multi-model
@@ -32,7 +37,11 @@ routing, context and cache policies, and `/resume` behavior.
 
 ## Install
 
-Linux and macOS:
+Prebuilt releases currently support Linux x86-64 and Windows x86-64. See the
+[latest release](https://github.com/fahmiirsyadk/torii/releases/latest) for
+archives and SHA-256 checksums.
+
+Linux x86-64:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -57,8 +66,9 @@ torii login <provider>
 torii logout <provider>
 ```
 
-Build from source with `cargo build --release -p torii` after running
-`npm ci` in `sidecar/`.
+Other platforms can build from source. Install the sidecar dependencies with
+`npm ci --prefix sidecar`, then run `cargo build --release --locked -p torii`.
+Source-tree execution requires Node.js for the TypeScript SDK sidecar.
 
 ## Arguments
 
@@ -92,9 +102,11 @@ torii list
 torii config
 ```
 
-Torii checks for a new stable release in the background at most once every
-24 hours. Updates are downloaded, digest-verified, unpacked into a new version
-directory, and activated by an atomic version-pointer replacement:
+Torii checks GitHub's latest stable release in the background at most once
+every 24 hours. The dashboard reports available, downloading, ready, failed,
+and rollback states. Updates are downloaded, size- and digest-verified,
+unpacked into a new version directory, and validated against the bundled Pi
+sidecar before activation:
 
 ```text
 torii self check
@@ -103,7 +115,9 @@ torii self version
 ```
 
 The running process is never replaced. A verified update becomes active on the
-next launch; the previous version remains available for recovery.
+next launch through an atomic version-pointer replacement. The launcher health
+checks that pending version and automatically restores the previous version if
+startup validation fails.
 
 ## Usage tutorial
 
@@ -112,23 +126,38 @@ next launch; the previous version remains available for recovery.
 Start Torii in the current repository:
 
 ```bash
-torii --backend pi
+torii
 ```
 
-The welcome screen lists saved sessions and their live state. Use `Up`/`Down`
-to select one, `Enter` to resume it, or `n` to start a new session. From the
-transcript, `/home` returns to this screen and `/resume` opens the searchable
-session picker. You can also resume directly from the shell:
+Pi is the default backend; use `--backend mock` only for deterministic local
+testing. The welcome screen lists saved sessions and their live state. Use
+`Up`/`Down` to select one, `PageUp`/`PageDown` to move by a page,
+`Home`/`End` to jump to either boundary, `Enter` to resume, or `n` to start a
+new session. From the transcript, `/home` returns to this screen and `/resume`
+opens the searchable session picker. You can also resume directly from the
+shell:
 
 ```bash
-torii --backend pi --continue
-torii --backend pi --session <path-or-id>
+torii --continue
+torii --session <path-or-id>
 ```
 
 During a running turn, `Enter` queues a follow-up for the next turn and
 `Ctrl+Enter` sends an immediate steering message. `Ctrl+C` clears a non-empty
 draft first; with an empty composer it cancels the active turn. `Ctrl+P` opens
 the command palette, `Ctrl+L` changes model, and `Ctrl+B` opens the task list.
+
+### Manage Pi extensions
+
+Open settings with `F2` or `/settings`, then select **Pi extensions**. The
+searchable list shows every extension resolved by Pi, including disabled
+entries, its source, and whether it belongs to user or project configuration.
+Press `Space` or `Enter` to enable or disable the selected extension.
+
+Changes are written through Pi's package configuration and the active session
+is reloaded before the checkbox changes. Temporary extensions injected into the
+current process are shown for visibility but cannot be disabled because they
+have no persistent configuration entry.
 
 ### Delegate an ad-hoc task to a subagent
 
