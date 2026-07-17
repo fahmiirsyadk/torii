@@ -452,28 +452,32 @@ function waitForOAuthReply(sessionId: string, event: OAuthReplyEvent): Promise<s
 // Main loop
 // -----------------------------------------------------------------------------
 
-writeMessage({ type: "ready", protocol_version: 1 });
+if (process.argv[2] === "--package-command") {
+  await pi.runPackageCommand(process.argv.slice(3));
+} else {
+  writeMessage({ type: "ready", protocol_version: 2 });
 
-const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of input) {
-  if (line.trim() === "") continue;
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of input) {
+    if (line.trim() === "") continue;
 
-  let command: SidecarCommand;
-  try {
-    command = JSON.parse(line) as SidecarCommand;
-  } catch (error) {
-    writeMessage({
-      type: "error",
-      message: error instanceof Error ? error.message : String(error),
+    let command: SidecarCommand;
+    try {
+      command = JSON.parse(line) as SidecarCommand;
+    } catch (error) {
+      writeMessage({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+
+    await dispatchCommand(command, handleCommand, (failedCommand, error) => {
+      writeMessage({
+        type: "error",
+        request_id: "request_id" in failedCommand ? failedCommand.request_id : undefined,
+        message: error instanceof Error ? error.message : String(error),
+      });
     });
-    continue;
   }
-
-  await dispatchCommand(command, handleCommand, (failedCommand, error) => {
-    writeMessage({
-      type: "error",
-      request_id: "request_id" in failedCommand ? failedCommand.request_id : undefined,
-      message: error instanceof Error ? error.message : String(error),
-    });
-  });
 }

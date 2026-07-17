@@ -25,7 +25,7 @@ use tokio::{
     time::timeout,
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INFERENCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -121,9 +121,17 @@ impl PiHarness {
                 sidecar.display()
             ));
         }
-        let mut child = Command::new("node")
-            .arg("--experimental-strip-types")
-            .arg(sidecar)
+        let mut command = if sidecar
+            .extension()
+            .is_some_and(|extension| extension == "ts")
+        {
+            let mut command = Command::new("node");
+            command.arg("--experimental-strip-types").arg(sidecar);
+            command
+        } else {
+            Command::new(sidecar)
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -876,7 +884,21 @@ async fn read_messages(inner: Arc<Inner>, mut lines: Lines<BufReader<ChildStdout
 }
 
 fn default_sidecar_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sidecar/src/index.ts")
+    let executable = std::env::current_exe().ok();
+    let packaged = executable
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|root| {
+            root.join("libexec").join(if cfg!(windows) {
+                "torii-sidecar.exe"
+            } else {
+                "torii-sidecar"
+            })
+        });
+    packaged
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sidecar/src/index.ts"))
 }
 
 #[cfg(test)]

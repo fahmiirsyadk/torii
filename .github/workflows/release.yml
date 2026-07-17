@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            bun_target: bun-linux-x64-baseline
+            archive: tar
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            bun_target: bun-linux-arm64
+            archive: tar
+          - os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            bun_target: bun-darwin-x64-baseline
+            archive: tar
+          - os: macos-14
+            rust_target: aarch64-apple-darwin
+            bun_target: bun-darwin-arm64
+            archive: tar
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bun_target: bun-windows-x64-baseline
+            archive: zip
+          - os: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            bun_target: bun-windows-arm64
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - name: Validate release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$version"
+          test "$(node -p "require('./sidecar/package.json').version")" = "$version"
+      - name: Install sidecar dependencies
+        run: npm ci --prefix sidecar
+      - name: Test
+        run: |
+          cargo test --workspace --locked
+          bun --cwd sidecar run check
+          bun --cwd sidecar run test
+      - name: Build Rust host
+        run: cargo build --release --locked -p torii --target ${{ matrix.rust_target }}
+      - name: Assemble release
+        shell: bash
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          root="target/package/${{ matrix.rust_target }}"
+          mkdir -p "$root/bin" "$root/libexec"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.rust_target }}/release/torii.exe" "$root/bin/torii.exe"
+            sidecar="$root/libexec/torii-sidecar.exe"
+          else
+            cp "target/${{ matrix.rust_target }}/release/torii" "$root/bin/torii"
+            sidecar="$root/libexec/torii-sidecar"
+          fi
+          bun build sidecar/src/index.ts --compile --minify --sourcemap \
+            --target=${{ matrix.bun_target }} --outfile "$sidecar"
+          cp LICENSE THIRD-PARTY-NOTICES README.md CHANGELOG.md "$root/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            "$root/bin/torii.exe" --package-health-check
+          else
+            chmod 755 "$root/bin/torii" "$root/libexec/torii-sidecar"
+            "$root/bin/torii" --package-health-check
+          fi
+      - name: Package tar archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          asset="torii-v${version}-${{ matrix.rust_target }}.tar.gz"
+          tar -C "target/package/${{ matrix.rust_target }}" -czf "$asset" .
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Package zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $asset = "torii-v$version-${{ matrix.rust_target }}.zip"
+          Compress-Archive -Path "target/package/${{ matrix.rust_target }}/*" -DestinationPath $asset
+          "ASSET=$asset" | Out-File -Append -FilePath $env:GITHUB_ENV
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ASSET }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rust_target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum torii-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --notes-file ../CHANGELOG.md \
+            --title "$GITHUB_REF_NAME"

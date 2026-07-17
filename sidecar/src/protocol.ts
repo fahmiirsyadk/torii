@@ -72,7 +72,7 @@ export type SidecarCommand =
     };
 
 export type SidecarMessage =
-  | { type: "ready"; protocol_version: 1 }
+  | { type: "ready"; protocol_version: 2 }
   | {
       type: "response";
       request_id: string;
@@ -105,7 +105,7 @@ export type SidecarMessage =
         path: string;
         name?: string;
         first_message: string;
-        modified: string;
+        modified_at_ms: number;
         message_count: number;
         current: boolean;
         cwd: string;

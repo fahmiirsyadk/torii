@@ -578,6 +578,14 @@ impl SessionSupervisor {
             .collect()
     }
 
+    pub async fn publish_host_event(&self, event: AgentEvent) {
+        let session_id = self
+            .active_session()
+            .await
+            .unwrap_or_else(|_| SessionId(String::new()));
+        let _ = self.events.send(TaggedEvent { session_id, event });
+    }
+
     pub async fn stop(&self, path: &str) -> Result<()> {
         let id = self
             .residents

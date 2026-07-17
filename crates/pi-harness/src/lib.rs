@@ -68,6 +68,9 @@ pub enum AgentErrorKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    AppUpdate {
+        status: AppUpdateStatus,
+    },
     RuntimeSessions {
         sessions: Vec<RuntimeSessionInfo>,
     },
@@ -316,6 +319,32 @@ pub struct WorkflowPreviewStep {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AppUpdateStatus {
+    Checking,
+    Current,
+    Available {
+        version: String,
+        size_bytes: u64,
+    },
+    Downloading {
+        version: String,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Ready {
+        version: String,
+    },
+    Failed {
+        message: String,
+    },
+    RolledBack {
+        failed_version: String,
+        restored_version: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowBudgetSnapshot {
     pub max_agent_attempts: Option<u64>,
     pub max_prompt_tokens: Option<u64>,
@@ -456,7 +485,7 @@ pub struct SessionInfo {
     pub path: String,
     pub name: Option<String>,
     pub first_message: String,
-    pub modified: String,
+    pub modified_at_ms: u64,
     pub message_count: usize,
     pub current: bool,
     #[serde(default)]

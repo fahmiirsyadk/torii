@@ -267,6 +267,7 @@ fn image_preview(width: usize, height: usize, rgba: &[u8]) -> (u16, u16, Vec<u8>
 
 #[derive(Debug)]
 pub enum UiCommand {
+    InstallUpdate,
     Submit {
         text: String,
         delivery: Option<pi_harness::MessageDelivery>,
@@ -1042,6 +1043,33 @@ async fn run_app(
                         }
                         state.view = View::Transcript;
                     }
+                    KeyCode::Char('u')
+                        if state.view == View::Dashboard
+                            && matches!(
+                                state.app_update,
+                                Some(pi_harness::AppUpdateStatus::Available { .. })
+                            ) =>
+                    {
+                        if let Some(pi_harness::AppUpdateStatus::Available {
+                            version,
+                            size_bytes,
+                        }) = state.app_update.clone()
+                        {
+                            state.app_update = Some(pi_harness::AppUpdateStatus::Downloading {
+                                version,
+                                downloaded_bytes: 0,
+                                total_bytes: size_bytes,
+                            });
+                        }
+                        if let Some(sender) = &commands {
+                            let _ = sender.send(UiCommand::InstallUpdate);
+                        }
+                    }
+                    KeyCode::Char('l')
+                        if state.view == View::Dashboard && state.app_update.is_some() =>
+                    {
+                        state.app_update = None;
+                    }
                     KeyCode::Char('r') if state.view == View::Dashboard => {
                         state.begin_dashboard_rename();
                     }
@@ -1049,14 +1077,16 @@ async fn run_app(
                         state.begin_dashboard_delete();
                     }
                     KeyCode::Char('s') if state.view == View::Dashboard => {
-                        if let Some(path) = state.dashboard_selected_path()
+                        if state.dashboard_actions().stop
+                            && let Some(path) = state.dashboard_selected_path()
                             && let Some(sender) = &commands
                         {
                             let _ = sender.send(UiCommand::StopResident(path));
                         }
                     }
                     KeyCode::Char('x') if state.view == View::Dashboard => {
-                        if let Some(path) = state.dashboard_selected_path()
+                        if state.dashboard_actions().close
+                            && let Some(path) = state.dashboard_selected_path()
                             && let Some(sender) = &commands
                         {
                             let _ = sender.send(UiCommand::CloseResident(path));
@@ -4464,7 +4494,7 @@ mod tests {
                     path: "/sessions/one.jsonl".into(),
                     name: Some("DeepSeek subagent exploration".into()),
                     first_message: "explore the codebase".into(),
-                    modified: "2026-07-11T08:30:00.000Z".into(),
+                    modified_at_ms: 1_752_220_600_000,
                     message_count: 12,
                     current: true,
                     cwd: "/work/pi-shell".into(),
@@ -4475,7 +4505,7 @@ mod tests {
                     path: "/sessions/two.jsonl".into(),
                     name: None,
                     first_message: "Fix the model picker".into(),
-                    modified: "2026-07-11T07:00:00.000Z".into(),
+                    modified_at_ms: 1_752_215_200_000,
                     message_count: 4,
                     current: false,
                     cwd: "/work/pi-shell".into(),
@@ -4514,7 +4544,7 @@ mod tests {
                     path: "/sessions/one.jsonl".into(),
                     name: Some("Named session".into()),
                     first_message: "first".into(),
-                    modified: "2026-07-11T08:30:00.000Z".into(),
+                    modified_at_ms: 1_752_220_600_000,
                     message_count: 12,
                     current: true,
                     cwd: "/work".into(),
@@ -4525,7 +4555,7 @@ mod tests {
                     path: "/sessions/two.jsonl".into(),
                     name: None,
                     first_message: "second".into(),
-                    modified: "2026-07-11T07:00:00.000Z".into(),
+                    modified_at_ms: 1_752_215_200_000,
                     message_count: 4,
                     current: false,
                     cwd: "/work".into(),
@@ -4579,7 +4609,7 @@ mod tests {
                     path: "/sessions/active.jsonl".into(),
                     name: Some("Active".into()),
                     first_message: "active".into(),
-                    modified: String::new(),
+                    modified_at_ms: 0,
                     message_count: 1,
                     current: true,
                     cwd: "/work".into(),
@@ -4590,7 +4620,7 @@ mod tests {
                     path: "/sessions/old.jsonl".into(),
                     name: Some("Old".into()),
                     first_message: "old".into(),
-                    modified: String::new(),
+                    modified_at_ms: 0,
                     message_count: 1,
                     current: false,
                     cwd: "/work".into(),
@@ -6224,6 +6254,12 @@ mod tests {
         let (width, height) = (100, 32);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let now_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
         let mut state = super::AppState {
             view: super::View::Dashboard,
             available_sessions: vec![
@@ -6232,7 +6268,7 @@ mod tests {
                     path: "/tmp/current.jsonl".into(),
                     name: Some("Active refactor".into()),
                     first_message: String::new(),
-                    modified: "now".into(),
+                    modified_at_ms: now_ms,
                     message_count: 4,
                     current: true,
                     cwd: String::new(),
@@ -6243,7 +6279,7 @@ mod tests {
                     path: "/tmp/saved.jsonl".into(),
                     name: None,
                     first_message: "Previous investigation".into(),
-                    modified: "2h ago".into(),
+                    modified_at_ms: now_ms - 2 * 60 * 60 * 1_000,
                     message_count: 8,
                     current: false,
                     cwd: String::new(),
@@ -6252,6 +6288,14 @@ mod tests {
             ],
             ..super::AppState::default()
         };
+        state.runtime_sessions.insert(
+            "/tmp/current.jsonl".into(),
+            pi_harness::RuntimeSessionInfo {
+                path: "/tmp/current.jsonl".into(),
+                status: "running".into(),
+                started_at_ms: Some(now_ms),
+            },
+        );
         state.streaming = true;
         state.turn_started_at = Some(std::time::Instant::now());
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
@@ -6262,6 +6306,57 @@ mod tests {
         assert!(output.contains("Running"));
         assert!(output.contains("Inactive"));
         assert!(output.contains("Active refactor"));
+        assert!(output.contains("2h ago"));
+        assert!(output.contains("s stop"));
+        assert!(output.contains("x close"));
+        assert!(!output.contains("d delete"));
         assert!(!output.contains("Messages total"));
+
+        state.dashboard_selected = 1;
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("d delete"));
+        assert!(!output.contains("s stop"));
+        assert!(!output.contains("x close"));
+    }
+
+    #[test]
+    fn session_age_uses_relative_units_without_leaking_wire_dates() {
+        let now = 2_000_000_000;
+        assert_eq!(super::state::format_session_age(now, now), "now");
+        assert_eq!(
+            super::state::format_session_age(now - 5 * 60_000, now),
+            "5m ago"
+        );
+        assert_eq!(
+            super::state::format_session_age(now - 3 * 3_600_000, now),
+            "3h ago"
+        );
+        assert_eq!(
+            super::state::format_session_age(now - 2 * 86_400_000, now),
+            "2d ago"
+        );
+    }
+
+    #[test]
+    fn dashboard_renders_update_state_above_contextual_actions() {
+        let (width, height) = (100, 32);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = super::AppState {
+            view: super::View::Dashboard,
+            app_update: Some(pi_harness::AppUpdateStatus::Available {
+                version: "0.2.0".into(),
+                size_bytes: 38 * 1024 * 1024,
+            }),
+            ..super::AppState::default()
+        };
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("Torii v0.2.0 available"));
+        assert!(output.contains("38.0 MiB"));
+        assert!(output.contains("u update"));
+        assert!(output.contains("l later"));
+        assert!(output.contains("Enter open"));
     }
 }

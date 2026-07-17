@@ -1,0 +1,18 @@
+Grok Build
+----------
+
+Torii's action registry, responsive agent layout, semantic scrollback display
+model, prompt interaction patterns, and GrokNight theme values are adapted from
+Grok Build:
+
+  https://github.com/xai-org/grok-build
+
+Copyright 2023-2026 SpaceXAI
+Licensed under the Apache License, Version 2.0.
+
+The Apache License, Version 2.0 is available at:
+
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Torii retains its Pi SDK runtime, workflow engine, protocol, session format,
+and project-specific rendering and behavior.

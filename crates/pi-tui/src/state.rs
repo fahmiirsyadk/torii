@@ -1,6 +1,6 @@
 use pi_harness::{
-    AgentEvent, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings, SessionInfo,
-    SessionTreeEntry, SubagentTask, ToolResult, Usage, WorkflowArtifactSnapshot,
+    AgentEvent, AppUpdateStatus, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings,
+    SessionInfo, SessionTreeEntry, SubagentTask, ToolResult, Usage, WorkflowArtifactSnapshot,
     WorkflowCatalogEntry, WorkflowPreview, WorkflowPreviewStep, WorkflowRunSnapshot,
 };
 use std::{
@@ -17,6 +17,13 @@ pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
 pub struct ScrollDrag {
     pub start_row: u16,
     pub start_from_bottom: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DashboardActions {
+    pub delete: bool,
+    pub stop: bool,
+    pub close: bool,
 }
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
@@ -651,6 +658,7 @@ pub struct AppState {
     pub model: String,
     pub permission_mode: PermissionMode,
     pub status: String,
+    pub app_update: Option<AppUpdateStatus>,
     pub streaming: bool,
     pub escape_armed_at: Option<Instant>,
     /// Wall-clock time the LLM started the current turn (the first TextDelta
@@ -797,6 +805,7 @@ impl Default for AppState {
             model: "Mock model".into(),
             permission_mode: PermissionMode::Normal,
             status: "idle".into(),
+            app_update: None,
             streaming: false,
             escape_armed_at: None,
             turn_started_at: None,
@@ -1037,6 +1046,18 @@ impl AppState {
         self.available_sessions
             .get(self.dashboard_selected)
             .map(|session| session.path.clone())
+    }
+
+    pub fn dashboard_actions(&self) -> DashboardActions {
+        let Some(session) = self.available_sessions.get(self.dashboard_selected) else {
+            return DashboardActions::default();
+        };
+        let runtime = self.runtime_sessions.get(&session.path);
+        DashboardActions {
+            delete: !session.current && runtime.is_none(),
+            stop: runtime.is_some_and(|runtime| runtime.status != "idle"),
+            close: runtime.is_some(),
+        }
     }
 
     pub fn begin_dashboard_rename(&mut self) {
@@ -2398,7 +2419,9 @@ impl AppState {
             .filter(|session| session_search_text(session).contains(&query))
             .collect::<Vec<_>>();
         match self.session_sort {
-            SessionSort::Recent => sessions.sort_by(|a, b| b.modified.cmp(&a.modified)),
+            SessionSort::Recent => {
+                sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_at_ms))
+            }
             SessionSort::Relevance if !query.is_empty() => sessions.sort_by_key(|session| {
                 session_search_text(session)
                     .find(&query)
@@ -3788,6 +3811,9 @@ impl AppState {
 
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::AppUpdate { status } => {
+                self.app_update = (!matches!(status, AppUpdateStatus::Current)).then_some(status);
+            }
             AgentEvent::RuntimeSessions { sessions } => {
                 self.runtime_sessions = sessions
                     .into_iter()
@@ -4355,7 +4381,7 @@ pub(crate) fn session_label(session: &SessionInfo, show_path: bool) -> String {
         title
     };
     let title = title.chars().take(20).collect::<String>();
-    let modified = session.modified.get(..16).unwrap_or(&session.modified);
+    let modified = format_session_age(session.modified_at_ms, unix_time_ms());
     let path = if show_path {
         format!("  · {}", session.path)
     } else {
@@ -4365,6 +4391,30 @@ pub(crate) fn session_label(session: &SessionInfo, show_path: bool) -> String {
         "{title}  · {modified}  · {} msg{path}",
         session.message_count
     )
+}
+
+pub(crate) fn format_session_age(modified_at_ms: u64, now_ms: u64) -> String {
+    if modified_at_ms == 0 {
+        return "unknown".into();
+    }
+    let elapsed_seconds = now_ms.saturating_sub(modified_at_ms) / 1_000;
+    match elapsed_seconds {
+        0..60 => "now".into(),
+        60..3_600 => format!("{}m ago", elapsed_seconds / 60),
+        3_600..86_400 => format!("{}h ago", elapsed_seconds / 3_600),
+        86_400..604_800 => format!("{}d ago", elapsed_seconds / 86_400),
+        604_800..31_536_000 => format!("{}w ago", elapsed_seconds / 604_800),
+        _ => format!("{}y ago", elapsed_seconds / 31_536_000),
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn session_search_text(session: &SessionInfo) -> String {
@@ -4394,7 +4444,7 @@ fn threaded_session_order(sessions: Vec<&SessionInfo>) -> Vec<&SessionInfo> {
         children.entry(parent).or_default().push(session);
     }
     for siblings in children.values_mut() {
-        siblings.sort_by(|a, b| b.modified.cmp(&a.modified));
+        siblings.sort_by_key(|session| std::cmp::Reverse(session.modified_at_ms));
     }
     let mut ordered = Vec::new();
     let mut stack = children.get(&None).cloned().unwrap_or_default();

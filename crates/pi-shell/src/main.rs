@@ -12,11 +12,25 @@ use std::{
 
 pub mod supervisor;
 pub mod task;
+pub mod update;
 pub mod workflow;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(status) = delegate_installed_version()? {
+        std::process::exit(status);
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--package-health-check")
+    {
+        PiHarness::spawn_default().await?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|argument| argument == "self") {
+        return self_command(&args[1..]).await;
+    }
     if is_package_command(&args) {
         return delegate_pi_package_command(&args);
     }
@@ -84,7 +98,7 @@ async fn main() -> Result<()> {
         .position(|arg| arg == "--backend")
         .and_then(|position| args.get(position + 1))
         .map(String::as_str)
-        .unwrap_or("mock");
+        .unwrap_or("pi");
     let harness: Arc<dyn AgentHarness> = match backend {
         "mock" => Arc::new(MockHarness::default()),
         "pi" => Arc::new(PiHarness::spawn_default().await?),
@@ -138,9 +152,80 @@ async fn main() -> Result<()> {
             .adopt(current_path, session.clone(), events)
             .await;
         let events = supervisor.foreground_events();
+        let update_candidate = Arc::new(tokio::sync::RwLock::new(None));
+        {
+            let update_supervisor = Arc::clone(&supervisor);
+            let update_candidate = Arc::clone(&update_candidate);
+            tokio::spawn(async move {
+                if let Ok(failed_version) = std::env::var("TORII_ROLLED_BACK_FROM") {
+                    update_supervisor
+                        .publish_host_event(AgentEvent::AppUpdate {
+                            status: pi_harness::AppUpdateStatus::RolledBack {
+                                failed_version,
+                                restored_version: env!("CARGO_PKG_VERSION").into(),
+                            },
+                        })
+                        .await;
+                    return;
+                }
+                update_supervisor
+                    .publish_host_event(AgentEvent::AppUpdate {
+                        status: pi_harness::AppUpdateStatus::Checking,
+                    })
+                    .await;
+                let status = match update::check(false).await {
+                    Ok(Some(candidate)) => {
+                        let status = update::candidate_status(&candidate);
+                        *update_candidate.write().await = Some(candidate);
+                        status
+                    }
+                    Ok(None) => pi_harness::AppUpdateStatus::Current,
+                    Err(_) => pi_harness::AppUpdateStatus::Current,
+                };
+                update_supervisor
+                    .publish_host_event(AgentEvent::AppUpdate { status })
+                    .await;
+            });
+        }
         let command_supervisor = Arc::clone(&supervisor);
         tokio::spawn(async move {
             while let Some(command) = submitted.recv().await {
+                if matches!(command, pi_tui::UiCommand::InstallUpdate) {
+                    let candidate = update_candidate.read().await.clone();
+                    let update_supervisor = Arc::clone(&command_supervisor);
+                    tokio::spawn(async move {
+                        let Some(candidate) = candidate else {
+                            update_supervisor
+                                .publish_host_event(AgentEvent::AppUpdate {
+                                    status: pi_harness::AppUpdateStatus::Failed {
+                                        message: "no checked update is available".into(),
+                                    },
+                                })
+                                .await;
+                            return;
+                        };
+                        let progress_supervisor = Arc::clone(&update_supervisor);
+                        let result = update::install(&candidate, move |status| {
+                            let supervisor = Arc::clone(&progress_supervisor);
+                            tokio::spawn(async move {
+                                supervisor
+                                    .publish_host_event(AgentEvent::AppUpdate { status })
+                                    .await;
+                            });
+                        })
+                        .await;
+                        if let Err(error) = result {
+                            update_supervisor
+                                .publish_host_event(AgentEvent::AppUpdate {
+                                    status: pi_harness::AppUpdateStatus::Failed {
+                                        message: error.to_string(),
+                                    },
+                                })
+                                .await;
+                        }
+                    });
+                    continue;
+                }
                 if let pi_tui::UiCommand::ResumeSession(target) = &command {
                     let _ = command_supervisor.activate(target.clone(), None).await;
                     continue;
@@ -165,6 +250,7 @@ async fn main() -> Result<()> {
                     continue;
                 };
                 match command {
+                    pi_tui::UiCommand::InstallUpdate => unreachable!(),
                     pi_tui::UiCommand::Submit {
                         text,
                         delivery,
@@ -414,6 +500,119 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn delegate_installed_version() -> Result<Option<i32>> {
+    let executable = std::env::current_exe()?;
+    let Some(bin) = executable.parent() else {
+        return Ok(None);
+    };
+    let Some(root) = bin.parent() else {
+        return Ok(None);
+    };
+    let pointer = root.join("current");
+    if !pointer.is_file() {
+        return Ok(None);
+    }
+    let mut version = update::read_pointer(root, "current")
+        .ok_or_else(|| anyhow::anyhow!("invalid installed Torii version pointer"))?;
+    let mut target = root
+        .join("versions")
+        .join(&version)
+        .join("bin")
+        .join(if cfg!(windows) { "torii.exe" } else { "torii" });
+    if target == executable || !target.is_file() {
+        return Err(anyhow::anyhow!(
+            "installed Torii version {version} is incomplete at {}",
+            target.display()
+        ));
+    }
+    let pending = update::read_pointer(root, "pending");
+    let mut rolled_back_from = None;
+    if pending.as_deref() == Some(&version) {
+        let healthy = std::process::Command::new(&target)
+            .arg("--package-health-check")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if healthy {
+            let _ = std::fs::remove_file(root.join("pending"));
+        } else {
+            let failed = version;
+            version = update::read_pointer(root, "previous").ok_or_else(|| {
+                anyhow::anyhow!("updated Torii failed and no previous version exists")
+            })?;
+            update::write_pointer(root, "current", &version)?;
+            let _ = std::fs::remove_file(root.join("pending"));
+            target = root
+                .join("versions")
+                .join(&version)
+                .join("bin")
+                .join(if cfg!(windows) { "torii.exe" } else { "torii" });
+            rolled_back_from = Some(failed);
+        }
+    }
+    let mut command = std::process::Command::new(target);
+    command.args(std::env::args_os().skip(1));
+    if let Some(failed) = rolled_back_from {
+        command.env("TORII_ROLLED_BACK_FROM", failed);
+    }
+    let status = command
+        .status()
+        .context("failed to launch the installed Torii version")?;
+    Ok(Some(status.code().unwrap_or(1)))
+}
+
+async fn self_command(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("check") => match update::check(true).await? {
+            Some(candidate) => {
+                println!(
+                    "Torii v{} is available ({} bytes)",
+                    candidate.version, candidate.size_bytes
+                );
+                Ok(())
+            }
+            None => {
+                println!("Torii v{} is current", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
+        },
+        Some("update") => {
+            let Some(candidate) = update::check(true).await? else {
+                println!("Torii v{} is current", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            };
+            update::install(&candidate, |status| {
+                if let pi_harness::AppUpdateStatus::Downloading {
+                    downloaded_bytes,
+                    total_bytes,
+                    ..
+                } = status
+                {
+                    eprint!("\rDownloading {downloaded_bytes}/{total_bytes} bytes");
+                }
+            })
+            .await?;
+            eprintln!();
+            println!(
+                "Torii v{} is installed and will run on the next launch",
+                candidate.version
+            );
+            Ok(())
+        }
+        Some("version") => {
+            println!(
+                "torii {} (protocol {})",
+                env!("CARGO_PKG_VERSION"),
+                pi_harness_pi::PROTOCOL_VERSION
+            );
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!("usage: torii self <check|update|version>")),
+    }
+}
+
 fn is_package_command(args: &[String]) -> bool {
     args.first().is_some_and(|argument| {
         matches!(
@@ -427,8 +626,24 @@ fn delegate_pi_package_command(args: &[String]) -> Result<()> {
     let cli = std::env::var_os("PI_SHELL_PI_CLI")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../sidecar/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
+            let executable = std::env::current_exe().ok();
+            executable
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::parent)
+                .map(|root| {
+                    root.join("libexec").join(if cfg!(windows) {
+                        "torii-sidecar.exe"
+                    } else {
+                        "torii-sidecar"
+                    })
+                })
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| {
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                        "../../sidecar/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+                    )
+                })
         });
     if !cli.is_file() {
         return Err(anyhow::anyhow!(
@@ -436,8 +651,16 @@ fn delegate_pi_package_command(args: &[String]) -> Result<()> {
             cli.display()
         ));
     }
-    let status = std::process::Command::new("node")
-        .arg(cli)
+    let mut command = if cli.extension().is_some_and(|extension| extension == "js") {
+        let mut command = std::process::Command::new("node");
+        command.arg(cli);
+        command
+    } else {
+        let mut command = std::process::Command::new(cli);
+        command.arg("--package-command");
+        command
+    };
+    let status = command
         .args(args)
         .status()
         .context("failed to launch Pi package manager")?;

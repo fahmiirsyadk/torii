@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use pi_harness::AppUpdateStatus;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -1005,8 +1006,10 @@ fn short_fingerprint(value: &str) -> &str {
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
-    } else {
+    } else if bytes < 1024 * 1024 {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1519,7 +1522,13 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
                 }),
             ),
             Span::styled(
-                format!("  {}", session.modified),
+                format!(
+                    "  {}",
+                    crate::state::format_session_age(
+                        session.modified_at_ms,
+                        unix_time_ms().try_into().unwrap_or(u64::MAX),
+                    )
+                ),
                 Style::default().fg(theme.muted),
             ),
         ]));
@@ -1537,14 +1546,83 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         chunks[3].height,
     )));
     frame.render_widget(Paragraph::new(lines), chunks[3]);
+    let actions = state.dashboard_actions();
+    let mut footer = String::from("↑/↓ select   Enter open   n new   r rename");
+    if actions.delete {
+        footer.push_str("   d delete");
+    }
+    if actions.stop {
+        footer.push_str("   s stop");
+    }
+    if actions.close {
+        footer.push_str("   x close");
+    }
+    footer.push_str("   Esc return");
+    let mut footer_lines = Vec::with_capacity(2);
+    if let Some(status) = state.app_update.as_ref() {
+        footer_lines.push(update_status_line(status, theme));
+    }
+    footer_lines.push(Line::from(footer));
     frame.render_widget(
-        Paragraph::new(
-            "↑/↓ select   Enter open   n new   r rename   d delete   s stop   x close   Esc return",
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.muted)),
+        Paragraph::new(footer_lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
         chunks[4],
     );
+}
+
+fn update_status_line(status: &AppUpdateStatus, theme: Theme) -> Line<'static> {
+    let (text, color) = match status {
+        AppUpdateStatus::Checking => ("Checking for Torii updates".into(), theme.muted),
+        AppUpdateStatus::Current => return Line::default(),
+        AppUpdateStatus::Available {
+            version,
+            size_bytes,
+        } => (
+            format!(
+                "Torii v{version} available  ·  {}  ·  u update   l later",
+                format_bytes(*size_bytes)
+            ),
+            theme.accent,
+        ),
+        AppUpdateStatus::Downloading {
+            version,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            let percent = if *total_bytes == 0 {
+                0
+            } else {
+                downloaded_bytes.saturating_mul(100) / total_bytes
+            };
+            (
+                format!(
+                    "Downloading v{version}  ·  {percent}%  ·  {} / {}",
+                    format_bytes(*downloaded_bytes),
+                    format_bytes(*total_bytes)
+                ),
+                theme.accent,
+            )
+        }
+        AppUpdateStatus::Ready { version } => (
+            format!("✓ Torii v{version} is verified and ready  ·  restart to apply"),
+            theme.success,
+        ),
+        AppUpdateStatus::Failed { message } => (
+            format!("! Update rejected: {}", truncate_text(message, 52)),
+            theme.error,
+        ),
+        AppUpdateStatus::RolledBack {
+            failed_version,
+            restored_version,
+        } => (
+            format!(
+                "↶ Restored v{restored_version} after v{failed_version} failed its health check"
+            ),
+            theme.warning,
+        ),
+    };
+    Line::from(Span::styled(text, Style::default().fg(color)))
 }
 
 fn unix_time_ms() -> u128 {

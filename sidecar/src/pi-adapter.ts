@@ -31,6 +31,7 @@ import {
   type ExtensionContext,
   type AgentSessionRuntime,
   type ModelRegistry,
+  main as piMain,
   ProjectTrustStore,
   copyToClipboard,
   getAgentDir,
@@ -59,6 +60,10 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
 type CapabilityMode = "read-only" | "read-write" | "execute" | "all";
+
+export async function runPackageCommand(args: string[]): Promise<void> {
+  await piMain(args);
+}
 
 // -----------------------------------------------------------------------------
 // Active session — the bridge between wire state and the SDK session.
@@ -1158,7 +1163,7 @@ export async function listAllSessions(active: ActiveSession) {
     path: session.path,
     name: session.name,
     first_message: session.firstMessage,
-    modified: session.modified.toISOString(),
+    modified_at_ms: session.modified.getTime(),
     message_count: session.messageCount,
     current: currentPath === session.path,
     cwd: session.cwd,

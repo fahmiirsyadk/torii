@@ -1,6 +1,7 @@
 # Torii
 
-A terminal interface for coding-agent sessions powered by the Pi SDK. (WIP). The Design heavy inspired from Grok Build CLI.
+A terminal workspace for coding-agent sessions powered by the Pi SDK, with
+interaction and visual design inspired by Grok Build CLI.
 
 <div align="center">
 <img width="725" height="582" alt="screenshot-20260713-145028" src="https://github.com/user-attachments/assets/1e39cff2-1f51-461d-a70c-a2b72b489008" />
@@ -31,40 +32,38 @@ routing, context and cache policies, and `/resume` behavior.
 
 ## Install
 
-Requirements:
-
-- Rust toolchain
-- Node.js 22.19 or newer
-- npm
-
-Install the sidecar dependencies and build the release binary:
+Linux and macOS:
 
 ```bash
-git clone https://github.com/fahmiirsyadk/torii.git
-cd torii/sidecar
-npm install
-cd ..
-cargo build --release -p torii
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/fahmiirsyadk/torii/main/install.sh | sh
 ```
 
-Run it with the Pi backend:
+Windows PowerShell:
 
-```bash
-./target/release/torii --backend pi
+```powershell
+irm https://raw.githubusercontent.com/fahmiirsyadk/torii/main/install.ps1 | iex
 ```
+
+The installer verifies the platform release digest and installs a stable
+launcher plus a versioned Rust host and compiled SDK sidecar. Node.js, npm,
+Bun, and the Rust toolchain are not runtime requirements.
 
 Provider authentication:
 
 ```bash
-./target/release/torii login
-./target/release/torii login <provider>
-./target/release/torii logout <provider>
+torii login
+torii login <provider>
+torii logout <provider>
 ```
+
+Build from source with `cargo build --release -p torii` after running
+`npm ci` in `sidecar/`.
 
 ## Arguments
 
 ```text
---backend <mock|pi>       Select the backend. Default: mock
+--backend <mock|pi>       Select the backend. Default: pi
 --model <provider/model>  Select a model before opening the session
 --headless                Print JSONL events without opening the TUI
 --prompt <text>           Prompt used in headless mode
@@ -92,6 +91,19 @@ torii update [package]
 torii list
 torii config
 ```
+
+Torii checks for a new stable release in the background at most once every
+24 hours. Updates are downloaded, digest-verified, unpacked into a new version
+directory, and activated by an atomic version-pointer replacement:
+
+```text
+torii self check
+torii self update
+torii self version
+```
+
+The running process is never replaced. A verified update becomes active on the
+next launch; the previous version remains available for recovery.
 
 ## Usage tutorial
 
