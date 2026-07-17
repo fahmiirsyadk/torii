@@ -18,6 +18,10 @@ pub enum ActionId {
     ScrollDown,
     ToggleFold,
     OpenBlockViewer,
+    CopyBlockContent,
+    CopyBlockMarkdown,
+    CopyCode,
+    CopyTurn,
     ToggleTasks,
     ToggleQueue,
     CycleMode,
@@ -48,7 +52,13 @@ impl KeyBinding {
     }
 
     pub fn matches(self, key: &KeyEvent) -> bool {
-        self.code == key.code && self.modifiers == key.modifiers
+        let same_code = match (self.code, key.code) {
+            (KeyCode::Char(expected), KeyCode::Char(actual)) => {
+                expected.eq_ignore_ascii_case(&actual)
+            }
+            _ => self.code == key.code,
+        };
+        same_code && self.modifiers == key.modifiers
     }
 
     pub fn display(self) -> String {
@@ -187,6 +197,46 @@ pub fn definitions() -> Vec<ActionDefinition> {
             alternates: NONE,
             hint_priority: Some(3),
             palette: false,
+        },
+        ActionDefinition {
+            id: ActionId::CopyBlockContent,
+            label: "Copy",
+            description: "Copy the selected conversation block",
+            context: ActionContext::Scrollback,
+            primary: KeyBinding::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            alternates: NONE,
+            hint_priority: Some(3),
+            palette: true,
+        },
+        ActionDefinition {
+            id: ActionId::CopyBlockMarkdown,
+            label: "Copy Markdown",
+            description: "Copy the selected block's raw Markdown",
+            context: ActionContext::Scrollback,
+            primary: KeyBinding::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            alternates: NONE,
+            hint_priority: None,
+            palette: true,
+        },
+        ActionDefinition {
+            id: ActionId::CopyCode,
+            label: "Copy code",
+            description: "Copy fenced code from the selected response",
+            context: ActionContext::Scrollback,
+            primary: KeyBinding::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            alternates: NONE,
+            hint_priority: None,
+            palette: true,
+        },
+        ActionDefinition {
+            id: ActionId::CopyTurn,
+            label: "Copy turn",
+            description: "Copy the selected user and assistant turn as Markdown",
+            context: ActionContext::Scrollback,
+            primary: KeyBinding::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            alternates: NONE,
+            hint_priority: None,
+            palette: true,
         },
         ActionDefinition {
             id: ActionId::FocusPrompt,

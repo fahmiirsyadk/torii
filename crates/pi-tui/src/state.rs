@@ -675,6 +675,9 @@ pub struct AppState {
     pub status: String,
     pub app_update: Option<AppUpdateStatus>,
     pub streaming: bool,
+    /// A locally submitted foreground message that has not yet been
+    /// acknowledged by a non-idle runtime event.
+    pub submission_pending: bool,
     pub escape_armed_at: Option<Instant>,
     /// Wall-clock time the LLM started the current turn (the first TextDelta
     /// or ReasoningDelta of a turn). Used by the working banner above the
@@ -828,6 +831,7 @@ impl Default for AppState {
             status: "idle".into(),
             app_update: None,
             streaming: false,
+            submission_pending: false,
             escape_armed_at: None,
             turn_started_at: None,
             image_processing_started_at: None,
@@ -3710,11 +3714,118 @@ impl AppState {
             );
             if foldable {
                 self.toggle_entry_at(index);
-            } else if self.entries.get(index).is_some() {
-                self.viewed_entry = Some(index);
-                self.view = View::BlockViewer;
-                self.scroll_from_bottom = 0;
             }
+        }
+    }
+
+    pub fn selected_block_markdown(&self) -> Option<String> {
+        self.focused_entry
+            .and_then(|index| self.entry_markdown(index))
+            .filter(|text| !text.is_empty())
+    }
+
+    pub fn selected_block_text(&self) -> Option<String> {
+        let index = self.focused_entry?;
+        let entry = self.entries.get(index)?;
+        let text = match entry {
+            Entry::Assistant { lines, .. } => crate::markdown::render(lines, 120, self.theme())
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string(),
+            _ => self.entry_markdown(index)?,
+        };
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn selected_code(&self) -> Option<String> {
+        let Entry::Assistant { lines, .. } = self.entries.get(self.focused_entry?)? else {
+            return None;
+        };
+        let blocks = crate::markdown::code_blocks(lines);
+        (!blocks.is_empty()).then(|| {
+            blocks
+                .into_iter()
+                .map(|block| block.body)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+    }
+
+    pub fn selected_turn_markdown(&self) -> Option<String> {
+        let selected = self.focused_entry?;
+        let user = (0..=selected)
+            .rev()
+            .find(|index| matches!(self.entries.get(*index), Some(Entry::User { .. })))?;
+        let assistant = (selected.max(user)..self.entries.len())
+            .find(|index| matches!(self.entries.get(*index), Some(Entry::Assistant { .. })))?;
+        let mut transcript = Vec::new();
+        for index in user..=assistant {
+            let Some(entry) = self.entries.get(index) else {
+                continue;
+            };
+            let Some(body) = self.entry_markdown(index) else {
+                continue;
+            };
+            let heading = match entry {
+                Entry::User { .. } => "## User".to_string(),
+                Entry::Assistant { .. } => "## Assistant".to_string(),
+                Entry::Reasoning { .. } => "### Reasoning".to_string(),
+                Entry::Tool { label, .. } => format!("### Tool: {label}"),
+                Entry::Diff { path, .. } => format!("### Change: `{path}`"),
+                Entry::Plan { .. } => "### Plan".to_string(),
+                Entry::Compaction { .. } => "### Compaction".to_string(),
+                Entry::CompactionIndicator { .. } => continue,
+            };
+            transcript.push(format!("{heading}\n\n{}", body.trim()));
+        }
+        (!transcript.is_empty()).then(|| transcript.join("\n\n"))
+    }
+
+    fn entry_markdown(&self, index: usize) -> Option<String> {
+        match self.entries.get(index)? {
+            Entry::User { text, .. } => Some(text.clone()),
+            Entry::Assistant { lines, .. } => Some(lines.join("\n")),
+            Entry::Reasoning { text, .. } => Some(text.clone()),
+            Entry::Diff { path, lines, .. } => Some(format!(
+                "```diff\n--- a/{path}\n+++ b/{path}\n{}\n```",
+                lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            Entry::Tool { detail, result, .. } => {
+                Some(result.as_deref().unwrap_or(detail).to_string())
+            }
+            Entry::Plan { entries, .. } => Some(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "- [{}] {}",
+                            if entry.status == "completed" {
+                                "x"
+                            } else {
+                                " "
+                            },
+                            entry.step
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Entry::Compaction { summary, .. } => Some(summary.clone()),
+            Entry::CompactionIndicator { .. } => None,
         }
     }
 
@@ -3852,7 +3963,14 @@ impl AppState {
         });
         self.clear_prompt();
         self.scroll_to_bottom();
-        self.status = "queued".into();
+        if self.streaming {
+            self.status = "queued".into();
+        } else {
+            self.begin_turn_if_needed();
+            self.streaming = true;
+            self.submission_pending = true;
+            self.status = "sendingâ€¦".into();
+        }
         Some((prompt, images))
     }
 
@@ -3966,8 +4084,8 @@ impl AppState {
         self.running_tool_count() > 0
     }
 
-    /// Records the start of a new LLM turn. Called by the TextDelta and
-    /// ReasoningDelta arms on the first delta of a turn. Snapshots
+    /// Records the start of a new LLM turn. Called on local submission and
+    /// retained when the first runtime or content event arrives. Snapshots
     /// `context_used` as the input-token count and resets the output-char
     /// accumulator so the working banner can show a meaningful ↑/↓ token
     /// tally while the model is generating.
@@ -4008,8 +4126,15 @@ impl AppState {
                 if let Some(window) = context_window {
                     self.context_limit = window;
                 }
-                self.streaming = streaming;
-                if idle && !compacting {
+                if self.submission_pending && idle && !compacting {
+                    self.streaming = true;
+                } else {
+                    if !idle || compacting || streaming {
+                        self.submission_pending = false;
+                    }
+                    self.streaming = streaming || !idle;
+                }
+                if idle && !compacting && !self.submission_pending {
                     self.turn_started_at = None;
                 }
             }
@@ -4040,6 +4165,7 @@ impl AppState {
                 self.scroll_from_bottom = 0;
                 self.status = "session resumed".into();
                 self.streaming = false;
+                self.submission_pending = false;
                 self.turn_started_at = None;
                 self.turn_input_tokens = 0;
                 self.turn_output_chars = 0;
@@ -4266,6 +4392,7 @@ impl AppState {
                 };
             }
             AgentEvent::TextDelta { text } => {
+                self.submission_pending = false;
                 self.begin_turn_if_needed();
                 let added = text.chars().count() as u64;
                 self.apply_text_delta(text);
@@ -4274,6 +4401,7 @@ impl AppState {
                 self.streaming = true;
             }
             AgentEvent::ReasoningDelta { text } => {
+                self.submission_pending = false;
                 self.begin_turn_if_needed();
                 let added = text.chars().count() as u64;
                 self.append_reasoning_text(&text);
@@ -4494,6 +4622,7 @@ impl AppState {
                     format!("{running} background task(s) running")
                 };
                 self.streaming = false;
+                self.submission_pending = false;
                 for entry in &mut self.entries {
                     if let Entry::Reasoning { active, .. } = entry {
                         *active = false;
@@ -4513,6 +4642,7 @@ impl AppState {
                 });
                 self.status = "error".into();
                 self.streaming = false;
+                self.submission_pending = false;
                 self.turn_started_at = None;
             }
             AgentEvent::Compaction {

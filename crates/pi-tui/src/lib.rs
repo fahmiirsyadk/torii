@@ -97,6 +97,22 @@ fn read_clipboard_text() -> Result<String> {
     Ok(text)
 }
 
+fn write_clipboard_text(text: &str) -> Result<()> {
+    ClipboardContext::new()
+        .and_then(|clipboard| clipboard.set_text(text.to_string()))
+        .map_err(|error| anyhow!(error.to_string()))
+}
+
+fn copy_selected(state: &mut AppState, content: Option<String>, label: &str) {
+    match content {
+        Some(text) => match write_clipboard_text(&text) {
+            Ok(()) => state.status = format!("copied {label}"),
+            Err(error) => state.status = format!("copy failed: {error:#}"),
+        },
+        None => state.status = format!("no {label} available for the selected block"),
+    }
+}
+
 enum ClipboardPayload {
     Image(state::ImageAttachment),
     Text(String),
@@ -457,6 +473,22 @@ fn dispatch_pane_action(
                 state.view = View::BlockViewer;
                 state.scroll_from_bottom = 0;
             }
+        }
+        ActionId::CopyBlockContent => {
+            let content = state.selected_block_text();
+            copy_selected(state, content, "block");
+        }
+        ActionId::CopyBlockMarkdown => {
+            let content = state.selected_block_markdown();
+            copy_selected(state, content, "Markdown");
+        }
+        ActionId::CopyCode => {
+            let content = state.selected_code();
+            copy_selected(state, content, "code");
+        }
+        ActionId::CopyTurn => {
+            let content = state.selected_turn_markdown();
+            copy_selected(state, content, "turn");
         }
         ActionId::ToggleMultiline => {
             state.multiline_mode = !state.multiline_mode;
@@ -1196,9 +1228,7 @@ async fn run_app(
                                     exclude_from_context,
                                 });
                             }
-                        } else if let Some((prompt, images)) = state.submit_message()
-                            && let Some(sender) = &commands
-                        {
+                        } else {
                             let delivery = state.streaming.then_some(
                                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                                     pi_harness::MessageDelivery::Steer
@@ -1206,11 +1236,21 @@ async fn run_app(
                                     pi_harness::MessageDelivery::FollowUp
                                 },
                             );
-                            let _ = sender.send(UiCommand::Submit {
-                                text: prompt,
-                                delivery,
-                                images,
-                            });
+                            if let Some((prompt, images)) = state.submit_message()
+                                && let Some(sender) = &commands
+                                && sender
+                                    .send(UiCommand::Submit {
+                                        text: prompt,
+                                        delivery,
+                                        images,
+                                    })
+                                    .is_err()
+                            {
+                                state.submission_pending = false;
+                                state.streaming = false;
+                                state.turn_started_at = None;
+                                state.status = "send failed: runtime command channel closed".into();
+                            }
                         }
                     }
                     KeyCode::Enter if state.focus == Focus::Scrollback => {
@@ -2367,6 +2407,50 @@ mod tests {
     }
 
     #[test]
+    fn submitting_a_message_enters_working_state_before_runtime_acknowledgement() {
+        let mut state = super::AppState::default();
+        state.context_used = 1_234;
+        state.prompt = "start now".into();
+
+        let (message, images) = state.submit_message().unwrap();
+        assert_eq!(message, "start now");
+        assert!(images.is_empty());
+        assert!(state.streaming);
+        assert!(state.submission_pending);
+        assert!(state.turn_started_at.is_some());
+        assert_eq!(state.turn_input_tokens, 1_234);
+        assert_eq!(state.status, "sendingâ€¦");
+
+        // A stale idle snapshot queued before submission must not erase the
+        // local state while the command is travelling to the runtime.
+        state.apply(AgentEvent::RuntimeState {
+            idle: true,
+            streaming: false,
+            compacting: false,
+            context_tokens: None,
+            context_window: None,
+            context_percent: None,
+        });
+        assert!(state.streaming);
+        assert!(state.submission_pending);
+        assert!(state.turn_started_at.is_some());
+
+        // The first non-idle acknowledgement transfers ownership to the
+        // authoritative runtime state.
+        state.apply(AgentEvent::RuntimeState {
+            idle: false,
+            streaming: false,
+            compacting: false,
+            context_tokens: None,
+            context_window: None,
+            context_percent: None,
+        });
+        assert!(state.streaming);
+        assert!(!state.submission_pending);
+        assert!(state.turn_started_at.is_some());
+    }
+
+    #[test]
     fn focus_and_permission_mode_cycle() {
         let mut state = super::AppState::default();
         assert_eq!(state.focus, super::Focus::Prompt);
@@ -2402,7 +2486,7 @@ mod tests {
 
     #[test]
     fn markdown_story_renders_structured_code_and_styles() {
-        let (width, height) = (100, 32);
+        let (width, height) = (100, 52);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = fixtures::markdown();
@@ -2410,6 +2494,7 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
         assert!(output.contains("Renderer design"));
+        assert!(output.contains("Semantic Markdown events"));
         assert!(output.contains("fn render(entry: &Entry)"));
         assert!(
             terminal
@@ -2462,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_plain_transcript_block_opens_viewer() {
+    fn enter_on_plain_transcript_block_keeps_transcript_open() {
         let mut state = super::AppState::default();
         state.entries.push(super::state::Entry::Assistant {
             lines: vec!["inspect me".into()],
@@ -2470,8 +2555,64 @@ mod tests {
         });
         state.focus_scrollback();
         state.activate_entry_at(0);
-        assert_eq!(state.view, super::View::BlockViewer);
-        assert_eq!(state.viewed_entry, Some(0));
+        assert_eq!(state.view, super::View::Transcript);
+        assert_eq!(state.viewed_entry, None);
+    }
+
+    #[test]
+    fn selected_response_exposes_raw_markdown_code_and_turn_copy_sources() {
+        let mut state = super::AppState::default();
+        state.entries.push(super::state::Entry::User {
+            text: "show a table".into(),
+            timestamp: String::new(),
+        });
+        state.entries.push(super::state::Entry::Assistant {
+            lines: vec![
+                "| A | B |".into(),
+                "| - | - |".into(),
+                "| 1 | 2 |".into(),
+                "".into(),
+                "```rust".into(),
+                "fn main() {}".into(),
+                "```".into(),
+            ],
+            timestamp: String::new(),
+        });
+        state.focused_entry = Some(1);
+
+        assert!(state.selected_block_text().unwrap().contains("┌"));
+        assert!(
+            state
+                .selected_block_markdown()
+                .unwrap()
+                .contains("| - | - |")
+        );
+        assert_eq!(state.selected_code().as_deref(), Some("fn main() {}"));
+        let turn = state.selected_turn_markdown().unwrap();
+        assert!(turn.contains("## User\n\nshow a table"));
+        assert!(turn.contains("## Assistant\n\n| A | B |"));
+    }
+
+    #[test]
+    fn streaming_animation_does_not_reissue_the_hardware_cursor() {
+        let mut state = super::AppState::default();
+        state.focus = super::Focus::Prompt;
+        assert!(ui::composer_uses_hardware_cursor(&state));
+        state.streaming = true;
+        assert!(!ui::composer_uses_hardware_cursor(&state));
+        let backend = TestBackend::new(8, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| ui::render_composer_cursor(frame, &state, (2, 2)))
+            .unwrap();
+        assert!(
+            terminal.backend().buffer()[(2, 2)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        state.streaming = false;
+        state.focus = super::Focus::Scrollback;
+        assert!(!ui::composer_uses_hardware_cursor(&state));
     }
 
     #[test]

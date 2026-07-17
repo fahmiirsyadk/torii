@@ -12,6 +12,7 @@ image.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 pi-harness = { path = "../pi-harness" }
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

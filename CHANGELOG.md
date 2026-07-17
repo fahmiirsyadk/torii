@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.4 - 2026-07-17
+
+### Sessions and interaction
+
+- Sending a foreground message immediately enters a locally owned working
+  state instead of waiting for the first runtime response.
+- Pi's `null` and missing parent-session representations are normalized at the
+  SDK boundary so saved top-level sessions remain visible after restart.
+- Clicking ordinary transcript messages selects them without opening the
+  full-screen block viewer.
+- Streaming redraws use a stable software cursor instead of repeatedly moving
+  and showing the terminal hardware cursor.
+
+### Markdown and copy
+
+- The transcript uses a semantic GFM parser with responsive tables,
+  blockquotes, links, emphasis, strikethrough, task lists, math, nested lists,
+  thematic breaks, and fenced or indented code blocks.
+- Selected blocks support rendered-text, raw-Markdown, fenced-code, and
+  complete-turn clipboard actions.
+
+### Updates
+
+- Update downloads resume partial files, retry transient failures, distinguish
+  stalled transfers from slow valid downloads, and retry checksum failures.
+- Update errors retain their complete cause chain and packaged health checks
+  allow for slower antivirus inspection on Windows.
+- GitHub releases publish only the matching version section from this
+  changelog.
+
 ## 0.1.3 - 2026-07-17
 
 ### Authentication

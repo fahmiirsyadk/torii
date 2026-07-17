@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(None) => pi_harness::AppUpdateStatus::Current,
                     Err(error) => pi_harness::AppUpdateStatus::Failed {
-                        message: error.to_string(),
+                        message: format!("{error:#}"),
                     },
                 };
                 update_supervisor
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
                             update_supervisor
                                 .publish_host_event(AgentEvent::AppUpdate {
                                     status: pi_harness::AppUpdateStatus::Failed {
-                                        message: error.to_string(),
+                                        message: format!("{error:#}"),
                                     },
                                 })
                                 .await;
@@ -260,9 +260,17 @@ async fn main() -> Result<()> {
                         images,
                     } => {
                         command_supervisor.mark_running(&command_session).await;
-                        let _ = command_harness
+                        if let Err(error) = command_harness
                             .deliver_message(&command_session, text, delivery, images)
-                            .await;
+                            .await
+                        {
+                            command_supervisor
+                                .publish_host_event(pi_harness::AgentEvent::Error {
+                                    kind: pi_harness::AgentErrorKind::Internal,
+                                    message: format!("failed to send message: {error:#}"),
+                                })
+                                .await;
+                        }
                     }
                     pi_tui::UiCommand::Permission {
                         request_id,

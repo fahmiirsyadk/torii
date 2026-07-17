@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { grokToolsExtension, loadedHistory, readToriiSettings, writeToriiSubagentModel } from "./pi-adapter.ts";
+import { grokToolsExtension, isTopLevelSession, loadedHistory, readToriiSettings, writeToriiSubagentModel } from "./pi-adapter.ts";
+
+test("Pi null and missing parent paths both identify top-level sessions", () => {
+  assert.equal(isTopLevelSession(undefined), true);
+  assert.equal(isTopLevelSession(null), true);
+  assert.equal(isTopLevelSession("/sessions/parent.jsonl"), false);
+});
 
 test("loaded history preserves Pi compaction-aware entry order", () => {
   const contextEntries = [

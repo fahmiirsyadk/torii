@@ -80,7 +80,10 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
         let start = row;
         let mut actionable = false;
         match &state.entries[index] {
-            Entry::User { .. } => row += 5,
+            Entry::User { .. } => {
+                row += 5;
+                actionable = true;
+            }
             Entry::Reasoning {
                 text,
                 active,
@@ -178,7 +181,8 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                 row += 1 + compaction_indicator_line(*tokens_before, width, theme).len();
             }
             Entry::Assistant { lines, .. } => {
-                row += 1 + markdown::render(lines, width, theme).len()
+                row += 1 + markdown::render(lines, width, theme).len();
+                actionable = true;
             }
         }
         sections.push(LayoutSection {
@@ -3540,10 +3544,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
             } else {
                 display_cursor.saturating_sub(start).min(available)
             };
-            frame.set_cursor_position((
-                area.x + 3 + image_width as u16 + cursor_offset as u16,
-                area.y + 1,
-            ));
+            render_composer_cursor(
+                frame,
+                state,
+                (
+                    area.x + 3 + image_width as u16 + cursor_offset as u16,
+                    area.y + 1,
+                ),
+            );
         }
         return;
     }
@@ -3593,19 +3601,41 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
     }
     frame.render_widget(Paragraph::new(rendered).block(block), area);
     if state.focus == Focus::Prompt {
-        frame.set_cursor_position((
-            area.x
-                .saturating_add(3)
-                .saturating_add(if prompt_layout.cursor_row == 0 {
-                    image_width as u16
-                } else {
-                    0
-                })
-                .saturating_add(prompt_layout.cursor_column as u16),
-            area.y
-                .saturating_add(1)
-                .saturating_add(prompt_layout.cursor_row.saturating_sub(first_row) as u16),
-        ));
+        render_composer_cursor(
+            frame,
+            state,
+            (
+                area.x
+                    .saturating_add(3)
+                    .saturating_add(if prompt_layout.cursor_row == 0 {
+                        image_width as u16
+                    } else {
+                        0
+                    })
+                    .saturating_add(prompt_layout.cursor_column as u16),
+                area.y
+                    .saturating_add(1)
+                    .saturating_add(prompt_layout.cursor_row.saturating_sub(first_row) as u16),
+            ),
+        );
+    }
+}
+
+pub(crate) fn composer_uses_hardware_cursor(state: &AppState) -> bool {
+    state.focus == Focus::Prompt && !state.streaming
+}
+
+pub(crate) fn render_composer_cursor(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    position: (u16, u16),
+) {
+    if composer_uses_hardware_cursor(state) {
+        frame.set_cursor_position(position);
+    } else if state.focus == Focus::Prompt
+        && let Some(cell) = frame.buffer_mut().cell_mut(position)
+    {
+        cell.modifier.insert(Modifier::REVERSED);
     }
 }
 

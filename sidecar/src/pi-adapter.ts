@@ -1263,7 +1263,7 @@ export async function listAllSessions(active: ActiveSession) {
   const listed = await SessionManager.list(active.cwd);
   // Rust-owned tasks use persistent child sessions. They are implementation
   // details of the parent conversation, not independent dashboard sessions.
-  return listed.filter((session) => session.parentSessionPath === undefined || session.path === currentPath).map((session) => ({
+  return listed.filter((session) => isTopLevelSession(session.parentSessionPath) || session.path === currentPath).map((session) => ({
     id: session.id,
     path: session.path,
     name: session.name,
@@ -1274,6 +1274,10 @@ export async function listAllSessions(active: ActiveSession) {
     cwd: session.cwd,
     parent_session_path: session.parentSessionPath,
   }));
+}
+
+export function isTopLevelSession(parentSessionPath: string | null | undefined): boolean {
+  return parentSessionPath == null;
 }
 
 export function renameSession(path: string, name: string): void {

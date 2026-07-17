@@ -112,49 +112,7 @@ where
     fs::create_dir_all(&downloads)?;
     let archive = downloads.join(&candidate.asset_name);
     let temporary_archive = downloads.join(format!(".{}.part", candidate.asset_name));
-    let response = client()
-        .get(&candidate.url)
-        .send()
-        .await
-        .context("failed to download the Torii update")?
-        .error_for_status()
-        .context("Torii update download was rejected")?;
-    let total = response.content_length().unwrap_or(candidate.size_bytes);
-    let mut stream = response.bytes_stream();
-    let mut file = File::create(&temporary_archive)?;
-    let mut hasher = Sha256::new();
-    let mut downloaded = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("failed while downloading the Torii update")?;
-        file.write_all(&chunk)?;
-        hasher.update(&chunk);
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
-        progress(AppUpdateStatus::Downloading {
-            version: candidate.version.to_string(),
-            downloaded_bytes: downloaded,
-            total_bytes: total,
-        });
-    }
-    if downloaded != candidate.size_bytes {
-        let _ = fs::remove_file(&temporary_archive);
-        bail!(
-            "release asset size mismatch: expected {}, received {}",
-            candidate.size_bytes,
-            downloaded
-        );
-    }
-    file.sync_all()?;
-    drop(file);
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != candidate.sha256 {
-        let _ = fs::remove_file(&temporary_archive);
-        bail!(
-            "SHA-256 mismatch for {}: expected {}, received {}",
-            candidate.asset_name,
-            candidate.sha256,
-            actual
-        );
-    }
+    download_with_resume(candidate, &temporary_archive, &mut progress).await?;
     crate::task::replace_file(&temporary_archive, &archive)?;
 
     let versions = root.join("versions");
@@ -187,10 +145,134 @@ pub fn candidate_status(candidate: &UpdateCandidate) -> AppUpdateStatus {
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!("torii/{}", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // A read timeout detects a stalled connection without imposing a total
+        // deadline on a valid transfer over a slower network.
+        .read_timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("static HTTP client configuration must be valid")
+}
+
+async fn download_with_resume<F>(
+    candidate: &UpdateCandidate,
+    destination: &Path,
+    progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(AppUpdateStatus),
+{
+    const ATTEMPTS: usize = 3;
+    let mut last_error = None;
+    for attempt in 1..=ATTEMPTS {
+        match download_attempt(candidate, destination, progress).await {
+            Ok(()) => {
+                let actual = sha256_file(destination)?;
+                if actual == candidate.sha256 {
+                    return Ok(());
+                }
+                let _ = fs::remove_file(destination);
+                last_error = Some(format!(
+                    "SHA-256 mismatch for {}: expected {}, received {}",
+                    candidate.asset_name, candidate.sha256, actual
+                ));
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                }
+            }
+            Err(error) => {
+                last_error = Some(format!("{error:#}"));
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                }
+            }
+        }
+    }
+    bail!(
+        "failed to download the Torii update after {ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown download failure".into())
+    )
+}
+
+async fn download_attempt<F>(
+    candidate: &UpdateCandidate,
+    destination: &Path,
+    progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(AppUpdateStatus),
+{
+    let mut downloaded = fs::metadata(destination)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if downloaded > candidate.size_bytes {
+        fs::remove_file(destination).context("failed to discard an oversized partial update")?;
+        downloaded = 0;
+    }
+    if downloaded == candidate.size_bytes {
+        return Ok(());
+    }
+
+    let mut request = client().get(&candidate.url);
+    if downloaded > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
+    }
+    let response = request
+        .send()
+        .await
+        .context("failed to connect while downloading the Torii update")?;
+    let resumed = downloaded > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let response = response
+        .error_for_status()
+        .context("Torii update download was rejected")?;
+    if !resumed {
+        downloaded = 0;
+    }
+    let mut file = if resumed {
+        File::options()
+            .append(true)
+            .open(destination)
+            .context("failed to reopen the partial Torii update")?
+    } else {
+        File::create(destination).context("failed to create the partial Torii update")?
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("connection stalled while downloading the Torii update")?;
+        file.write_all(&chunk)
+            .context("failed to write the partial Torii update")?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        progress(AppUpdateStatus::Downloading {
+            version: candidate.version.to_string(),
+            downloaded_bytes: downloaded,
+            total_bytes: candidate.size_bytes,
+        });
+    }
+    file.sync_all()
+        .context("failed to flush the partial Torii update")?;
+    if downloaded != candidate.size_bytes {
+        bail!(
+            "incomplete Torii update download: expected {}, received {}",
+            candidate.size_bytes,
+            downloaded
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).context("failed to reopen the downloaded Torii update")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .context("failed to verify the downloaded Torii update")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn install_root() -> Option<PathBuf> {
@@ -287,7 +369,7 @@ pub fn write_pointer(root: &Path, name: &str, version: &str) -> Result<()> {
 async fn health_check(version_root: &Path) -> Result<()> {
     let executable = version_root.join("bin").join(executable_name("torii"));
     let status = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(120),
         tokio::process::Command::new(&executable)
             .arg("--package-health-check")
             .stdin(std::process::Stdio::null())
@@ -296,7 +378,7 @@ async fn health_check(version_root: &Path) -> Result<()> {
             .status(),
     )
     .await
-    .context("updated Torii health check timed out")?
+    .context("updated Torii package health check did not finish within 120 seconds")?
     .with_context(|| format!("failed to start {}", executable.display()))?;
     if !status.success() {
         bail!("updated Torii failed its packaged health check");
@@ -440,6 +522,71 @@ mod tests {
         let name = release_asset_name(&version);
         assert!(name.starts_with("torii-v1.2.3-"));
         assert!(name.ends_with(if cfg!(windows) { ".zip" } else { ".tar.gz" }));
+    }
+
+    #[test]
+    fn sha256_file_streams_the_complete_archive() {
+        let path = std::env::temp_dir().join(format!(
+            "torii-update-sha-{}-{}.part",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, b"torii update").unwrap();
+        let digest = sha256_file(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            digest,
+            "5a804ce64ac109fc1baf866dee92278c190f800c392ce4e7d20d27a48208ad54"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_attempt_resumes_an_existing_partial_archive() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("range: bytes=3-"))
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 3-5/6\r\nConnection: close\r\n\r\ndef",
+                )
+                .unwrap();
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "torii-update-resume-{}-{}.part",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, b"abc").unwrap();
+        let candidate = UpdateCandidate {
+            version: Version::new(9, 9, 9),
+            url: format!("http://{address}/torii.zip"),
+            asset_name: "torii.zip".into(),
+            size_bytes: 6,
+            sha256: String::new(),
+        };
+        download_attempt(&candidate, &path, &mut |_| {})
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abcdef");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

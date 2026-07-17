@@ -122,6 +122,18 @@ jobs:
           path: release
       - name: Stage immutable installers
         run: cp install.sh install.ps1 release/
+      - name: Prepare version release notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            /^## / {
+              if (found) exit
+              found = ($2 == version)
+            }
+            found
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: release/install.sh
@@ -137,5 +149,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" ./* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --notes-file ../CHANGELOG.md \
+            --notes-file ../release-notes.md \
             --title "$GITHUB_REF_NAME"
