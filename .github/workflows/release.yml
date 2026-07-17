@@ -22,25 +22,9 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             bun_target: bun-linux-x64-baseline
             archive: tar
-          - os: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            bun_target: bun-linux-arm64
-            archive: tar
-          - os: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            bun_target: bun-darwin-x64-baseline
-            archive: tar
-          - os: macos-14
-            rust_target: aarch64-apple-darwin
-            bun_target: bun-darwin-arm64
-            archive: tar
           - os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            bun_target: bun-windows-x64-baseline
-            archive: zip
-          - os: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            bun_target: bun-windows-arm64
+            bun_target: bun-windows-x64
             archive: zip
     runs-on: ${{ matrix.os }}
     steps:

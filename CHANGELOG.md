@@ -13,6 +13,7 @@
 
 ### Dashboard and updates
 
+- Release binaries target Linux x64 and Windows x64.
 - Dashboard sessions reuse the bounded picker pager, with keyboard paging and
   consistent scrollbar behavior.
 - Resumed session attention is derived from unresolved current work rather than
