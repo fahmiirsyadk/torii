@@ -23,5 +23,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ratatui = "0.30.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 unicode-width = "0.2"
+uuid = { version = "1.18", features = ["v4"] }
+fs2 = "0.4"
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

@@ -13,7 +13,7 @@ A terminal interface for coding-agent sessions powered by the Pi SDK. (WIP). The
 - Searchable model, command, session, file, settings, and history pickers.
 - Permission prompts for tool execution and project trust controls.
 - Editable multiline paste blocks with mouse-based cursor positioning.
-- Multiple image attachments from the clipboard, `/paste-image`, keyboard shortcuts, or the `@` file picker.
+- Clipboard text and multiple image attachments via `/paste`, keyboard shortcuts, or the `@` file picker.
 - Clickable image previews with aspect-ratio-preserving terminal rendering.
 - Non-blocking clipboard image decoding with processing, success, and error states.
 - Project file references, shell commands, prompt history, plans, MCP tools, and package management.
@@ -141,11 +141,9 @@ tasks return a task ID and do not bloat the parent transcript with the entire
 child conversation. Open the task dashboard with `Ctrl+B`, select a task with
 `Up`/`Down`, press `Enter` to inspect its transcript, or press `k` to cancel it.
 
-An isolated worktree is never merged automatically. After inspecting the result,
-ask the parent to apply it with `apply_subagent_worktree`, or discard it with
-`remove_subagent_worktree`. Subagents cannot spawn nested subagents. Use a
-workflow when the work needs several deterministic roles, checkpoints, retries,
-or model routes.
+An isolated worktree is never merged or removed automatically. Inspect and apply
+or discard it with ordinary Git commands. Subagents cannot spawn nested
+subagents. Use a workflow when work needs explicit dependencies or checkpoints.
 
 Choose the default subagent model with `/subagent-model`. The setting is separate
 from the parent model and persists across sessions.
@@ -160,7 +158,7 @@ Torii ships with three workflows:
 - `review` for parallel correctness, security, and test review followed by
   synthesis.
 
-First inspect the resolved agents, exact models, tools, policies, and readiness:
+First validate and inspect the dependency graph:
 
 ```text
 /workflow
@@ -183,84 +181,43 @@ Open `/workflows` to monitor runs. In the dashboard:
 - `v` or `Enter` opens the latest bounded artifact.
 - `Esc` returns to the transcript.
 
-Workflows are scheduled by Torii rather than by the parent model. Their resolved
-graph, model routes, contracts, budgets, attempts, checkpoints, and artifacts are
-journaled. Completed work is not repeated after `/resume`; interrupted
-write-capable steps fail closed and require an explicit retry. Persistent executor
-roles reopen their child session, while ephemeral reviewers receive clean contexts.
+Workflows are scheduled and persisted by Rust rather than by the parent model or
+TypeScript sidecar. Independent ready steps run concurrently, while every pair
+of write-capable steps must be ordered by a dependency path. Interrupted work
+fails closed and requires an explicit retry.
 
-### Use multiple models and MCP connectors safely
+### Add a project workflow
 
-Copy the multi-provider example into the global workflow directory, or into a
-trusted project's workflow directory:
+Copy the dependency-graph example into a trusted project's workflow directory:
 
 ```bash
 mkdir -p .pi/workflows
-cp examples/workflows/production-multimodel-github.yaml .pi/workflows/
+cp examples/workflows/focused-review.yaml .pi/workflows/
 ```
 
-Edit its placeholder `provider/model` routes, then run:
-
-```text
-/workflow check production-multimodel-github
-```
-
-The example uses a fresh bounded GitHub connector context, an exact planner and
-executor, parallel reviewers on different models, and a persistent executor for
-repairs. Connector evidence is validated into bounded structured artifacts before
-downstream roles receive it. MCP tools are discovered with `tool_search` and only
-added to the active set; they are not removed during the session, preserving Pi's
-cache-friendly prompt prefix. The loaded set is restored before the next prompt
-after `/resume`.
-
-Project workflow definitions are ignored until the project is trusted. External
-MCP mutations additionally require an earlier named checkpoint, an exact tool
-allowlist, ephemeral execution, and a typed effect receipt.
-
-For a workflow with typed parameters:
-
-```text
-/workflow review --params {"target":"src","mode":"deep"} -- Review this change
-```
+Project definitions are ignored until the project is trusted. Parallelism comes
+from dependency readiness; there is no nested parallel syntax or policy DSL.
 
 See [Workflow architecture](docs/workflows.md) and the
-[`examples/workflows`](examples/workflows) directory for the full schema,
-composition, contracts, budgets, provider policies, and guarded GitHub mutation
-example.
+[`examples/workflows`](examples/workflows) directory for the complete schema.
 
 ## Workflows
 
 Torii includes `production-change`, `implement-review`, and `review` workflows.
-The production workflow isolates optional MCP evidence, requires plan approval,
-and applies context/cache guardrails through implementation and review. Custom YAML or JSON
-definitions can be placed in `~/.pi/agent/workflows` (using Pi's resolved agent
-directory) or, for trusted projects, `.pi/workflows`. Project definitions
-shadow global definitions only after the project is trusted.
+The production workflow requires plan approval before implementation. Custom
+YAML or JSON definitions can be placed in a trusted project's `.pi/workflows`
+directory.
 
 The agent controls workflows with `workflow_start`, `workflow_status`,
-`workflow_control`, and `artifact_read`. MCP connectors are discovered through
-`tool_search` and enabled only when needed. See [Workflow architecture](docs/workflows.md)
-for the schema, model routing, trust boundaries, and `/resume` behavior.
+`workflow_control`, and `artifact_read`. See
+[Workflow architecture](docs/workflows.md) for the schema, trust boundary,
+persistence, and restart behavior.
 
-Open `/workflow` to search the trusted workflow catalog and inspect its resolved
-models, permissions, tools and policies before launch, or start one directly with
-`/workflow <name> <task>`. Use `/workflow check <name>` for live model, agent,
-tool, MCP, and context-fan-in readiness without launching. Open
-`/workflows` for the native execution dashboard, checkpoint controls, retry and
-cancel actions, artifact inspection, context budgets, tool-schema/cache-prefix
-fingerprints, declarative guardrail violations, and enforceable provider
-prompt/output/cache budgets. Optional workflow-wide budgets reserve headroom
-across parallel calls and retain cumulative consumption across `/resume`.
-Provider concurrency, journal-backed rate limits, and circuit breakers prevent
-retry storms without changing a run's frozen model route.
-Bounded custom JSON contracts create validated handoff artifacts, while static
-workflow composition namespaces and freezes reusable fragments before launch.
-Closed typed launch parameters use the `/workflow <name> --params ... -- <task>`
-form and are validated, canonicalized, and frozen across `/resume` without
-being interpolated into workflow prompts. Composed fragments can be pinned to
-an exact declared version and receive only statically bound parameter views, so
-incompatible changes or broader-than-declared context fail during preflight.
+Open `/workflow` to search the trusted workflow catalog and inspect its dependency
+graph before launch, or start one directly with `/workflow <name> <task>`. Use
+`/workflow check <name>` to validate the graph without launching. Open
+`/workflows` for checkpoint controls, explicit retry and cancellation, and
+bounded artifact inspection.
 
-External MCP mutations require an earlier named checkpoint, an exact fail-closed
-tool allowlist, ephemeral execution, and a typed `effect_receipt`. Interrupted
-writers never replay automatically after `/resume`; retry is an explicit operator action.
+Interrupted writers never replay automatically after `/resume`; retry is an
+explicit operator action.

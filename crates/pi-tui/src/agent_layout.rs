@@ -38,9 +38,9 @@ impl AgentLayout {
             content_width,
             if compact { 4 } else { 8 },
         );
-        let turn_height = u16::from(
-            state.turn_started_at.is_some() || state.image_processing_started_at.is_some(),
-        );
+        // Keep this row reserved so the composer does not jump when the first
+        // streaming delta starts (or when TurnComplete clears the banner).
+        let turn_height = 1;
         let compaction_height = u16::from(state.active_compaction_started_at().is_some());
         let queued = state.queued_steering.len() + state.queued_follow_up.len();
         let queue_height = if state.queue_visible && queued > 0 {
@@ -65,7 +65,7 @@ impl AgentLayout {
                 Constraint::Length(compaction_height),
                 Constraint::Length(permission_height),
                 Constraint::Length(prompt_height),
-                Constraint::Length(if compact { 1 } else { 2 }),
+                Constraint::Length(1),
             ])
             .split(outer);
         Self {
@@ -104,5 +104,18 @@ mod tests {
         assert!(layout.compact);
         assert_eq!(layout.outer, Rect::new(0, 0, 80, 20));
         assert_eq!(layout.shortcuts.height, 1);
+    }
+
+    #[test]
+    fn streaming_does_not_move_the_prompt() {
+        let idle = AppState::default();
+        let mut streaming = idle.clone();
+        streaming.streaming = true;
+        streaming.turn_started_at = Some(std::time::Instant::now());
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(
+            AgentLayout::compute(area, &idle).prompt,
+            AgentLayout::compute(area, &streaming).prompt
+        );
     }
 }

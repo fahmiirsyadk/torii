@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { childThinkingLevel, grokToolsExtension, loadedHistory, readToriiSettings, resolveSubagentRole, writeToriiSubagentModel } from "./pi-adapter.ts";
-import { NativeSubagentCoordinator } from "./subagents.ts";
-import type { WorkflowCoordinator } from "./workflows/coordinator.ts";
+import { grokToolsExtension, loadedHistory, readToriiSettings, writeToriiSubagentModel } from "./pi-adapter.ts";
 
 test("loaded history preserves Pi compaction-aware entry order", () => {
   const contextEntries = [
@@ -80,38 +78,6 @@ test("loaded history marks an unmatched tool call as interrupted", () => {
   });
 });
 
-test("subagent role resolution layers project role over persona defaults", () => {
-  const root = mkdtempSync(join(tmpdir(), "torii-role-"));
-  const agentDir = join(root, "agent-home");
-  mkdirSync(join(root, ".pi", "agents"), { recursive: true });
-  mkdirSync(join(root, ".pi", "personas"), { recursive: true });
-  writeFileSync(join(root, ".pi", "personas", "concise.toml"), 'instructions = "Return concise evidence."\nmodel = "persona/model"\nreasoning_effort = "low"\n');
-  writeFileSync(join(root, ".pi", "agents", "reviewer.md"), '---\npersona: concise\nmodel: role/model\ntools: read, grep\n---\nReview correctness.\n');
-  try {
-    const role = resolveSubagentRole(root, agentDir, "reviewer");
-    assert.match(role.instructions, /Review correctness/);
-    assert.match(role.instructions, /Return concise evidence/);
-    assert.deepEqual(role.model, { provider: "role", id: "model" });
-    assert.equal(role.thinkingLevel, "low");
-    assert.deepEqual(role.tools, ["read", "grep"]);
-    const untrusted = resolveSubagentRole(root, agentDir, "reviewer", false);
-    assert.doesNotMatch(untrusted.instructions, /Review correctness|Return concise evidence/);
-    assert.equal(untrusted.model, undefined);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("new subagents choose the lowest practical thinking effort", () => {
-  const model = (reasoning: boolean, thinkingLevelMap?: Record<string, string | null>) =>
-    ({ reasoning, thinkingLevelMap }) as Parameters<typeof childThinkingLevel>[0];
-
-  assert.equal(childThinkingLevel(model(false)), "off");
-  assert.equal(childThinkingLevel(model(true)), "low");
-  assert.equal(childThinkingLevel(model(true, { low: null, off: "none" })), "off");
-  assert.equal(childThinkingLevel(model(true, { low: null, off: null })), "minimal");
-});
-
 test("Torii subagent model override persists independently of Pi settings", () => {
   const agentDir = mkdtempSync(join(tmpdir(), "torii-settings-"));
   try {
@@ -124,10 +90,10 @@ test("Torii subagent model override persists independently of Pi settings", () =
   }
 });
 
-test("parent Grok tool extension exposes native task and worktree controls", () => {
+test("parent Grok tool extension exposes Rust-owned task controls", () => {
   const names: string[] = [];
-  const coordinator = new NativeSubagentCoordinator(async () => { throw new Error("not launched"); });
-  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, coordinator, {} as WorkflowCoordinator, 0);
+  const requestHost = async () => ({ content: "ok" });
+  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, requestHost, 0);
   extension.factory({ registerTool: (tool: { name: string }) => { names.push(tool.name); } } as unknown as ExtensionAPI);
   for (const name of [
     "tool_search",
@@ -140,14 +106,12 @@ test("parent Grok tool extension exposes native task and worktree controls", () 
     "get_command_or_subagent_output",
     "wait_commands_or_subagents",
     "kill_command_or_subagent",
-    "apply_subagent_worktree",
-    "remove_subagent_worktree",
   ]) assert.ok(names.includes(name), `${name} was not registered`);
 });
 
 test("workflow connector children retain tool_search without delegation tools", () => {
   const names: string[] = [];
-  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, undefined, 1);
+  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, 1);
   extension.factory({ registerTool: (tool: { name: string }) => { names.push(tool.name); } } as unknown as ExtensionAPI);
   assert.ok(names.includes("tool_search"));
   assert.ok(!names.includes("spawn_subagent"));
@@ -157,7 +121,7 @@ test("workflow connector children retain tool_search without delegation tools", 
 test("read-only connector discovery enables only MCP tools with readOnlyHint metadata", async () => {
   const registered: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
   let active = ["read"];
-  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, undefined, 1, "read-only");
+  const extension = grokToolsExtension("child", process.cwd(), process.cwd(), "/sessions/child.jsonl", () => {}, undefined, 1, "read-only");
   extension.factory({
     registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => { registered.push(tool); },
     getAllTools: () => [
@@ -178,7 +142,7 @@ test("tool search only grows the active MCP tool set", async () => {
   const registered: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
   let active = ["read", "mcp__github__issues"];
   const entries: unknown[] = [];
-  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, undefined, undefined, 0);
+  const extension = grokToolsExtension("parent", process.cwd(), process.cwd(), "/sessions/parent.jsonl", () => {}, undefined, 0);
   extension.factory({
     registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => { registered.push(tool); },
     getAllTools: () => [

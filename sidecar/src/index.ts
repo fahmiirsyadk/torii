@@ -20,9 +20,6 @@ import { dispatchCommand } from "./command-dispatch.ts";
 import type { AgentEvent, SidecarCommand } from "./protocol.ts";
 import { writeMessage } from "./protocol.ts";
 import * as pi from "./pi-adapter.ts";
-import { NativeSubagentCoordinator, type TaskSnapshot } from "./subagents.ts";
-import { WorkflowCoordinator, workflowBelongsToSession } from "./workflows/coordinator.ts";
-import { WorkflowRunStore } from "./workflows/store.ts";
 
 // -----------------------------------------------------------------------------
 // Per-session state at the protocol layer.
@@ -32,59 +29,18 @@ const sessions = new Map<string, pi.ActiveSession>();
 const oauthReplies = new Map<string, (value: string | undefined) => void>();
 let nextOauthId = 1;
 const permissionReplies = new Map<string, (decision: "allow_once" | "allow_always" | "deny") => void>();
+const hostReplies = new Map<string, {
+  sessionId: string;
+  resolve: (result: { content: string; details?: unknown }) => void;
+  reject: (error: Error) => void;
+}>();
 const alwaysAllowedTools = new Set<string>();
 const permissionModes = new Map<string, "normal" | "plan" | "always_approve">();
 const mcpClients = new Map<string, McpClient>();
 let nextPermissionId = 1;
+let nextHostCallId = 1;
 
-const subagents = new NativeSubagentCoordinator(async (context) => {
-  const parent = sessions.get(context.parentSessionId);
-  if (parent === undefined) throw new Error(`subagent parent session is not resident: ${context.parentSessionId}`);
-  return pi.launchNativeSubagent(context, openHooks, subagents, parent);
-});
-const workflows = new WorkflowCoordinator(new WorkflowRunStore(pi.workflowRunRoot()), subagents);
-const persistedTaskStates = new Map<string, string>();
-const persistedWorkflowStates = new Map<string, string>();
 
-subagents.subscribe((record) => {
-  const parent = sessions.get(record.parentSessionId);
-  const snapshot = subagents.snapshot(record);
-  writeMessage({ type: "event", session_id: record.parentSessionId, event: { type: "subagent_update", task: snapshot } });
-  if (parent === undefined) return;
-  const persistenceKey = `${record.status}:${record.activity}:${record.childSessionPath ?? ""}:${record.worktreePath ?? ""}:${record.completedAt ?? ""}`;
-  if (persistedTaskStates.get(record.taskId) !== persistenceKey) {
-    parent.session.sessionManager.appendCustomEntry("torii.subagent", snapshot);
-    persistedTaskStates.set(record.taskId, persistenceKey);
-  }
-  if (record.completedAt === undefined || record.workflowRunId !== undefined || persistedTaskStates.has(`${record.taskId}:notified`)) return;
-  persistedTaskStates.set(`${record.taskId}:notified`, "true");
-  const content = `[Subagent ${record.status}: ${record.description} (${record.taskId})]\nResult retained outside the parent context. Use get_command_or_subagent_output with task_id=${record.taskId} to inspect it.`;
-  const compact = { ...snapshot, output: undefined, error: snapshot.error?.slice(0, 1000) };
-  void parent.session.sendCustomMessage(
-    { customType: "torii.subagent-result", content, display: true, details: compact },
-    parent.session.isStreaming ? { triggerTurn: false, deliverAs: "nextTurn" } : { triggerTurn: false },
-  );
-});
-
-workflows.subscribe((state) => {
-  const parent = sessions.get(state.rootSessionId);
-  if (parent === undefined) return;
-  writeMessage({ type: "event", session_id: state.rootSessionId, event: { type: "workflow_update", workflow: workflows.snapshot(state) } });
-  const summary = workflows.summary(state);
-  const notable = new Set(["paused", "completed", "failed", "cancelled"]).has(state.status);
-  const persistenceKey = `${summary.status}:${summary.current_step ?? ""}:${summary.completed_steps}`;
-  if (notable && persistedWorkflowStates.get(state.runId) !== persistenceKey) {
-    parent.session.sessionManager.appendCustomEntry("torii.workflow", summary);
-    persistedWorkflowStates.set(state.runId, persistenceKey);
-  }
-  if (!notable || persistedWorkflowStates.has(`${state.runId}:notified:${state.status}`)) return;
-  persistedWorkflowStates.set(`${state.runId}:notified:${state.status}`, "true");
-  const content = `[Workflow ${state.status}: ${state.plan.name} (${state.runId})]\n${summary.completed_steps}/${summary.total_steps} steps completed. Use workflow_status for details and artifact references.`;
-  void parent.session.sendCustomMessage(
-    { customType: "torii.workflow-result", content, display: true, details: summary },
-    parent.session.isStreaming ? { triggerTurn: false, deliverAs: "nextTurn" } : { triggerTurn: false },
-  );
-});
 
 function emitFor(wireSessionId: string): (event: AgentEvent) => void {
   return (event) => writeMessage({ type: "event", session_id: wireSessionId, event });
@@ -107,76 +63,12 @@ const openHooks: pi.OpenSessionHooks = {
   registerPermissionReply: (id, reply) => permissionReplies.set(id, reply),
   unregisterPermissionReply: (id) => permissionReplies.delete(id),
   mcpClients,
-  subagents,
-  workflows,
+  requestHost: (wireSessionId, name, args) => {
+    const id = `host-${nextHostCallId++}`;
+    writeMessage({ type: "event", session_id: wireSessionId, event: { type: "host_call", id, name, args } });
+    return new Promise((resolve, reject) => hostReplies.set(id, { sessionId: wireSessionId, resolve, reject }));
+  },
 };
-
-function restoreSubagents(active: pi.ActiveSession): AgentEvent[] {
-  const latest = new Map<string, TaskSnapshot>();
-  for (const entry of active.session.sessionManager.getEntries()) {
-    if (entry.type !== "custom" || entry.customType !== "torii.subagent") continue;
-    const data = entry.data as Partial<TaskSnapshot> | undefined;
-    if (data?.task_id === undefined || data.parent_session_id === undefined || data.status === undefined) continue;
-    latest.set(data.task_id, data as TaskSnapshot);
-  }
-  const events: AgentEvent[] = [];
-  for (const task of latest.values()) {
-    subagents.restore({
-      taskId: task.task_id,
-      parentSessionId: active.wireSessionId,
-      parentSessionPath: active.session.sessionFile,
-      childSessionId: task.child_session_id,
-      childSessionPath: task.child_session_path,
-      prompt: "",
-      description: task.description,
-      subagentType: task.subagent_type,
-      capabilityMode: task.capability_mode,
-      isolation: task.isolation,
-      background: task.background,
-      status: task.status,
-      activity: task.activity,
-      startedAt: task.started_at_ms,
-      completedAt: task.completed_at_ms,
-      output: task.output,
-      error: task.error,
-      failureKind: task.failure_kind,
-      model: task.model,
-      thinkingLevel: task.thinking_level,
-      worktreePath: task.worktree_path,
-      cwd: task.cwd,
-      workflowRunId: task.workflow_run_id,
-    });
-    const restored = subagents.get(task.task_id);
-    if (restored !== undefined) {
-      if (restored.completedAt !== undefined) persistedTaskStates.set(`${restored.taskId}:notified`, "true");
-      events.push({ type: "subagent_update", task: subagents.snapshot(restored) });
-      if (restored.childSessionPath !== undefined) {
-        for (const event of pi.loadPersistedSubagentTranscript(restored.childSessionPath)) {
-          events.push({ type: "subagent_transcript", task_id: restored.taskId, event });
-        }
-      }
-    }
-  }
-  return events;
-}
-
-function restoreWorkflows(active: pi.ActiveSession): AgentEvent[] {
-  return workflows.list()
-    .filter((run) => workflowBelongsToSession(run, active.wireSessionId, active.session.sessionFile))
-    .map((run) => workflows.attachSession(run.runId, active.wireSessionId, active.session.sessionFile))
-    .map((run) => ({ type: "workflow_update" as const, workflow: workflows.snapshot(run) }));
-}
-
-function resumeResidentWorkflows(active: pi.ActiveSession): void {
-  for (const run of workflows.list()) {
-    if (
-      run.rootSessionPath === active.session.sessionFile
-      && (run.status === "pending" || run.status === "running" || run.status === "interrupted")
-    ) {
-      void workflows.resume(run.runId).catch(() => undefined);
-    }
-  }
-}
 
 // -----------------------------------------------------------------------------
 // Command dispatch
@@ -195,6 +87,7 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
     const models = discovered.map((model) => ({
       id: `${model.provider}/${model.id}`,
       display_name: model.name,
+      context_window: model.contextWindow,
     }));
     writeMessage({ type: "response", request_id: command.request_id, models });
     return;
@@ -203,11 +96,12 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   if (command.type === "open_session") {
     const { active, history } = await pi.openSession(command, openHooks);
     sessions.set(active.wireSessionId, active);
-    history.push(...restoreSubagents(active));
-    restoreWorkflows(active);
-    resumeResidentWorkflows(active);
-    history.push(...restoreWorkflows(active));
-    writeMessage({ type: "response", request_id: command.request_id, session_id: active.wireSessionId, history });
+    writeMessage({
+      type: "response",
+      request_id: command.request_id,
+      session_id: active.wireSessionId,
+      history,
+    });
     return;
   }
 
@@ -216,77 +110,12 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   const sessionId = command.session_id;
   const emit = emitFor(sessionId);
 
-  if (command.type === "kill_task") {
-    const task = subagents.get(command.task_id);
-    if (task === undefined || task.parentSessionId !== sessionId || task.parentSessionPath !== active.session.sessionFile) throw new Error(`unknown task for session: ${command.task_id}`);
-    await subagents.kill(command.task_id);
-    writeMessage({ type: "response", request_id: command.request_id });
-    return;
-  }
-
-  if (command.type === "workflow_control") {
-    const run = workflows.get(command.run_id);
-    if (run.rootSessionId !== sessionId || run.rootSessionPath !== active.session.sessionFile) throw new Error(`unknown workflow for session: ${command.run_id}`);
-    await workflows.control(command.run_id, command.action, command.step_id);
-    writeMessage({ type: "response", request_id: command.request_id });
-    return;
-  }
-
-  if (command.type === "workflow_start") {
-    const plan = await pi.resolveNamedWorkflow(active, command.workflow);
-    pi.assertWorkflowReady(await pi.workflowReadinessForActive(active, plan));
-    if (command.expected_definition_hash !== undefined && plan.definitionHash !== command.expected_definition_hash) {
-      throw new Error(`workflow ${command.workflow} changed after preflight; inspect it again before starting`);
-    }
-    const started = workflows.start({
-      rootSessionId: sessionId,
-      rootSessionPath: active.session.sessionFile,
-      cwd: active.cwd,
-      input: command.input,
-      parameters: command.parameters,
-      background: true,
-      plan,
-    });
-    void started.completion.catch(() => undefined);
-    writeMessage({ type: "response", request_id: command.request_id });
-    return;
-  }
-
-  if (command.type === "workflow_catalog") {
-    writeMessage({ type: "event", session_id: sessionId, event: { type: "workflow_catalog", workflows: pi.workflowCatalog(active) } });
-    writeMessage({ type: "response", request_id: command.request_id });
-    return;
-  }
-
-  if (command.type === "workflow_preview") {
-    writeMessage({ type: "event", session_id: sessionId, event: { type: "workflow_preview", preview: await pi.workflowPreview(active, command.workflow) } });
-    writeMessage({ type: "response", request_id: command.request_id });
-    return;
-  }
-
-  if (command.type === "workflow_artifact_read") {
-    const run = workflows.get(command.run_id);
-    if (run.rootSessionId !== sessionId || run.rootSessionPath !== active.session.sessionFile) throw new Error(`unknown workflow for session: ${command.run_id}`);
-    const artifact = workflows.readArtifact(command.run_id, command.artifact_id);
-    const raw = typeof artifact.data === "string" ? artifact.data : JSON.stringify(artifact.data, null, 2);
-    const content = Buffer.from(raw, "utf8").subarray(0, 100_000).toString("utf8").replace(/\uFFFD$/, "");
-    writeMessage({
-      type: "event",
-      session_id: sessionId,
-      event: {
-        type: "workflow_artifact",
-        artifact: {
-          run_id: command.run_id,
-          artifact_id: artifact.id,
-          step_id: artifact.stepId,
-          summary: artifact.summary,
-          producer_role: artifact.producer.role,
-          producer_model: artifact.producer.model,
-          content,
-          truncated: Buffer.byteLength(raw, "utf8") > 100_000,
-        },
-      },
-    });
+  if (command.type === "host_result") {
+    const pending = hostReplies.get(command.call_id);
+    if (pending === undefined || pending.sessionId !== sessionId) throw new Error(`unknown host call: ${command.call_id}`);
+    hostReplies.delete(command.call_id);
+    if (command.is_error) pending.reject(new Error(command.result.content));
+    else pending.resolve(command.result);
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }
@@ -443,25 +272,26 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "resume_session") {
     await pi.switchSession(active, command.target);
-    const subagentHistory = restoreSubagents(active);
-    restoreWorkflows(active);
-    resumeResidentWorkflows(active);
-    const workflowHistory = restoreWorkflows(active);
     writeMessage({
       type: "response",
       request_id: command.request_id,
-      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory, ...workflowHistory],
+      history: [
+        { type: "session_reset" },
+        ...pi.loadedHistory(active.session, active.session.sessionManager),
+      ],
     });
     return;
   }
 
   if (command.type === "new_session" || command.type === "clone_session") {
     await pi.newOrCloneSession(active, command.type === "clone_session" ? "clone" : "new");
-    const subagentHistory = restoreSubagents(active);
     writeMessage({
       type: "response",
       request_id: command.request_id,
-      history: [{ type: "session_reset" }, ...pi.loadedHistory(active.session, active.session.sessionManager), ...subagentHistory],
+      history: [
+        { type: "session_reset" },
+        ...pi.loadedHistory(active.session, active.session.sessionManager),
+      ],
     });
     return;
   }
@@ -519,12 +349,14 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   }
 
   if (command.type === "close_session") {
-    for (const task of subagents.listForParent(sessionId)) {
-      if (task.status === "running") await subagents.kill(task.taskId);
-    }
-    await active.runtime.dispose();
+    await pi.disposeSession(active, mcpClients);
     sessions.delete(sessionId);
     permissionModes.delete(sessionId);
+    for (const [id, pending] of hostReplies) {
+      if (pending.sessionId !== sessionId) continue;
+      hostReplies.delete(id);
+      pending.reject(new Error("session closed"));
+    }
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }
@@ -601,9 +433,9 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   writeMessage({ type: "response", request_id: command.request_id });
   pi.sendPrompt(active, command.text, command.delivery, command.images).catch((error: unknown) => {
     writeMessage({
-      type: "error",
-      request_id: command.request_id,
-      message: error instanceof Error ? error.message : String(error),
+      type: "event",
+      session_id: sessionId,
+      event: { type: "error", kind: "provider", message: error instanceof Error ? error.message : String(error) },
     });
   });
 }

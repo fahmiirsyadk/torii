@@ -8,9 +8,16 @@ use std::{
 use anyhow::{Result, anyhow};
 use pi_harness::{
     AgentEvent, AgentHarness, RuntimeSessionInfo, SessionConfig, SessionId, SessionPersistence,
+    ToolResult,
 };
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::{RwLock, broadcast};
+
+use crate::{
+    task::{TaskCoordinator, TaskNotice},
+    workflow::{WorkflowCoordinator, WorkflowNotice},
+};
 
 const MAX_REPLAY_EVENTS: usize = 20_000;
 // Resuming a resident replays its whole buffered transcript through the event
@@ -167,16 +174,125 @@ pub struct SessionSupervisor {
     residents: Arc<RwLock<HashMap<String, Resident>>>,
     active_path: Arc<RwLock<Option<String>>>,
     events: broadcast::Sender<TaggedEvent>,
+    tasks: TaskCoordinator,
+    workflows: WorkflowCoordinator,
+    cwd: String,
+    project_trusted: Arc<RwLock<bool>>,
 }
 
 impl SessionSupervisor {
     pub fn new(harness: Arc<dyn AgentHarness>) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let residents = Arc::new(RwLock::new(HashMap::<String, Resident>::new()));
+        let tasks = TaskCoordinator::new(Arc::clone(&harness));
+        let workflows = WorkflowCoordinator::new(tasks.clone());
+        let mut task_updates = tasks.subscribe();
+        let task_residents = Arc::clone(&residents);
+        let task_events = events.clone();
+        tokio::spawn(async move {
+            loop {
+                let notice = match task_updates.recv().await {
+                    Ok(notice) => notice,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let (owner, owner_path, event) = match notice {
+                    TaskNotice::Update(snapshot) => (
+                        snapshot.owner.clone(),
+                        snapshot.owner_path.clone(),
+                        AgentEvent::SubagentUpdate {
+                            task: Box::new(snapshot.as_agent_task()),
+                        },
+                    ),
+                    TaskNotice::Event {
+                        owner,
+                        owner_path,
+                        event,
+                    } => (owner, owner_path, event),
+                };
+                let sessions = {
+                    let mut residents = task_residents.write().await;
+                    if let Some(resident) = residents.get_mut(&owner_path) {
+                        resident.history.push(event.clone());
+                        resident.observe(&event);
+                    }
+                    runtime_infos(&residents)
+                };
+                let _ = task_events.send(TaggedEvent {
+                    session_id: owner.clone(),
+                    event,
+                });
+                let _ = task_events.send(TaggedEvent {
+                    session_id: owner,
+                    event: AgentEvent::RuntimeSessions { sessions },
+                });
+            }
+        });
+        let mut workflow_updates = workflows.subscribe();
+        let workflow_residents = Arc::clone(&residents);
+        let workflow_events = events.clone();
+        tokio::spawn(async move {
+            loop {
+                let notice = match workflow_updates.recv().await {
+                    Ok(notice) => notice,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let (owner, owner_path, event) = match notice {
+                    WorkflowNotice::Update {
+                        owner,
+                        owner_path,
+                        snapshot,
+                    } => (
+                        owner,
+                        owner_path,
+                        AgentEvent::WorkflowUpdate {
+                            workflow: Box::new(snapshot),
+                        },
+                    ),
+                    WorkflowNotice::Artifact {
+                        owner,
+                        owner_path,
+                        artifact,
+                    } => (
+                        owner,
+                        owner_path,
+                        AgentEvent::WorkflowArtifact {
+                            artifact: Box::new(artifact),
+                        },
+                    ),
+                };
+                let sessions = {
+                    let mut residents = workflow_residents.write().await;
+                    if let Some(resident) = residents.get_mut(&owner_path) {
+                        resident.history.push(event.clone());
+                        resident.observe(&event);
+                    }
+                    runtime_infos(&residents)
+                };
+                let _ = workflow_events.send(TaggedEvent {
+                    session_id: owner.clone(),
+                    event,
+                });
+                let _ = workflow_events.send(TaggedEvent {
+                    session_id: owner,
+                    event: AgentEvent::RuntimeSessions { sessions },
+                });
+            }
+        });
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         Self {
             harness,
-            residents: Arc::new(RwLock::new(HashMap::new())),
+            residents,
             active_path: Arc::new(RwLock::new(None)),
             events,
+            tasks,
+            workflows,
+            cwd,
+            project_trusted: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -203,6 +319,11 @@ impl SessionSupervisor {
             },
         );
         *self.active_path.write().await = Some(path.clone());
+        let _ = self.tasks.restore_owner(id.clone(), &path).await;
+        let _ = self
+            .workflows
+            .restore_owner(id.clone(), path.clone(), &self.cwd)
+            .await;
         self.forward(path, id, receiver);
         self.emit_snapshots().await;
     }
@@ -376,6 +497,73 @@ impl SessionSupervisor {
         self.emit_snapshots().await;
     }
 
+    pub async fn kill_task(&self, owner: &SessionId, task_id: &str) -> Result<()> {
+        self.tasks.cancel(owner, task_id).await?;
+        Ok(())
+    }
+
+    pub async fn workflow_command(
+        &self,
+        owner: &SessionId,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolResult> {
+        let owner_path = self
+            .residents
+            .read()
+            .await
+            .iter()
+            .find(|(_, resident)| &resident.id == owner)
+            .map(|(path, _)| path.clone())
+            .ok_or_else(|| anyhow!("session is not resident: {}", owner.0))?;
+        let result = self
+            .workflows
+            .handle_call(
+                owner.clone(),
+                owner_path,
+                self.cwd.clone(),
+                *self.project_trusted.read().await,
+                name,
+                args,
+            )
+            .await?;
+        let event = match name {
+            "workflow_catalog" => result.details.clone().and_then(|value| {
+                serde_json::from_value(value)
+                    .ok()
+                    .map(|workflows| AgentEvent::WorkflowCatalog { workflows })
+            }),
+            "workflow_preview" | "workflow_check" => result.details.clone().and_then(|value| {
+                serde_json::from_value(value)
+                    .ok()
+                    .map(|preview| AgentEvent::WorkflowPreview {
+                        preview: Box::new(preview),
+                    })
+            }),
+            "workflow_artifact_read" | "artifact_read" => {
+                result.details.clone().and_then(|value| {
+                    serde_json::from_value(value).ok().map(|artifact| {
+                        AgentEvent::WorkflowArtifact {
+                            artifact: Box::new(artifact),
+                        }
+                    })
+                })
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = self.events.send(TaggedEvent {
+                session_id: owner.clone(),
+                event,
+            });
+        }
+        Ok(result)
+    }
+
+    pub async fn set_project_trusted(&self, trusted: bool) {
+        *self.project_trusted.write().await = trusted;
+    }
+
     pub async fn snapshots(&self) -> Vec<ResidentSnapshot> {
         self.residents
             .read()
@@ -398,6 +586,8 @@ impl SessionSupervisor {
             .get(path)
             .map(|resident| resident.id.clone())
             .ok_or_else(|| anyhow!("session is not resident: {path}"))?;
+        self.tasks.cancel_owner(&id).await;
+        self.workflows.cancel_owner(&id).await;
         self.harness.cancel(&id).await?;
         if let Some(resident) = self.residents.write().await.get_mut(path) {
             resident.status = RuntimeStatus::Idle;
@@ -418,6 +608,8 @@ impl SessionSupervisor {
             .get(path)
             .map(|resident| resident.id.clone())
             .ok_or_else(|| anyhow!("session is not resident: {path}"))?;
+        self.tasks.cancel_owner(&id).await;
+        self.workflows.cancel_owner(&id).await;
         self.harness.close_session(&id).await?;
         self.residents.write().await.remove(path);
         if self.active_path.read().await.as_deref() == Some(path) {
@@ -448,6 +640,10 @@ impl SessionSupervisor {
         let residents = Arc::clone(&self.residents);
         let output = self.events.clone();
         let harness = Arc::clone(&self.harness);
+        let tasks = self.tasks.clone();
+        let workflows = self.workflows.clone();
+        let cwd = self.cwd.clone();
+        let project_trusted = Arc::clone(&self.project_trusted);
         tokio::spawn(async move {
             // Phase 1 — replay. Everything already queued on the receiver is the
             // resumed transcript (the harness sends it synchronously before the
@@ -487,6 +683,58 @@ impl SessionSupervisor {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 };
+                if let AgentEvent::HostCall {
+                    id: call_id,
+                    name,
+                    args,
+                } = &event
+                {
+                    if replaying {
+                        continue;
+                    }
+                    let call_id = call_id.clone();
+                    let name = name.clone();
+                    let args = args.clone();
+                    let harness = Arc::clone(&harness);
+                    let tasks = tasks.clone();
+                    let workflows = workflows.clone();
+                    let owner = id.clone();
+                    let owner_path = path.clone();
+                    let cwd = cwd.clone();
+                    let project_trusted = Arc::clone(&project_trusted);
+                    tokio::spawn(async move {
+                        let outcome = if name.starts_with("workflow_") || name == "artifact_read" {
+                            workflows
+                                .handle_call(
+                                    owner.clone(),
+                                    owner_path,
+                                    cwd,
+                                    *project_trusted.read().await,
+                                    &name,
+                                    args,
+                                )
+                                .await
+                        } else {
+                            tasks
+                                .handle_call(owner.clone(), owner_path, &name, args)
+                                .await
+                        };
+                        let (result, is_error) = match outcome {
+                            Ok(result) => (result, false),
+                            Err(error) => (
+                                pi_harness::ToolResult {
+                                    content: error.to_string(),
+                                    details: None,
+                                },
+                                true,
+                            ),
+                        };
+                        let _ = harness
+                            .reply_host_call(&owner, call_id, result, is_error)
+                            .await;
+                    });
+                    continue;
+                }
                 if let Some(url) = browser_oauth_url(&event) {
                     let url = url.to_string();
                     tokio::spawn(async move {

@@ -26,6 +26,7 @@ use tokio::{
 };
 
 const PROTOCOL_VERSION: u32 = 1;
+const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INFERENCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -114,6 +115,12 @@ impl PiHarness {
 
     pub async fn spawn(sidecar: impl AsRef<Path>) -> Result<Self> {
         let sidecar = sidecar.as_ref();
+        if !sidecar.is_file() {
+            return Err(anyhow!(
+                "Pi sidecar entry point not found at {}; run npm install in sidecar/ or set PI_SHELL_SIDECAR",
+                sidecar.display()
+            ));
+        }
         let mut child = Command::new("node")
             .arg("--experimental-strip-types")
             .arg(sidecar)
@@ -130,9 +137,15 @@ impl PiHarness {
             .context("Pi sidecar stdout unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
 
-        let ready = timeout(Duration::from_secs(10), lines.next_line())
+        let ready = timeout(SIDECAR_STARTUP_TIMEOUT, lines.next_line())
             .await
-            .context("timed out waiting for Pi sidecar")??
+            .with_context(|| {
+                format!(
+                    "timed out after {}s waiting for Pi sidecar at {}; verify Node.js >=22.19 and run npm install in sidecar/",
+                    SIDECAR_STARTUP_TIMEOUT.as_secs(),
+                    sidecar.display()
+                )
+            })??
             .context("Pi sidecar exited before ready")?;
         match serde_json::from_str::<WireMessage>(&ready).context("invalid Pi sidecar greeting")? {
             WireMessage::Ready { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
@@ -223,17 +236,6 @@ impl PiHarness {
             .await
     }
 
-    fn emit_internal_error(&self, id: &SessionId, message: String) {
-        if let Ok(sessions) = self.inner.sessions.read()
-            && let Some(sender) = sessions.get(id)
-        {
-            let _ = sender.send(AgentEvent::Error {
-                kind: pi_harness::AgentErrorKind::Internal,
-                message,
-            });
-        }
-    }
-
     async fn request_with_timeout(
         &self,
         mut command: Value,
@@ -287,7 +289,11 @@ impl AgentHarness for PiHarness {
                 json!({
                     "type": "open_session",
                     "cwd": cwd,
+                    "model": config.model,
                     "persistence": config.persistence,
+                    "parent_session_path": config.parent_session_path,
+                    "thinking_level": config.thinking_level,
+                    "tools": config.tools,
                 }),
                 None,
             )
@@ -404,86 +410,21 @@ impl AgentHarness for PiHarness {
         Ok(())
     }
 
-    async fn kill_task(&self, id: &SessionId, task_id: String) -> Result<()> {
-        self.request(
-            json!({ "type": "kill_task", "session_id": id.0, "task_id": task_id }),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn control_workflow(
+    async fn reply_host_call(
         &self,
         id: &SessionId,
-        run_id: String,
-        action: String,
-        step_id: Option<String>,
+        call_id: String,
+        result: pi_harness::ToolResult,
+        is_error: bool,
     ) -> Result<()> {
         self.request(
-            json!({ "type": "workflow_control", "session_id": id.0, "run_id": run_id, "action": action, "step_id": step_id }),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn start_workflow(
-        &self,
-        id: &SessionId,
-        workflow: String,
-        input: String,
-        parameters: Option<Value>,
-        expected_definition_hash: Option<String>,
-    ) -> Result<()> {
-        let mut request = json!({
-            "type": "workflow_start", "session_id": id.0, "workflow": workflow,
-            "input": input
-        });
-        if let Some(parameters) = parameters {
-            request["parameters"] = parameters;
-        }
-        if let Some(hash) = expected_definition_hash {
-            request["expected_definition_hash"] = Value::String(hash);
-        }
-        if let Err(error) = self.request(request, None).await {
-            self.emit_internal_error(id, error.to_string());
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn workflow_catalog(&self, id: &SessionId) -> Result<()> {
-        self.request(
-            json!({ "type": "workflow_catalog", "session_id": id.0 }),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn preview_workflow(&self, id: &SessionId, workflow: String) -> Result<()> {
-        if let Err(error) = self
-            .request(
-                json!({ "type": "workflow_preview", "session_id": id.0, "workflow": workflow }),
-                None,
-            )
-            .await
-        {
-            self.emit_internal_error(id, error.to_string());
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn read_workflow_artifact(
-        &self,
-        id: &SessionId,
-        run_id: String,
-        artifact_id: String,
-    ) -> Result<()> {
-        self.request(
-            json!({ "type": "workflow_artifact_read", "session_id": id.0, "run_id": run_id, "artifact_id": artifact_id }),
+            json!({
+                "type": "host_result",
+                "session_id": id.0,
+                "call_id": call_id,
+                "result": result,
+                "is_error": is_error,
+            }),
             None,
         )
         .await?;
@@ -558,6 +499,7 @@ impl AgentHarness for PiHarness {
                         ""
                     }
                 ),
+                context_window: None,
             })
             .collect())
     }
@@ -1081,7 +1023,6 @@ mod tests {
             preview,
             WireMessage::Event { event: AgentEvent::WorkflowPreview { preview }, .. }
                 if preview.name == "review"
-                    && preview.steps[0].forced_read_only
                     && preview.steps[0].model.as_deref() == Some("openai/gpt-5")
         ));
     }

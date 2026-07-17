@@ -3,17 +3,17 @@ use std::collections::HashMap;
 use pi_harness::SessionTreeEntry;
 use ratatui::{
     Frame,
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     agent_layout::AgentLayout,
     picker::{self, PickerRow, PickerSpec},
-    state::{AppState, OverlayKind},
+    state::{AppState, ImageAttachment, OverlayKind},
     theme::Theme,
 };
 
@@ -39,275 +39,6 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         return;
     }
     render_grok_picker(frame, state);
-}
-
-#[allow(dead_code)]
-fn render_legacy(frame: &mut Frame<'_>, state: &AppState) {
-    if state.overlay == OverlayKind::None {
-        render_slash_suggestions(frame, state);
-        return;
-    }
-    if state.overlay == OverlayKind::TreePicker {
-        render_tree_picker(frame, state);
-        return;
-    }
-    if state.overlay == OverlayKind::ForkPicker {
-        render_fork_picker(frame, state);
-        return;
-    }
-    if state.overlay == OverlayKind::PasteEditor {
-        render_paste_editor(frame, state);
-        return;
-    }
-    if state.overlay == OverlayKind::ImageViewer {
-        render_image_viewer(frame, state);
-        return;
-    }
-
-    let theme = Theme::GROK_NIGHT;
-    let frame_area = frame.area();
-    frame
-        .buffer_mut()
-        .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
-
-    let items = state.overlay_items();
-    let max_width = if state.overlay == OverlayKind::WorkflowPreview {
-        104
-    } else {
-        72
-    };
-    let width = frame_area.width.saturating_sub(6).clamp(30, max_width);
-    let (area, _, visible_start, visible_end) =
-        generic_picker_layout(state, frame_area, items.len(), width);
-    frame.render_widget(Clear, area);
-
-    let title = match state.overlay {
-        OverlayKind::CommandPalette => " Commands ",
-        OverlayKind::ModelPicker => " Select model ",
-        OverlayKind::WorkflowPicker => " Workflow catalog ",
-        OverlayKind::WorkflowPreview => " Workflow preflight ",
-        OverlayKind::SessionPicker => " Resume session ",
-        OverlayKind::SessionRename => " Rename Session ",
-        OverlayKind::SessionDeleteConfirm => " Delete Session? ",
-        OverlayKind::TreePicker => " Session tree ",
-        OverlayKind::ForkPicker => " Fork from prompt ",
-        OverlayKind::TreeSummaryPicker => " Summarize branch? ",
-        OverlayKind::TreeSummaryEditor => " Custom summarization instructions ",
-        OverlayKind::PasteEditor => " Edit pasted text ",
-        OverlayKind::ImageViewer => " Image attachment ",
-        OverlayKind::LabelEditor => " Entry label ",
-        OverlayKind::FilePicker => " Reference file ",
-        OverlayKind::ScopedModels => " Scoped models ",
-        OverlayKind::SubagentModelPicker => " Subagent model ",
-        OverlayKind::OauthPrompt => " OAuth input ",
-        OverlayKind::OauthSelect => " OAuth selection ",
-        OverlayKind::LoginProvider => " Login provider ",
-        OverlayKind::ThinkingPicker => " Thinking effort ",
-        OverlayKind::RewindPicker => " Rewind file edit ",
-        OverlayKind::Settings => " Settings ",
-        OverlayKind::Permission => " Permission required ",
-        OverlayKind::None => "",
-    };
-    let mut lines = Vec::new();
-    if matches!(
-        state.overlay,
-        OverlayKind::CommandPalette
-            | OverlayKind::ModelPicker
-            | OverlayKind::WorkflowPicker
-            | OverlayKind::SessionPicker
-            | OverlayKind::SessionRename
-            | OverlayKind::TreePicker
-            | OverlayKind::ForkPicker
-            | OverlayKind::TreeSummaryEditor
-            | OverlayKind::PasteEditor
-            | OverlayKind::ImageViewer
-            | OverlayKind::LabelEditor
-            | OverlayKind::FilePicker
-            | OverlayKind::ScopedModels
-            | OverlayKind::SubagentModelPicker
-            | OverlayKind::OauthPrompt
-            | OverlayKind::OauthSelect
-            | OverlayKind::LoginProvider
-            | OverlayKind::RewindPicker
-    ) {
-        lines.push(Line::from(vec![
-            Span::styled(
-                if state.overlay == OverlayKind::LabelEditor {
-                    "  Label: "
-                } else if state.overlay == OverlayKind::SessionRename {
-                    "  Name: "
-                } else if state.overlay == OverlayKind::TreeSummaryEditor {
-                    "  Instructions: "
-                } else if state.overlay == OverlayKind::OauthPrompt {
-                    "  Reply: "
-                } else {
-                    "  Filter: "
-                },
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                if state.overlay_query.is_empty() {
-                    if state.overlay == OverlayKind::LabelEditor {
-                        "empty clears label…".to_string()
-                    } else if state.overlay == OverlayKind::SessionRename {
-                        "enter a session name…".to_string()
-                    } else if state.overlay == OverlayKind::TreeSummaryEditor {
-                        "what should the summary preserve?…".to_string()
-                    } else if state.overlay == OverlayKind::OauthPrompt {
-                        "enter OAuth value…".to_string()
-                    } else {
-                        "type to search…".to_string()
-                    }
-                } else if state.overlay == OverlayKind::OauthPrompt {
-                    "•".repeat(state.overlay_query.chars().count())
-                } else {
-                    state.overlay_query.clone()
-                },
-                Style::default().fg(theme.foreground),
-            ),
-        ]));
-        lines.push(Line::raw(""));
-    }
-    if matches!(
-        state.overlay,
-        OverlayKind::TreePicker | OverlayKind::ForkPicker
-    ) {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  Ctrl+O: {}  ·  Shift+L label  ·  Shift+T time  ·  Shift+Enter summarize",
-                state.tree_filter.label()
-            ),
-            Style::default().fg(theme.muted),
-        )));
-        lines.push(Line::raw(""));
-    }
-    if state.overlay == OverlayKind::SessionPicker {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  Sort: {}  ·  Name: {}  ·  Ctrl+P path ({})",
-                state.session_sort.label(),
-                if state.session_named_only {
-                    "Named"
-                } else {
-                    "All"
-                },
-                if state.session_show_path { "on" } else { "off" }
-            ),
-            Style::default().fg(theme.muted),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Ctrl+S sort  ·  Ctrl+N named  ·  Ctrl+R rename  ·  Ctrl+D delete",
-            Style::default().fg(theme.muted),
-        )));
-    }
-    if state.overlay == OverlayKind::SessionDeleteConfirm {
-        let target = state.pending_session_path.as_deref().unwrap_or_default();
-        lines.push(Line::from(Span::styled(
-            format!("  Delete {target}?"),
-            Style::default().fg(theme.error),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Enter confirm  ·  Esc cancel",
-            Style::default().fg(theme.muted),
-        )));
-    }
-    if state.overlay == OverlayKind::SessionPicker && items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            if state.session_named_only {
-                "  No named sessions found. Press Ctrl+N to show all."
-            } else {
-                "  No sessions found"
-            },
-            Style::default().fg(theme.muted),
-        )));
-    }
-    if let Some(permission) = &state.pending_permission
-        && state.overlay == OverlayKind::Permission
-    {
-        lines.push(Line::from(vec![
-            Span::styled("  Tool: ", Style::default().fg(theme.muted)),
-            Span::styled(&permission.tool, Style::default().fg(theme.warning)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!("  {}", permission.reason),
-            Style::default().fg(theme.muted),
-        )));
-    }
-    if let Some(oauth) = &state.pending_oauth
-        && matches!(
-            state.overlay,
-            OverlayKind::OauthPrompt | OverlayKind::OauthSelect
-        )
-    {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", oauth.message),
-            Style::default().fg(theme.muted),
-        )));
-    }
-    let filtered_models = state.filtered_models();
-    let subagent_inherit_visible = state.overlay == OverlayKind::SubagentModelPicker
-        && (state.overlay_query.is_empty()
-            || "inherit parent (default)".contains(&state.overlay_query.to_ascii_lowercase()));
-    for (index, item) in items
-        .iter()
-        .enumerate()
-        .skip(visible_start)
-        .take(visible_end.saturating_sub(visible_start))
-    {
-        let selected = index == state.overlay_selected;
-        let marker = if selected { "› " } else { "  " };
-        let row_model = match state.overlay {
-            OverlayKind::ModelPicker | OverlayKind::ScopedModels => {
-                filtered_models.get(index).copied()
-            }
-            OverlayKind::SubagentModelPicker => index
-                .checked_sub(usize::from(subagent_inherit_visible))
-                .and_then(|model_index| filtered_models.get(model_index).copied()),
-            _ => None,
-        };
-        let model_current = state.overlay == OverlayKind::ModelPicker
-            && row_model.is_some_and(|model| model.display_name == state.model);
-        let subagent_model_current = state.overlay == OverlayKind::SubagentModelPicker
-            && match state.runtime_settings.subagent_model.as_deref() {
-                None => row_model.is_none() && item == "Inherit parent (default)",
-                Some(id) => row_model.is_some_and(|model| model.id == id),
-            };
-        let session_current = state.overlay == OverlayKind::SessionPicker
-            && state
-                .filtered_sessions()
-                .get(index)
-                .is_some_and(|session| session.current);
-        let current = if model_current || subagent_model_current || session_current {
-            "  ✓ current"
-        } else {
-            ""
-        };
-        let style = if selected {
-            Style::default().fg(theme.background).bg(theme.foreground)
-        } else {
-            Style::default().fg(theme.foreground)
-        };
-        let mut spans = vec![Span::styled(format!("{marker}{item}{current}"), style)];
-        if let Some(model) = row_model {
-            let provider = model
-                .id
-                .split_once('/')
-                .map_or("unknown", |(provider, _)| provider);
-            spans.push(Span::styled(
-                format!("  {provider}"),
-                style.fg(if selected { theme.subtle } else { theme.muted }),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .title_alignment(Alignment::Left)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().bg(theme.background));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 struct GenericPickerData {
@@ -338,7 +69,14 @@ fn render_grok_picker(frame: &mut Frame<'_>, state: &AppState) {
         max_width: data.max_width,
         max_height: data.max_height,
     };
-    picker::render(frame, &spec, state.overlay_selected, Theme::GROK_NIGHT);
+    picker::render(
+        frame,
+        &spec,
+        state.overlay_selected,
+        state.overlay_hovered,
+        state.overlay_close_hovered,
+        state.theme(),
+    );
 }
 
 fn generic_picker_data(state: &AppState) -> GenericPickerData {
@@ -581,11 +319,16 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
         .into();
     subagent.description = "Default model for native delegated tasks".into();
     rows.push(subagent);
+    rows.push(PickerRow::header("Appearance"));
+    let mut theme = PickerRow::item(7, "Theme");
+    theme.right = state.theme_mode.label().into();
+    theme.description = "Switch between Grok dark and light palettes".into();
+    rows.push(theme);
     rows
 }
 
 fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     let Some(image) = state.viewed_image() else {
         return;
     };
@@ -593,41 +336,13 @@ fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
     frame
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
-    let max_width = frame_area.width.saturating_sub(6).max(1);
-    let max_height = frame_area.height.saturating_sub(9).saturating_mul(2).max(1);
-    let (display_width, display_height) =
-        if image.preview_width <= max_width && image.preview_height <= max_height {
-            (image.preview_width, image.preview_height)
-        } else if u32::from(image.preview_width) * u32::from(max_height)
-            > u32::from(image.preview_height) * u32::from(max_width)
-        {
-            (
-                max_width,
-                ((u32::from(image.preview_height) * u32::from(max_width)
-                    / u32::from(image.preview_width)) as u16)
-                    .max(1),
-            )
-        } else {
-            (
-                ((u32::from(image.preview_width) * u32::from(max_height)
-                    / u32::from(image.preview_height)) as u16)
-                    .max(1),
-                max_height,
-            )
-        };
+    let (area, display_width, display_height) = image_viewer_geometry(image, frame_area);
     let preview_rows = usize::from(display_height).div_ceil(2);
-    let width = (display_width + 4)
-        .max(44)
-        .min(frame_area.width.saturating_sub(2).max(1));
-    let height = (preview_rows as u16 + 7).min(frame_area.height.saturating_sub(2).max(1));
-    let area = Rect::new(
-        frame_area.x + frame_area.width.saturating_sub(width) / 2,
-        frame_area.y + frame_area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
     frame.render_widget(Clear, area);
-    frame.render_widget(picker::modal_block("Image attachment", theme), area);
+    frame.render_widget(
+        picker::modal_block("Image attachment", state.overlay_close_hovered, theme),
+        area,
+    );
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -719,22 +434,53 @@ fn render_image_viewer(frame: &mut Frame<'_>, state: &AppState) {
     );
 }
 
+fn image_viewer_geometry(image: &ImageAttachment, frame_area: Rect) -> (Rect, u16, u16) {
+    let max_width = frame_area.width.saturating_sub(6).max(1);
+    let max_height = frame_area.height.saturating_sub(9).saturating_mul(2).max(1);
+    let (display_width, display_height) =
+        if image.preview_width <= max_width && image.preview_height <= max_height {
+            (image.preview_width, image.preview_height)
+        } else if u32::from(image.preview_width) * u32::from(max_height)
+            > u32::from(image.preview_height) * u32::from(max_width)
+        {
+            (
+                max_width,
+                ((u32::from(image.preview_height) * u32::from(max_width)
+                    / u32::from(image.preview_width)) as u16)
+                    .max(1),
+            )
+        } else {
+            (
+                ((u32::from(image.preview_width) * u32::from(max_height)
+                    / u32::from(image.preview_height)) as u16)
+                    .max(1),
+                max_height,
+            )
+        };
+    let preview_rows = usize::from(display_height).div_ceil(2);
+    let width = (display_width + 4)
+        .max(44)
+        .min(frame_area.width.saturating_sub(2).max(1));
+    let height = (preview_rows as u16 + 7).min(frame_area.height.saturating_sub(2).max(1));
+    (
+        centered(frame_area, width, height),
+        display_width,
+        display_height,
+    )
+}
+
 fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     let frame_area = frame.area();
     frame
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
-    let width = frame_area.width.saturating_sub(2).clamp(1, 120);
-    let height = frame_area.height.saturating_sub(2).clamp(1, 40);
-    let area = Rect::new(
-        frame_area.x + frame_area.width.saturating_sub(width) / 2,
-        frame_area.y + frame_area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
+    let area = paste_editor_geometry(frame_area);
     frame.render_widget(Clear, area);
-    frame.render_widget(picker::modal_block("Edit pasted text", theme), area);
+    frame.render_widget(
+        picker::modal_block("Edit pasted text", state.overlay_close_hovered, theme),
+        area,
+    );
 
     let content_width = usize::from(area.width.saturating_sub(8)).max(1);
     let rows = paste_editor_rows(&state.overlay_query, content_width);
@@ -824,6 +570,19 @@ fn render_paste_editor(frame: &mut Frame<'_>, state: &AppState) {
             area.width.saturating_sub(4),
             viewport_height as u16,
         ),
+    );
+    picker::render_scrollbar_for(
+        frame,
+        Rect::new(
+            content_x,
+            content_y,
+            area.width.saturating_sub(4),
+            viewport_height as u16,
+        ),
+        scroll,
+        viewport_height.min(rows.len()),
+        rows.len(),
+        theme,
     );
     let footer_y = area.bottom().saturating_sub(2);
     let footer_x = area.x + 2;
@@ -929,22 +688,15 @@ fn paste_editor_rows(text: &str, width: usize) -> Vec<PasteEditorRow> {
 }
 
 fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     let frame_area = frame.area();
     frame
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
 
     let entries = state.filtered_tree();
-    let max_rows = usize::from(frame_area.height.saturating_sub(10)).max(1);
-    let start = centered_window(state.overlay_selected, entries.len(), max_rows);
-    let end = (start + max_rows).min(entries.len());
-    let height = (end.saturating_sub(start) + 7) as u16;
-    let area = centered(
-        frame_area,
-        frame_area.width.saturating_sub(2).max(1),
-        height.min(frame_area.height.saturating_sub(1).max(1)),
-    );
+    let (area, start, end) =
+        tree_picker_geometry(frame_area, state.overlay_selected, entries.len());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
@@ -977,6 +729,7 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
             lines.push(tree_row(
                 entry,
                 index == state.overlay_selected,
+                state.overlay_hovered == Some(index),
                 state,
                 &topology,
                 theme,
@@ -1003,7 +756,7 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
         Style::default().fg(theme.muted),
     )));
 
-    let block = picker::modal_block("Session Tree", theme);
+    let block = picker::modal_block("Session Tree", state.overlay_close_hovered, theme);
     frame.render_widget(Paragraph::new(lines).block(block), area);
     picker::render_scrollbar_for(
         frame,
@@ -1021,23 +774,14 @@ fn render_tree_picker(frame: &mut Frame<'_>, state: &AppState) {
 }
 
 fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     let frame_area = frame.area();
     frame
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
     let entries = state.filtered_tree();
-    let max_messages = 10usize
-        .min(usize::from(frame_area.height.saturating_sub(10)) / 3)
-        .max(1);
-    let start = centered_window(state.overlay_selected, entries.len(), max_messages);
-    let end = (start + max_messages).min(entries.len());
-    let height = (end.saturating_sub(start) * 3 + 6) as u16;
-    let area = centered(
-        frame_area,
-        frame_area.width.saturating_sub(2).max(1),
-        height.min(frame_area.height.saturating_sub(1).max(1)),
-    );
+    let (area, start, end) =
+        fork_picker_geometry(frame_area, state.overlay_selected, entries.len());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
@@ -1049,9 +793,15 @@ fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
     ];
     for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
         let selected = index == state.overlay_selected;
+        let hovered = state.overlay_hovered == Some(index);
         let style = Style::default()
             .fg(theme.foreground)
-            .add_modifier(if selected {
+            .bg(if selected || hovered {
+                theme.bg_highlight
+            } else {
+                theme.background
+            })
+            .add_modifier(if selected || hovered {
                 Modifier::BOLD
             } else {
                 Modifier::empty()
@@ -1075,7 +825,7 @@ fn render_fork_picker(frame: &mut Frame<'_>, state: &AppState) {
             Style::default().fg(theme.muted),
         )));
     }
-    let block = picker::modal_block("Fork from Message", theme);
+    let block = picker::modal_block("Fork from Message", state.overlay_close_hovered, theme);
     frame.render_widget(Paragraph::new(lines).block(block), area);
     picker::render_scrollbar_for(
         frame,
@@ -1237,6 +987,7 @@ impl<'a> TreeTopology<'a> {
 fn tree_row(
     entry: &SessionTreeEntry,
     selected: bool,
+    hovered: bool,
     state: &AppState,
     topology: &TreeTopology<'_>,
     theme: Theme,
@@ -1313,7 +1064,7 @@ fn tree_row(
         }
     }
     let (label, color) = match (entry.kind.as_str(), entry.role.as_deref()) {
-        ("message", Some("user")) => ("user: ".to_string(), Color::Cyan),
+        ("message", Some("user")) => ("user: ".to_string(), theme.accent_user),
         ("message", Some("assistant")) => ("assistant: ".to_string(), theme.success),
         ("message", Some("toolResult")) => (String::new(), theme.muted),
         ("compaction", _) => ("[compaction]: ".to_string(), theme.accent),
@@ -1321,7 +1072,7 @@ fn tree_row(
         (_, Some(role)) => (format!("{role}: "), theme.muted),
         (kind, None) => (format!("[{kind}]: "), theme.muted),
     };
-    let selected_style = if selected {
+    let selected_style = if selected || hovered {
         Modifier::BOLD
     } else {
         Modifier::empty()
@@ -1342,7 +1093,7 @@ fn tree_row(
             .add_modifier(selected_style),
     ));
     let mut line = Line::from(spans);
-    if selected {
+    if selected || hovered {
         line = line.style(Style::default().bg(theme.code_background));
     }
     line
@@ -1386,54 +1137,17 @@ fn slash_suggestion_area(state: &AppState, frame_area: Rect) -> Option<(Rect, us
     ))
 }
 
-#[allow(dead_code)]
-fn render_slash_suggestions_legacy(frame: &mut Frame<'_>, state: &AppState) {
-    let Some((area, start, end)) = slash_suggestion_area(state, frame.area()) else {
-        return;
-    };
-    let matches = state.slash_suggestions();
-    let theme = Theme::GROK_NIGHT;
-    let mut lines = Vec::with_capacity(end.saturating_sub(start));
-    for (index, (command, description)) in matches
-        .into_iter()
-        .enumerate()
-        .skip(start)
-        .take(end.saturating_sub(start))
-    {
-        let selected = index == state.overlay_selected;
-        let marker = if selected { "›" } else { " " };
-        let style = if selected {
-            Style::default().fg(theme.background).bg(theme.foreground)
-        } else {
-            Style::default().fg(theme.foreground)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} {command}  "), style),
-            Span::styled(
-                truncate_overlay_text(
-                    &description,
-                    area.width
-                        .saturating_sub(command.chars().count() as u16 + 6)
-                        as usize,
-                ),
-                style.fg(theme.muted),
-            ),
-        ]));
-    }
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.subtle))
-                .style(Style::default().bg(theme.background)),
-        ),
-        area,
-    );
-}
-
-pub fn slash_item_at(state: &AppState, width: u16, height: u16, row: u16) -> Option<usize> {
+pub fn slash_item_at(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
     let (area, start, end) = slash_suggestion_area(state, Rect::new(0, 0, width, height))?;
+    if column < area.x || column >= area.right() {
+        return None;
+    }
     let item_row = row.checked_sub(area.y + 1)? as usize;
     if row < area.y + 1 || row >= area.bottom().saturating_sub(1) {
         return None;
@@ -1457,31 +1171,21 @@ pub fn item_at_position(
     let entries = state.filtered_tree();
     match state.overlay {
         OverlayKind::TreePicker => {
-            let max_rows = usize::from(height.saturating_sub(10)).max(1);
-            let start = centered_window(state.overlay_selected, entries.len(), max_rows);
-            let end = (start + max_rows).min(entries.len());
-            let area_height = (end.saturating_sub(start) + 7) as u16;
-            let area = centered(
-                frame_area,
-                width.saturating_sub(2).max(1),
-                area_height.min(height.saturating_sub(1).max(1)),
-            );
+            let (area, start, end) =
+                tree_picker_geometry(frame_area, state.overlay_selected, entries.len());
+            if !area.contains((column, row).into()) {
+                return None;
+            }
             let first_row = area.y.saturating_add(4);
             let offset = usize::from(row.saturating_sub(first_row));
             (row >= first_row && offset < end.saturating_sub(start)).then_some(start + offset)
         }
         OverlayKind::ForkPicker => {
-            let max_messages = 10usize
-                .min(usize::from(height.saturating_sub(10)) / 3)
-                .max(1);
-            let start = centered_window(state.overlay_selected, entries.len(), max_messages);
-            let end = (start + max_messages).min(entries.len());
-            let area_height = (end.saturating_sub(start) * 3 + 6) as u16;
-            let area = centered(
-                frame_area,
-                width.saturating_sub(2).max(1),
-                area_height.min(height.saturating_sub(1).max(1)),
-            );
+            let (area, start, end) =
+                fork_picker_geometry(frame_area, state.overlay_selected, entries.len());
+            if !area.contains((column, row).into()) {
+                return None;
+            }
             let first_row = area.y.saturating_add(3);
             let offset = usize::from(row.saturating_sub(first_row));
             let item = offset / 3;
@@ -1511,12 +1215,57 @@ pub fn item_at_position(
     }
 }
 
+pub fn close_at_position(state: &AppState, width: u16, height: u16, column: u16, row: u16) -> bool {
+    let frame_area = Rect::new(0, 0, width, height);
+    let modal = match state.overlay {
+        OverlayKind::TreePicker => {
+            let count = state.filtered_tree().len();
+            tree_picker_geometry(frame_area, state.overlay_selected, count).0
+        }
+        OverlayKind::ForkPicker => {
+            let count = state.filtered_tree().len();
+            fork_picker_geometry(frame_area, state.overlay_selected, count).0
+        }
+        OverlayKind::PasteEditor => paste_editor_geometry(frame_area),
+        OverlayKind::ImageViewer => {
+            let Some(image) = state.viewed_image() else {
+                return false;
+            };
+            image_viewer_geometry(image, frame_area).0
+        }
+        OverlayKind::None => return false,
+        _ => {
+            let data = generic_picker_data(state);
+            let display_query = if state.overlay == OverlayKind::OauthPrompt {
+                "•".repeat(state.overlay_query.chars().count())
+            } else {
+                state.overlay_query.clone()
+            };
+            let spec = PickerSpec {
+                title: data.title,
+                query: data
+                    .query_label
+                    .map(|label| (label, display_query.as_str())),
+                notes: &data.notes,
+                rows: &data.rows,
+                footer: data.footer,
+                max_width: data.max_width,
+                max_height: data.max_height,
+            };
+            picker::layout(frame_area, &spec, state.overlay_selected).modal
+        }
+    };
+    row == modal.y
+        && column >= modal.right().saturating_sub(6)
+        && column < modal.right().saturating_sub(1)
+}
+
 fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
     let Some((area, start, end)) = slash_suggestion_area(state, frame.area()) else {
         return;
     };
     let matches = state.slash_suggestions();
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg_light)),
@@ -1543,8 +1292,9 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
     for (relative, (command, description)) in visible.iter().enumerate() {
         let index = start + relative;
         let selected = index == state.overlay_selected;
+        let hovered = state.overlay_hovered == Some(index);
         let marker = if selected { "❯ " } else { "  " };
-        let bg = if selected {
+        let bg = if selected || hovered {
             theme.bg_highlight
         } else {
             theme.bg_light
@@ -1558,7 +1308,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
                 Style::default()
                     .fg(theme.foreground)
                     .bg(bg)
-                    .add_modifier(if selected {
+                    .add_modifier(if selected || hovered {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -1578,6 +1328,19 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, state: &AppState) {
             area.width,
             area.height.saturating_sub(2),
         ),
+    );
+    picker::render_scrollbar_for(
+        frame,
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2),
+        ),
+        start,
+        end.saturating_sub(start),
+        matches.len(),
+        theme,
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -1607,32 +1370,39 @@ fn overlay_has_query(overlay: OverlayKind) -> bool {
     )
 }
 
-fn generic_picker_layout(
-    state: &AppState,
-    frame_area: Rect,
-    item_count: usize,
-    width: u16,
-) -> (Rect, u16, usize, usize) {
-    let mut prelude_rows = usize::from(overlay_has_query(state.overlay)) * 2;
-    prelude_rows += usize::from(state.overlay == OverlayKind::Permission) * 2;
-    prelude_rows += usize::from(matches!(
-        state.overlay,
-        OverlayKind::SessionPicker | OverlayKind::SessionDeleteConfirm
-    )) * 2;
-    prelude_rows += usize::from(state.overlay == OverlayKind::SessionPicker && item_count == 0);
-    prelude_rows += usize::from(
-        state.pending_oauth.is_some()
-            && matches!(
-                state.overlay,
-                OverlayKind::OauthPrompt | OverlayKind::OauthSelect
-            ),
-    );
-    let height = (item_count + prelude_rows + 2).clamp(6, 16) as u16;
-    let area = centered(frame_area, width, height);
-    let capacity = usize::from(height).saturating_sub(prelude_rows + 2).max(1);
-    let start = centered_window(state.overlay_selected, item_count, capacity);
-    let end = (start + capacity).min(item_count);
-    (area, area.y + 1 + prelude_rows as u16, start, end)
+fn tree_picker_geometry(area: Rect, selected: usize, count: usize) -> (Rect, usize, usize) {
+    let capacity = usize::from(area.height.saturating_sub(10)).max(1);
+    let start = centered_window(selected, count, capacity);
+    let end = (start + capacity).min(count);
+    let height = (end.saturating_sub(start) as u16 + 7).min(area.height.saturating_sub(1).max(1));
+    (
+        centered(area, area.width.saturating_sub(2).max(1), height),
+        start,
+        end,
+    )
+}
+
+fn paste_editor_geometry(area: Rect) -> Rect {
+    centered(
+        area,
+        area.width.saturating_sub(2).clamp(1, 120),
+        area.height.saturating_sub(2).clamp(1, 40),
+    )
+}
+
+fn fork_picker_geometry(area: Rect, selected: usize, count: usize) -> (Rect, usize, usize) {
+    let capacity = 10usize
+        .min(usize::from(area.height.saturating_sub(10)) / 3)
+        .max(1);
+    let start = centered_window(selected, count, capacity);
+    let end = (start + capacity).min(count);
+    let height =
+        (end.saturating_sub(start) as u16 * 3 + 6).min(area.height.saturating_sub(1).max(1));
+    (
+        centered(area, area.width.saturating_sub(2).max(1), height),
+        start,
+        end,
+    )
 }
 
 fn centered(parent: Rect, width: u16, height: u16) -> Rect {

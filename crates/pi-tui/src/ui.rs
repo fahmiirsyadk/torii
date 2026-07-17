@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -68,6 +70,7 @@ fn transcript_geometry(state: &AppState, width: u16, height: u16) -> (u16, u16, 
 }
 
 fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSection>) {
+    let theme = state.theme();
     let mut row = 0;
     let mut sections = Vec::new();
     let mut index = 0;
@@ -82,8 +85,7 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                 active,
                 expanded,
             } => {
-                row += reasoning_lines(text, *active, *expanded, false, width, Theme::GROK_NIGHT)
-                    .len();
+                row += reasoning_lines(text, *active, *expanded, false, width, theme).len();
                 actionable = true;
             }
             Entry::Diff {
@@ -92,16 +94,15 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                 expanded,
                 ..
             } => {
-                row += diff_render_lines(path, lines, *expanded, false, width, Theme::GROK_NIGHT)
-                    .len();
+                row += diff_render_lines(path, lines, *expanded, false, width, theme).len();
                 actionable = true;
             }
             Entry::Plan { entries, expanded } => {
-                row += plan_lines(entries, *expanded, width, Theme::GROK_NIGHT).len();
+                row += plan_lines(entries, *expanded, width, theme).len();
                 actionable = true;
             }
             Entry::Tool { .. } => {
-                let Entry::Tool { label, .. } = &state.entries[index] else {
+                let Entry::Tool { id, label, .. } = &state.entries[index] else {
                     unreachable!()
                 };
                 let count = state.entries[index..]
@@ -110,10 +111,8 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                         |entry| matches!(entry, Entry::Tool { label: other, .. } if other == label),
                     )
                     .count();
-                if count > 1 {
-                    let Entry::Tool { id, .. } = &state.entries[index] else {
-                        unreachable!()
-                    };
+                let orchestration = label == "Agent" && id.starts_with("subagent:");
+                if count > 1 || orchestration {
                     sections.push(LayoutSection {
                         id: format!("tool-group:{id}"),
                         index,
@@ -125,7 +124,18 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                     if state.expanded_tool_groups.contains(&index) {
                         for child in index..index + count {
                             let child_start = row;
-                            row += tool_item_line_count(&state.entries[child], width, true);
+                            row += if orchestration {
+                                orchestration_task_lines(
+                                    state,
+                                    child,
+                                    child + 1 == index + count,
+                                    width,
+                                    theme,
+                                )
+                                .len()
+                            } else {
+                                tool_item_line_count(&state.entries[child], width, true, theme)
+                            };
                             let Entry::Tool { id, .. } = &state.entries[child] else {
                                 unreachable!()
                             };
@@ -141,7 +151,7 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                     index += count;
                     continue;
                 }
-                row += tool_item_line_count(&state.entries[index], width, false);
+                row += tool_item_line_count(&state.entries[index], width, false, theme);
                 actionable = true;
             }
             Entry::Compaction {
@@ -159,16 +169,15 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
                     *active,
                     error.as_deref(),
                     width,
-                    Theme::GROK_NIGHT,
+                    theme,
                 )
                 .len();
             }
             Entry::CompactionIndicator { tokens_before, .. } => {
-                row +=
-                    1 + compaction_indicator_line(*tokens_before, width, Theme::GROK_NIGHT).len();
+                row += 1 + compaction_indicator_line(*tokens_before, width, theme).len();
             }
             Entry::Assistant { lines, .. } => {
-                row += 1 + markdown::render(lines, width, Theme::GROK_NIGHT).len()
+                row += 1 + markdown::render(lines, width, theme).len()
             }
         }
         sections.push(LayoutSection {
@@ -185,7 +194,7 @@ fn build_layout_sections(state: &AppState, width: usize) -> (usize, Vec<LayoutSe
     (row, sections)
 }
 
-fn tool_item_line_count(entry: &Entry, width: usize, nested: bool) -> usize {
+fn tool_item_line_count(entry: &Entry, width: usize, nested: bool, theme: Theme) -> usize {
     let Entry::Tool {
         label,
         detail,
@@ -214,7 +223,7 @@ fn tool_item_line_count(entry: &Entry, width: usize, nested: bool) -> usize {
             waiting_for_user: false,
         },
         width,
-        Theme::GROK_NIGHT,
+        theme,
     )
     .len()
 }
@@ -284,9 +293,41 @@ pub fn move_section_focus(state: &mut AppState, width: u16, height: u16, directi
     } else {
         current.map_or(0, |position| (position + 1).min(sections.len() - 1))
     };
-    let section = &sections[next];
+    select_layout_section(state, &layout, next, viewport);
+}
+
+/// Give the transcript focus using Grok's activation behavior: preserve a
+/// still-visible selection, otherwise select the last visible/selectable
+/// block. This is deliberately layout-aware so a child hidden behind a
+/// collapsed tool group can never become an invisible focus target.
+pub fn focus_scrollback(state: &mut AppState, width: u16, height: u16) {
+    state.focus = Focus::Scrollback;
+    let (_, _, content_width, viewport) = transcript_geometry(state, width, height);
+    let layout = TranscriptLayout::build(state, content_width.saturating_sub(1) as usize);
+    if layout.sections.is_empty() {
+        state.focused_section = None;
+        state.focused_target_id = None;
+        state.focused_entry = None;
+        state.focused_tool = None;
+        return;
+    }
+    let selected = state
+        .focused_target_id
+        .as_ref()
+        .and_then(|id| layout.sections.iter().position(|section| &section.id == id))
+        .unwrap_or(layout.sections.len() - 1);
+    select_layout_section(state, &layout, selected, viewport);
+}
+
+fn select_layout_section(
+    state: &mut AppState,
+    layout: &TranscriptLayout,
+    position: usize,
+    viewport: usize,
+) {
+    let section = &layout.sections[position];
     let (index, start, end) = (section.index, section.start, section.end);
-    state.focused_section = Some(next);
+    state.focused_section = Some(position);
     state.focused_target_id = Some(section.id.clone());
     state.focused_entry = Some(index);
     state.focused_tool =
@@ -302,7 +343,7 @@ pub fn move_section_focus(state: &mut AppState, width: u16, height: u16, directi
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = Theme::GROK_NIGHT;
+    let theme = state.theme();
     // Clear symbols as well as styles. This matters when a resume replaces a
     // tall focused/hovered section with shorter content in terminals that keep
     // the previous alternate-screen cells until explicitly overwritten.
@@ -340,8 +381,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 
     let layout = AgentLayout::compute(frame.area(), state);
     let compaction_active = state.active_compaction_started_at().is_some();
-    let working_active =
-        state.turn_started_at.is_some() || state.image_processing_started_at.is_some();
+    let working_active = state.turn_started_at.is_some()
+        || state.image_processing_started_at.is_some()
+        || state
+            .subagent_tasks
+            .values()
+            .any(|task| task.status == "running");
 
     render_header(frame, layout.status, state, theme);
     render_transcript(frame, layout.scrollback, state, theme);
@@ -1032,14 +1077,33 @@ fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         vertical: 2,
     });
     let tasks = state.sorted_subagent_tasks();
+    let visible_tasks = usize::from(area.height.saturating_sub(2)) / 2;
+    let max_offset = tasks.len().saturating_sub(visible_tasks.max(1));
+    let mut offset = state.task_list_offset.get().min(max_offset);
+    if state.task_selected < offset {
+        offset = state.task_selected;
+    } else if state.task_selected >= offset.saturating_add(visible_tasks.max(1)) {
+        offset = state
+            .task_selected
+            .saturating_add(1)
+            .saturating_sub(visible_tasks.max(1));
+    }
+    state.task_list_offset.set(offset);
+    state.task_list_rect.set(Some((
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )));
     let mut lines = Vec::new();
-    for (index, task) in tasks.iter().enumerate() {
+    for (index, task) in tasks
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_tasks.max(1))
+    {
         let selected = index == state.task_selected;
-        let elapsed = if task.status == "running" {
-            unix_time_ms().saturating_sub(u128::from(task.started_at_ms)) as u64
-        } else {
-            task.duration_ms
-        };
+        let elapsed = task.duration_ms;
         let icon = match task.status.as_str() {
             "running" => WORKING_SPINNER[(elapsed / 80) as usize % WORKING_SPINNER.len()],
             "completed" => "✓",
@@ -1051,6 +1115,7 @@ fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
             "cancelled" => theme.muted,
             _ => theme.error,
         };
+        let activity = compact_task_activity(&task.activity, &state.cwd);
         lines.push(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
@@ -1066,16 +1131,17 @@ fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
                 }),
             ),
             Span::styled(
-                format!("  {}  {}", task.activity, format_elapsed(elapsed)),
+                format!("  {}  {}", activity, format_elapsed(elapsed)),
                 Style::default().fg(theme.muted),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             format!(
-                "      {} · {} · {}",
-                task.task_id,
+                "      {} · {} · {} · {}",
                 task.subagent_type,
-                task.model.as_deref().unwrap_or("inherited model")
+                task.model.as_deref().unwrap_or("inherited model"),
+                task.thinking_level.as_deref().unwrap_or("default thinking"),
+                task.capability_mode,
             ),
             Style::default().fg(theme.muted),
         )));
@@ -1097,6 +1163,16 @@ fn render_tasks(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+pub fn subagent_close_at(width: u16, height: u16, column: u16, row: u16) -> bool {
+    let area = Rect::new(0, 0, width, height).inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    row == area.y
+        && column >= area.right().saturating_sub(6)
+        && column < area.right().saturating_sub(1)
+}
+
 fn render_subagent(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     let area = frame.area().inner(Margin {
         horizontal: 1,
@@ -1106,99 +1182,20 @@ fn render_subagent(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         return;
     };
     let task = state.subagent_tasks.get(task_id);
-    let elapsed = task.map_or(0, |task| {
-        if task.status == "running" {
-            unix_time_ms().saturating_sub(u128::from(task.started_at_ms)) as u64
-        } else {
-            task.duration_ms
-        }
-    });
+    let elapsed = task.map_or(0, |task| task.duration_ms);
     let title = task.map_or_else(
         || format!(" Agent {task_id} "),
         |task| {
             format!(
                 " Agent · {} · {} · {} ",
                 task.description,
-                task.activity,
+                task.status,
                 format_elapsed(elapsed)
             )
         },
     );
-    let mut lines = Vec::new();
-    for event in state
-        .subagent_transcripts
-        .get(task_id)
-        .into_iter()
-        .flatten()
-    {
-        match event {
-            pi_harness::AgentEvent::UserMessage { text } => {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::default()
-                        .fg(theme.foreground)
-                        .bg(theme.user_background),
-                )));
-            }
-            pi_harness::AgentEvent::ReasoningDelta { text } => {
-                for line in text.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("  │ ", Style::default().fg(theme.muted)),
-                        Span::styled(line.to_string(), Style::default().fg(theme.muted)),
-                    ]));
-                }
-            }
-            pi_harness::AgentEvent::TextDelta { text } => {
-                for line in text.lines() {
-                    lines.push(Line::raw(format!("  {line}")));
-                }
-            }
-            pi_harness::AgentEvent::ToolCallStart { name, args, .. } => {
-                lines.push(Line::from(vec![
-                    Span::styled("  ◆ ", Style::default().fg(theme.success)),
-                    Span::styled(name.clone(), Style::default().fg(theme.foreground)),
-                    Span::styled(
-                        format!(
-                            " {}",
-                            truncate_text(
-                                &args.to_string(),
-                                area.width.saturating_sub(12) as usize
-                            )
-                        ),
-                        Style::default().fg(theme.muted),
-                    ),
-                ]));
-            }
-            pi_harness::AgentEvent::ToolCallResult {
-                is_error,
-                duration_ms,
-                ..
-            } => {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "    {} {}",
-                        if *is_error { "failed" } else { "done" },
-                        duration_ms.map(format_elapsed).unwrap_or_default()
-                    ),
-                    Style::default().fg(if *is_error { theme.error } else { theme.muted }),
-                )));
-            }
-            pi_harness::AgentEvent::Compaction { phase, .. } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ◇ Compaction {phase:?}"),
-                    Style::default().fg(theme.muted),
-                )));
-            }
-            pi_harness::AgentEvent::Error { message, .. } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ✗ {message}"),
-                    Style::default().fg(theme.error),
-                )));
-            }
-            _ => {}
-        }
-    }
+    let mut lines =
+        subagent_transcript_lines(state, task_id, area.width.saturating_sub(4) as usize, theme);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "  Waiting for child transcript…",
@@ -1226,6 +1223,155 @@ fn render_subagent(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
             .scroll((scroll as u16, 0)),
         area,
     );
+}
+
+fn subagent_transcript_lines(
+    state: &AppState,
+    task_id: &str,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(task) = state.subagent_tasks.get(task_id) {
+        lines.push(Line::from(vec![
+            Span::styled("  Activity  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                compact_task_activity(&task.activity, &state.cwd),
+                Style::default().fg(theme.foreground),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} · {} · {} · {}",
+                task.model.as_deref().unwrap_or("inherited model"),
+                task.thinking_level.as_deref().unwrap_or("default thinking"),
+                task.subagent_type,
+                task.capability_mode,
+            ),
+            Style::default().fg(theme.muted),
+        )));
+        lines.push(Line::raw(""));
+    }
+    let mut reasoning = String::new();
+    let mut response = String::new();
+    let mut visible_tool_calls = HashSet::new();
+    let flush = |lines: &mut Vec<Line<'static>>, text: &mut String, is_reasoning: bool| {
+        if text.is_empty() {
+            return;
+        }
+        for line in markdown::wrap(text.trim_end(), width.saturating_sub(4).max(1)) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if is_reasoning { "  | " } else { "  " },
+                    Style::default().fg(theme.subtle),
+                ),
+                Span::styled(
+                    line,
+                    Style::default()
+                        .fg(if is_reasoning {
+                            theme.muted
+                        } else {
+                            theme.foreground
+                        })
+                        .add_modifier(if is_reasoning {
+                            Modifier::ITALIC
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]));
+        }
+        text.clear();
+    };
+    for event in state
+        .subagent_transcripts
+        .get(task_id)
+        .into_iter()
+        .flatten()
+    {
+        match event {
+            pi_harness::AgentEvent::ReasoningDelta { text } => {
+                flush(&mut lines, &mut response, false);
+                reasoning.push_str(text);
+            }
+            pi_harness::AgentEvent::TextDelta { text } => {
+                flush(&mut lines, &mut reasoning, true);
+                response.push_str(text);
+            }
+            pi_harness::AgentEvent::UserMessage { text } => {
+                flush(&mut lines, &mut reasoning, true);
+                flush(&mut lines, &mut response, false);
+                lines.push(Line::raw(""));
+                for line in markdown::wrap(text, width.saturating_sub(4).max(1)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default()
+                            .fg(theme.foreground)
+                            .bg(theme.user_background),
+                    )));
+                }
+            }
+            pi_harness::AgentEvent::ToolCallStart { id, name, args } => {
+                flush(&mut lines, &mut reasoning, true);
+                flush(&mut lines, &mut response, false);
+                if !is_internal_subagent_ui_tool(name) {
+                    visible_tool_calls.insert(id.as_str());
+                    let detail = args
+                        .get("path")
+                        .or_else(|| args.get("command"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled("  + ", Style::default().fg(theme.accent_tool)),
+                        Span::styled(name.clone(), Style::default().fg(theme.foreground)),
+                        Span::styled(
+                            format!("  {}", truncate_text(detail, width.saturating_sub(12))),
+                            Style::default().fg(theme.muted),
+                        ),
+                    ]));
+                }
+            }
+            pi_harness::AgentEvent::ToolCallResult {
+                id,
+                is_error,
+                duration_ms,
+                ..
+            } if visible_tool_calls.contains(id.as_str()) => {
+                flush(&mut lines, &mut reasoning, true);
+                flush(&mut lines, &mut response, false);
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {} {}",
+                        if *is_error { "failed" } else { "done" },
+                        duration_ms.map(format_elapsed).unwrap_or_default()
+                    ),
+                    Style::default().fg(if *is_error { theme.error } else { theme.muted }),
+                )));
+            }
+            pi_harness::AgentEvent::Error { message, .. } => {
+                flush(&mut lines, &mut reasoning, true);
+                flush(&mut lines, &mut response, false);
+                lines.push(Line::from(Span::styled(
+                    format!("  x {message}"),
+                    Style::default().fg(theme.error),
+                )));
+            }
+            _ => {}
+        }
+    }
+    flush(&mut lines, &mut reasoning, true);
+    flush(&mut lines, &mut response, false);
+    lines
+}
+
+fn is_internal_subagent_ui_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "spawn_subagent"
+            | "get_command_or_subagent_output"
+            | "wait_commands_or_subagents"
+            | "get_subagent_result"
+    )
 }
 
 const TORII: &[&str] = &[
@@ -1272,7 +1418,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     frame.render_widget(
         Paragraph::new(logo)
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Rgb(190, 62, 74))),
+            .style(Style::default().fg(theme.error)),
         chunks[0],
     );
     frame.render_widget(
@@ -1430,17 +1576,21 @@ fn truncate_text(value: &str, width: usize) -> String {
 pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
     if state.view == View::BlockViewer {
         let area_width = width.saturating_sub(6);
-        let (_, lines) = block_viewer_content(state, usize::from(area_width), Theme::GROK_NIGHT);
+        let (_, lines) = block_viewer_content(state, usize::from(area_width), state.theme());
         return lines
             .len()
             .saturating_sub(usize::from(height.saturating_sub(4)));
     }
     if state.view == View::Subagent {
-        let count = state
-            .inspected_subagent
-            .as_ref()
-            .and_then(|task_id| state.subagent_transcripts.get(task_id))
-            .map_or(0, Vec::len);
+        let count = state.inspected_subagent.as_deref().map_or(0, |task_id| {
+            subagent_transcript_lines(
+                state,
+                task_id,
+                width.saturating_sub(4) as usize,
+                state.theme(),
+            )
+            .len()
+        });
         return count.saturating_sub(usize::from(height.saturating_sub(4)));
     }
     if state.view != View::Transcript {
@@ -1453,56 +1603,96 @@ pub fn max_scroll(state: &AppState, width: u16, height: u16) -> usize {
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
     let separator = || Span::styled(" │ ", Style::default().fg(theme.subtle));
     let queued = state.queued_steering.len() + state.queued_follow_up.len();
-    let mut right = Vec::new();
-    if state.streaming {
-        right.push(Span::styled(
-            "● working",
-            Style::default().fg(theme.accent_running),
-        ));
-    }
+    let mut right: Vec<(Option<u8>, Span<'static>)> = Vec::new();
     if state.tasks_total > 0 {
         if !right.is_empty() {
-            right.push(separator());
+            right.push((None, separator()));
         }
-        right.push(Span::styled(
-            format!("Plan {}/{}", state.tasks_complete, state.tasks_total),
-            Style::default().fg(theme.accent_plan),
+        right.push((
+            Some(2),
+            Span::styled(
+                format!("Plan {}/{}", state.tasks_complete, state.tasks_total),
+                Style::default().fg(theme.accent_plan).add_modifier(
+                    if state.header_hover == Some(2) {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                ),
+            ),
         ));
     }
     if queued > 0 {
         if !right.is_empty() {
-            right.push(separator());
+            right.push((None, separator()));
         }
-        right.push(Span::styled(
-            format!("+{queued}"),
-            Style::default().fg(theme.accent_user),
+        right.push((
+            Some(3),
+            Span::styled(
+                format!("+{queued}"),
+                Style::default().fg(theme.accent_user).add_modifier(
+                    if state.header_hover == Some(3) {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                ),
+            ),
         ));
     }
     if !right.is_empty() {
-        right.push(separator());
+        right.push((None, separator()));
     }
-    let context_percent = state
+    let context_used = state
         .context_used
+        .saturating_add(state.turn_output_chars / 4);
+    let context_percent = context_used
         .saturating_mul(100)
         .checked_div(state.context_limit.max(1))
         .unwrap_or(0);
-    right.push(Span::styled(
+    let estimate = if state.turn_started_at.is_some() {
+        "~"
+    } else {
+        ""
+    };
+    let used_label = compact_number(context_used);
+    let limit_label = compact_number(state.context_limit);
+    let token_label = format!("{estimate}{used_label} / {limit_label}");
+    let context_label = if state.header_hover == Some(4) {
+        let width = token_label.chars().count().max(6);
+        let bar_width = width.saturating_sub(6);
+        let filled = bar_width.saturating_mul(context_percent.min(100) as usize) / 100;
         format!(
-            "{} / {}  {context_percent}%",
-            compact_number(state.context_used),
-            compact_number(state.context_limit)
+            "{}{} {:>4}%",
+            "█".repeat(filled),
+            "░".repeat(bar_width.saturating_sub(filled)),
+            context_percent.min(100)
+        )
+    } else {
+        token_label
+    };
+    right.push((
+        Some(4),
+        Span::styled(
+            context_label,
+            Style::default()
+                .fg(if context_percent >= 95 {
+                    theme.error
+                } else if context_percent >= 85 {
+                    theme.warning
+                } else {
+                    theme.muted
+                })
+                .add_modifier(if state.header_hover == Some(4) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
-        Style::default().fg(if context_percent >= 95 {
-            theme.error
-        } else if context_percent >= 85 {
-            theme.warning
-        } else {
-            theme.muted
-        }),
     ));
     let right_width = right
         .iter()
-        .map(|span| span.content.chars().count())
+        .map(|(_, span)| span.content.chars().count())
         .sum::<usize>();
     let left_budget = usize::from(area.width).saturating_sub(right_width + 1);
     let branch = format!("⎇ {}", state.branch);
@@ -1511,16 +1701,43 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: The
     let mut spans = vec![
         Span::styled(branch, Style::default().fg(theme.text_secondary)),
         Span::styled("  ", Style::default()),
-        Span::styled(cwd, Style::default().fg(theme.muted)),
+        Span::styled(
+            cwd.clone(),
+            Style::default()
+                .fg(if state.header_hover == Some(0) {
+                    theme.foreground
+                } else {
+                    theme.muted
+                })
+                .add_modifier(if state.header_hover == Some(0) {
+                    Modifier::UNDERLINED
+                } else {
+                    Modifier::empty()
+                }),
+        ),
     ];
     let left_width = spans
         .iter()
         .map(|span| span.content.chars().count())
         .sum::<usize>();
-    spans.push(Span::raw(" ".repeat(
-        usize::from(area.width).saturating_sub(left_width + right_width),
-    )));
-    spans.extend(right);
+    let gap = usize::from(area.width).saturating_sub(left_width + right_width);
+    spans.push(Span::raw(" ".repeat(gap)));
+    let mut targets = state.header_targets.borrow_mut();
+    targets.clear();
+    let cwd_x = area.x + (left_width.saturating_sub(cwd.chars().count())) as u16;
+    if !cwd.is_empty() {
+        targets.push((0, cwd_x, cwd_x + cwd.chars().count() as u16, area.y));
+    }
+    let mut right_x = area.x + left_width.saturating_add(gap) as u16;
+    for (kind, span) in right {
+        let width = span.content.chars().count() as u16;
+        if let Some(kind) = kind {
+            targets.push((kind, right_x, right_x.saturating_add(width), area.y));
+        }
+        right_x = right_x.saturating_add(width);
+        spans.push(span);
+    }
+    drop(targets);
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1684,12 +1901,40 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, content);
 
-    if let Some(target_id) = state.focused_target_id.as_deref()
+    if let Some(target_id) = state.hovered_target_id.as_deref()
+        && state.focused_target_id.as_deref() != Some(target_id)
+        && let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.id == target_id)
+        && matches!(state.entries.get(section.index), Some(Entry::Tool { .. }))
+    {
+        render_tool_row_background(
+            frame,
+            content,
+            section,
+            scroll,
+            viewport_height,
+            theme.bg_hover,
+        );
+    }
+
+    if state.focus == Focus::Scrollback
+        && let Some(target_id) = state.focused_target_id.as_deref()
         && let Some(section) = layout
             .sections
             .iter()
             .find(|section| section.id == target_id)
     {
+        render_selected_tool_background(
+            frame,
+            content,
+            section,
+            scroll,
+            viewport_height,
+            state,
+            theme,
+        );
         render_section_border(
             frame,
             area,
@@ -1707,6 +1952,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             .sections
             .iter()
             .find(|section| section.id == target_id)
+        // Grok tool-call hover is a background + chevron affordance. Its
+        // selection box is reserved for keyboard/click selection.
+        && !matches!(state.entries.get(section.index), Some(Entry::Tool { .. }))
     {
         render_section_border(
             frame,
@@ -1721,6 +1969,12 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     }
 
     if line_count > viewport_height {
+        state.transcript_scrollbar_rect.set(Some((
+            area.right().saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        )));
         render_scrollbar(frame, area, line_count, viewport_height, scroll, theme);
         if state.scroll_from_bottom > 0 {
             let marker = Rect::new(
@@ -1736,6 +1990,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                 marker,
             );
         }
+    } else {
+        state.transcript_scrollbar_rect.set(None);
     }
 
     if let Some((_, text, timestamp)) = user_headers
@@ -1749,6 +2005,65 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             Paragraph::new(user_card_lines(text, timestamp, width, theme)),
             sticky_area,
         );
+    }
+}
+
+/// Grok gives a selected collapsed tool row a subtle background beneath its
+/// selection box. Expanded output keeps its own semantic row styling and gets
+/// the border only.
+fn render_selected_tool_background(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    section: &LayoutSection,
+    scroll: usize,
+    viewport_height: usize,
+    state: &AppState,
+    theme: Theme,
+) {
+    let is_collapsed_tool = match state.entries.get(section.index) {
+        Some(Entry::Tool { expanded, .. }) => section.id.starts_with("tool-group:") || !expanded,
+        _ => false,
+    };
+    if !is_collapsed_tool {
+        return;
+    }
+    render_tool_row_background(
+        frame,
+        content,
+        section,
+        scroll,
+        viewport_height,
+        theme.bg_dark,
+    );
+}
+
+fn render_tool_row_background(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    section: &LayoutSection,
+    scroll: usize,
+    viewport_height: usize,
+    color: Color,
+) {
+    let viewport_end = scroll.saturating_add(viewport_height);
+    let visible_start = section.start.max(scroll);
+    let visible_end = section.end.min(viewport_end);
+    if visible_start >= visible_end || content.width <= 2 {
+        return;
+    }
+    let y_start = content
+        .y
+        .saturating_add(visible_start.saturating_sub(scroll) as u16);
+    let y_end = content
+        .y
+        .saturating_add(visible_end.saturating_sub(scroll) as u16);
+    let style = Style::default().bg(color);
+    for y in y_start..y_end {
+        for x in content.x.saturating_add(1)..content.right().saturating_sub(1) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_style(style);
+            }
+        }
     }
 }
 
@@ -1767,41 +2082,41 @@ fn render_section_border(
     if section.end <= scroll || section.start >= viewport_end {
         return;
     }
-    let style = Style::default()
-        .fg(if preview { theme.muted } else { theme.accent })
-        .add_modifier(if preview {
-            Modifier::empty()
-        } else {
-            Modifier::BOLD
-        });
+    let style = Style::default().fg(if preview {
+        theme.hover_border
+    } else {
+        theme.selection_border
+    });
     let visible_start = section.start.max(scroll);
     let visible_end = section.end.min(viewport_end);
-    let clipped_below = visible_end < section.end;
-    for row in visible_start..visible_end {
-        let only = section.end.saturating_sub(section.start) == 1;
-        let continuation = clipped_below && row.saturating_add(3) >= visible_end;
-        let (left, right) = if preview {
-            ("▏", "▕")
-        } else if continuation {
-            ("┊", "┊")
-        } else if only {
-            ("[", "]")
-        } else if row == section.start {
-            ("┌", "┐")
-        } else if row + 1 == section.end {
-            ("└", "┘")
-        } else {
-            ("│", "│")
-        };
-        let y = content.y.saturating_add(row.saturating_sub(scroll) as u16);
-        frame.render_widget(
-            Paragraph::new(left).style(style),
-            Rect::new(area.x, y, 1, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(right).style(style),
-            Rect::new(area.right().saturating_sub(2), y, 1, 1),
-        );
+    let top_clipped = section.start < scroll;
+    let bottom_clipped = section.end > viewport_end;
+    let y_top = content
+        .y
+        .saturating_add(visible_start.saturating_sub(scroll) as u16);
+    let y_bottom = content
+        .y
+        .saturating_add(visible_end.saturating_sub(scroll) as u16)
+        .saturating_sub(1);
+    let left_x = area.x;
+    let right_x = area.right().saturating_sub(2);
+    for y in y_top..=y_bottom {
+        let dashed = (y == y_top && top_clipped) || (y == y_bottom && bottom_clipped);
+        let symbol = if dashed { "┆" } else { "│" };
+        frame.buffer_mut().set_string(left_x, y, symbol, style);
+        frame.buffer_mut().set_string(right_x, y, symbol, style);
+    }
+    if !top_clipped && y_top > 0 {
+        let y = y_top - 1;
+        frame.buffer_mut().set_string(left_x, y, "┌", style);
+        frame.buffer_mut().set_string(right_x, y, "┐", style);
+    }
+    if !bottom_clipped {
+        let y = y_bottom.saturating_add(1);
+        if y < area.bottom() {
+            frame.buffer_mut().set_string(left_x, y, "└", style);
+            frame.buffer_mut().set_string(right_x, y, "┘", style);
+        }
     }
 }
 
@@ -1867,11 +2182,11 @@ fn compaction_lines(
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let glyph = if active {
-        "◌"
+        "*"
     } else if error.is_some() {
-        "✕"
+        "x"
     } else {
-        "◆"
+        "+"
     };
     let title = if active {
         "Compacting context…".to_string()
@@ -1940,7 +2255,7 @@ fn plan_lines(
         .count();
     let mut header = vec![
         Span::styled(
-            "◆ Plan",
+            "+ Plan",
             Style::default()
                 .fg(theme.accent_plan)
                 .add_modifier(Modifier::BOLD),
@@ -2019,7 +2334,7 @@ fn reasoning_lines(
     } else if active {
         "*"
     } else {
-        "◆"
+        "+"
     };
     let header_color = if hovered {
         theme.foreground
@@ -2108,10 +2423,21 @@ fn render_working_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, th
         );
         return;
     }
-    let started_at = state
-        .turn_started_at
-        .unwrap_or_else(std::time::Instant::now);
-    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let active_tasks: Vec<_> = state
+        .subagent_tasks
+        .values()
+        .filter(|task| task.status == "running")
+        .collect();
+    let elapsed_ms = state.turn_started_at.map_or_else(
+        || {
+            active_tasks
+                .iter()
+                .map(|task| task.duration_ms)
+                .max()
+                .unwrap_or(0)
+        },
+        |started_at| started_at.elapsed().as_millis() as u64,
+    );
     let frame_index = (elapsed_ms / 100) as usize % WORKING_SPINNER.len();
     let spinner = WORKING_SPINNER[frame_index];
     // Estimate output tokens from the accumulated streamed characters. The
@@ -2120,7 +2446,16 @@ fn render_working_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, th
     // real number once TurnComplete arrives.
     let estimated_output_tokens = state.turn_output_chars / 4;
     let elapsed_label = format_elapsed(elapsed_ms);
-    let left = format!("{spinner} Working…");
+    let left = if let Some(task) = active_tasks.iter().max_by_key(|task| task.started_at_ms) {
+        let count = active_tasks.len();
+        format!(
+            "{spinner} {count} agent{} active · {}",
+            if count == 1 { "" } else { "s" },
+            compact_task_activity(&task.activity, &state.cwd)
+        )
+    } else {
+        format!("{spinner} Working…")
+    };
     let tokens_label = format!(
         "↑ {} input  ↓ {} output",
         compact_number(state.turn_input_tokens),
@@ -2285,14 +2620,16 @@ fn tool_group_lines(
     width: usize,
     theme: Theme,
 ) -> (Vec<Line<'static>>, usize) {
-    let Entry::Tool { label, .. } = &state.entries[start] else {
+    let Entry::Tool { id, label, .. } = &state.entries[start] else {
         return (Vec::new(), 1);
     };
     let count = state.entries[start..]
         .iter()
         .take_while(|entry| matches!(entry, Entry::Tool { label: other, .. } if other == label))
         .count();
-    if count == 1 {
+    let orchestration = label == "Agent"
+        && matches!(&state.entries[start], Entry::Tool { id, .. } if id.starts_with("subagent:"));
+    if count == 1 && !orchestration {
         let Entry::Tool {
             detail,
             status,
@@ -2316,7 +2653,12 @@ fn tool_group_lines(
                     duration: duration.as_deref(),
                     started_at: *started_at,
                     nested: false,
-                    focused: state.focused_tool == Some(start),
+                    focused: state.focus == Focus::Scrollback
+                        && state
+                            .focused_target_id
+                            .as_deref()
+                            .and_then(|target| target.strip_prefix("tool:"))
+                            == Some(id.as_str()),
                     hovered: state.hovered_entry == Some(start),
                     waiting_for_user: permission_matches_tool(state, label),
                 },
@@ -2367,26 +2709,41 @@ fn tool_group_lines(
             _ => None,
         })
         .max_by_key(|value| duration_millis(value));
-    let noun = match label.as_str() {
-        "Read" => "files",
-        "Search" => "searches",
-        "Agent" => "agents",
-        _ => "calls",
-    };
     let expanded = state.expanded_tool_groups.contains(&start);
+    if orchestration {
+        let mut lines = vec![orchestration_header_line(
+            state, start, count, status, expanded, started_at, duration, width, theme,
+        )];
+        if expanded {
+            for offset in 0..count {
+                lines.extend(orchestration_task_lines(
+                    state,
+                    start + offset,
+                    offset + 1 == count,
+                    width,
+                    theme,
+                ));
+            }
+        }
+        return (lines, count);
+    }
+    let summary = grouped_tool_summary(group, label, failed, count);
     let mut lines = tool_render_lines(
         ToolRender {
             label,
-            detail: &format!("{count} {noun} {}", if expanded { "⌄" } else { "›" }),
+            detail: &format!("{summary} {}", if expanded { "v" } else { ">" }),
             status,
             result: None,
             expanded: false,
             duration,
             started_at,
             nested: false,
-            focused: state
-                .focused_tool
-                .is_some_and(|focused| focused >= start && focused < start + count),
+            focused: state.focus == Focus::Scrollback
+                && state
+                    .focused_target_id
+                    .as_deref()
+                    .and_then(|target| target.strip_prefix("tool-group:"))
+                    == Some(id.as_str()),
             hovered: state.hovered_entry == Some(start),
             waiting_for_user: permission_matches_tool(state, label),
         },
@@ -2418,7 +2775,9 @@ fn tool_group_lines(
                     duration: duration.as_deref(),
                     started_at: *started_at,
                     nested: true,
-                    focused: state.focused_tool == Some(start + offset),
+                    focused: state.focus == Focus::Scrollback
+                        && state.focused_target_id.as_deref()
+                            == state.entry_target_id(start + offset).as_deref(),
                     hovered: state.hovered_entry == Some(start + offset),
                     waiting_for_user: permission_matches_tool(state, label),
                 },
@@ -2428,6 +2787,225 @@ fn tool_group_lines(
         }
     }
     (lines, count)
+}
+
+fn grouped_tool_summary(group: &[Entry], label: &str, failed: bool, count: usize) -> String {
+    let aggregate = match label {
+        "Read" => aggregate_detail_units(group, "file", "files"),
+        "Search" => aggregate_detail_units(group, "query", "queries"),
+        "Find" => aggregate_detail_units(group, "pattern", "patterns"),
+        _ => None,
+    };
+    let mut summary = format!("{count} calls");
+    if let Some((total, noun)) = aggregate {
+        summary.push_str(&format!(" · {total} {noun}"));
+    }
+    if failed {
+        let errors = group
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    Entry::Tool {
+                        status: ToolStatus::Error,
+                        ..
+                    }
+                )
+            })
+            .count();
+        summary.push_str(&format!(" · {errors} failed"));
+    }
+    summary
+}
+
+fn aggregate_detail_units<'a>(
+    group: &'a [Entry],
+    singular: &'a str,
+    plural: &'a str,
+) -> Option<(usize, &'a str)> {
+    let mut total = 0usize;
+    for entry in group {
+        let Entry::Tool { detail, .. } = entry else {
+            return None;
+        };
+        let (count, remainder) = detail.split_once(' ')?;
+        let noun = remainder.split_whitespace().next()?;
+        let count = count.parse::<usize>().ok()?;
+        if noun != singular && noun != plural {
+            return None;
+        }
+        total = total.saturating_add(count);
+    }
+    Some((total, if total == 1 { singular } else { plural }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn orchestration_header_line(
+    state: &AppState,
+    start: usize,
+    count: usize,
+    status: ToolStatus,
+    expanded: bool,
+    started_at: Option<std::time::Instant>,
+    duration: Option<&str>,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let completed = state.entries[start..start + count]
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                Entry::Tool {
+                    status: ToolStatus::Success,
+                    ..
+                }
+            )
+        })
+        .count();
+    let failed = state.entries[start..start + count]
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                Entry::Tool {
+                    status: ToolStatus::Error,
+                    ..
+                }
+            )
+        })
+        .count();
+    let title = state.entries[..start]
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            Entry::User { text, .. } => text
+                .split_once("Objective:")
+                .map(|(_, objective)| objective.trim())
+                .or(Some(text.as_str())),
+            _ => None,
+        })
+        .unwrap_or("Delegated work");
+    let elapsed = started_at
+        .map(|start| format_elapsed(start.elapsed().as_millis() as u64))
+        .or_else(|| duration.map(str::to_string))
+        .unwrap_or_default();
+    let marker = match status {
+        ToolStatus::Running => ">",
+        ToolStatus::Success => "+",
+        ToolStatus::Error => "x",
+    };
+    let color = match status {
+        ToolStatus::Running => theme.accent_running,
+        ToolStatus::Success => theme.success,
+        ToolStatus::Error => theme.error,
+    };
+    let summary = if failed > 0 {
+        format!("{completed}/{count} complete · {failed} failed")
+    } else {
+        format!("{completed}/{count} complete")
+    };
+    let suffix = format!(
+        "  {summary}  {elapsed}  {}",
+        if expanded { "v" } else { ">" }
+    );
+    let budget = width.saturating_sub(suffix.chars().count() + 4);
+    Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(color)),
+        Span::styled(
+            truncate(title, budget),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(suffix, Style::default().fg(theme.muted)),
+    ])
+}
+
+fn orchestration_task_lines(
+    state: &AppState,
+    index: usize,
+    last: bool,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let Some(task) = state
+        .entries
+        .get(index)
+        .and_then(|entry| state.subagent_task_for_entry(entry))
+    else {
+        return Vec::new();
+    };
+    let elapsed = task.duration_ms;
+    let (marker, color, state_label) = match task.status.as_str() {
+        "running" => (">", theme.accent_running, "Running"),
+        "completed" => ("+", theme.success, "Completed"),
+        "cancelled" => ("-", theme.muted, "Cancelled"),
+        _ => ("x", theme.error, "Failed"),
+    };
+    let rail = if last { "  `- " } else { "  |- " };
+    let activity = compact_task_activity(&task.activity, &state.cwd);
+    let right = format!("  {state_label}  {}", format_elapsed(elapsed));
+    let description_budget = width.saturating_sub(rail.len() + right.len() + 6);
+    let metadata = [
+        task.model.as_deref().unwrap_or("inherited model"),
+        task.thinking_level.as_deref().unwrap_or("default thinking"),
+        task.subagent_type.as_str(),
+    ]
+    .join(" · ");
+    vec![
+        Line::from(vec![
+            Span::styled(rail, Style::default().fg(theme.subtle)),
+            Span::styled(format!("{marker} "), Style::default().fg(color)),
+            Span::styled(
+                truncate(&task.description, description_budget),
+                Style::default().fg(theme.foreground),
+            ),
+            Span::styled(right, Style::default().fg(theme.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if last { "     " } else { "  |  " },
+                Style::default().fg(theme.subtle),
+            ),
+            Span::styled(
+                truncate(&activity, width.saturating_sub(7)),
+                Style::default().fg(theme.text_secondary),
+            ),
+            Span::styled(
+                format!("  · {metadata}"),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            ),
+        ]),
+    ]
+}
+
+fn compact_task_activity(activity: &str, cwd: &str) -> String {
+    let normalized = activity.replace('\\', "/");
+    let (verb, value) = normalized
+        .split_once(' ')
+        .map_or(("", normalized.as_str()), |(verb, value)| (verb, value));
+    let cwd = cwd.trim_start_matches("~/").replace('\\', "/");
+    let compact = value
+        .find(&cwd)
+        .map(|index| {
+            value[index + cwd.len()..]
+                .trim_start_matches('/')
+                .to_string()
+        })
+        .unwrap_or_else(|| value.to_string());
+    let compact = match verb.to_ascii_lowercase().as_str() {
+        "read" | "reading" => format!("Reading {compact}"),
+        "search" | "searching" => format!("Searching {compact}"),
+        "write" | "writing" => format!("Writing {compact}"),
+        _ if verb.is_empty() => compact,
+        _ => format!("{verb} {compact}"),
+    };
+    if compact.is_empty() {
+        "Waiting for activity…".into()
+    } else {
+        compact
+    }
 }
 
 fn duration_millis(value: &str) -> u64 {
@@ -2455,18 +3033,12 @@ fn permission_matches_tool(state: &AppState, label: &str) -> bool {
 
 fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Line<'static>> {
     let (marker, marker_color) = if tool.waiting_for_user {
-        ("●", theme.accent_running)
+        ("!", theme.accent_running)
     } else {
         match tool.status {
-            ToolStatus::Running => {
-                const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-                let frame = tool
-                    .started_at
-                    .map_or(0, |started| (started.elapsed().as_millis() / 120) as usize);
-                (SPINNER[frame % SPINNER.len()], theme.accent_running)
-            }
-            ToolStatus::Success => ("◆", theme.accent_tool),
-            ToolStatus::Error => ("◆", theme.error),
+            ToolStatus::Running => ("*", theme.accent_running),
+            ToolStatus::Success => ("+", theme.accent_tool),
+            ToolStatus::Error => ("x", theme.error),
         }
     };
     let marker = if tool.hovered { ">" } else { marker };
@@ -2481,7 +3053,7 @@ fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Li
     };
     let detail_width =
         width.saturating_sub(tool.label.chars().count() + timing.chars().count() + 4);
-    let prefix = if tool.nested { "  ├ " } else { "" };
+    let prefix = if tool.nested { "  |- " } else { "" };
     let mut spans = vec![
         Span::styled(
             format!("{prefix}{marker} "),
@@ -2528,6 +3100,7 @@ fn tool_render_lines(tool: ToolRender<'_>, width: usize, theme: Theme) -> Vec<Li
 
 fn tool_detail_spans(label: &str, detail: &str, theme: Theme) -> Vec<Span<'static>> {
     if label == "Search"
+        && detail.starts_with('"')
         && let Some(query_end) = detail.get(1..).and_then(|rest| rest.find('"'))
     {
         let query_end = query_end + 2;
@@ -2597,7 +3170,7 @@ fn diff_render_lines(
     let path_width = width.saturating_sub(7 + summary.chars().count());
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            if hovered { "> " } else { "◆ " },
+            if hovered { "> " } else { "+ " },
             Style::default().fg(theme.foreground),
         ),
         Span::styled(
@@ -2698,26 +3271,15 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         theme.prompt_border
     };
     let model_label = format!(" {} ", state.model);
-    let thinking_label = format!(" thinking {} ", state.thinking_level);
+    let thinking_label = format!("· thinking {} ", state.thinking_level);
     let mode_label = if state.multiline_mode {
-        format!(" multiline · {} ", state.permission_mode.label())
+        format!("· {} · multiline ", state.permission_mode.label())
     } else {
-        format!("{} ", state.permission_mode.label())
-    };
-    let context_percent = state
-        .context_used
-        .saturating_mul(100)
-        .checked_div(state.context_limit.max(1))
-        .unwrap_or(0);
-    let context_label = if context_percent >= 85 {
-        format!(" {context_percent}% context ")
-    } else {
-        String::new()
+        format!("· {} ", state.permission_mode.label())
     };
     let total = (model_label.chars().count()
         + thinking_label.chars().count()
-        + mode_label.chars().count()
-        + context_label.chars().count()) as u16;
+        + mode_label.chars().count()) as u16;
     let mut x = area.right().saturating_sub(total + 1);
     let y = area.bottom().saturating_sub(1);
     let mut targets = state.composer_targets.borrow_mut();
@@ -2731,7 +3293,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         x = end;
     }
     drop(targets);
-    let mut title_spans = vec![
+    let title_spans = vec![
         Span::styled(
             model_label,
             Style::default()
@@ -2740,42 +3302,62 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
                 } else {
                     theme.accent_model
                 })
-                .bg(theme.background),
+                .bg(if state.composer_hover == Some(0) {
+                    theme.bg_hover
+                } else {
+                    theme.background
+                })
+                .add_modifier(if state.composer_hover == Some(0) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled(
             thinking_label,
-            Style::default().fg(if state.composer_hover == Some(1) {
-                theme.foreground
-            } else {
-                theme.accent_thinking
-            }),
+            Style::default()
+                .fg(if state.composer_hover == Some(1) {
+                    theme.foreground
+                } else {
+                    theme.accent_thinking
+                })
+                .bg(if state.composer_hover == Some(1) {
+                    theme.bg_hover
+                } else {
+                    theme.background
+                })
+                .add_modifier(if state.composer_hover == Some(1) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled(
             mode_label,
-            Style::default().fg(if state.composer_hover == Some(2) {
-                theme.foreground
-            } else {
-                theme.accent_plan
-            }),
+            Style::default()
+                .fg(if state.composer_hover == Some(2) {
+                    theme.foreground
+                } else {
+                    theme.accent_plan
+                })
+                .bg(if state.composer_hover == Some(2) {
+                    theme.bg_hover
+                } else {
+                    theme.background
+                })
+                .add_modifier(if state.composer_hover == Some(2) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
     ];
-    if !context_label.is_empty() {
-        title_spans.push(Span::styled(
-            context_label,
-            Style::default().fg(if context_percent >= 95 {
-                theme.error
-            } else {
-                theme.warning
-            }),
-        ));
-    }
-    let title_line = Line::from(title_spans);
+    let title_line = Line::from(title_spans).alignment(Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title_bottom(title_line)
-        .title_alignment(Alignment::Right);
-    let mut prompt_spans = vec![Span::styled("▯ ", Style::default().fg(theme.foreground))];
+        .title_bottom(title_line);
+    let mut prompt_spans = vec![Span::styled("> ", Style::default().fg(theme.foreground))];
     let mut image_x = area.x + 3;
     let mut image_targets = state.image_targets.borrow_mut();
     image_targets.clear();
@@ -2971,10 +3553,10 @@ fn composer_paste_spans(state: &AppState, chars: &[char], theme: Theme) -> Vec<S
                 .fg(if hovered {
                     theme.background
                 } else {
-                    Color::Blue
+                    theme.accent_system
                 })
                 .bg(if hovered {
-                    Color::Blue
+                    theme.accent_system
                 } else {
                     theme.code_background
                 })
@@ -3021,20 +3603,31 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
     } else {
         theme.muted
     };
-    let lines = vec![
-        Line::from(Span::styled(
-            format!(" {left}"),
-            Style::default().fg(theme.foreground),
-        )),
-        Line::from(Span::styled(
-            format!(
-                " {}",
-                truncate(&state.status, area.width.saturating_sub(2) as usize)
-            ),
-            Style::default().fg(status_color),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), area);
+    let status_budget = usize::from(area.width) / 3;
+    let hide_redundant_status = (state.turn_started_at.is_some()
+        || state
+            .subagent_tasks
+            .values()
+            .any(|task| task.status == "running"))
+        && !state.status.contains("failed")
+        && !state.status.contains("unavailable");
+    let status = if hide_redundant_status {
+        String::new()
+    } else {
+        truncate(&state.status, status_budget)
+    };
+    let status_width = status.chars().count();
+    let left_budget = usize::from(area.width).saturating_sub(status_width + 2);
+    let left = truncate(&left, left_budget.saturating_sub(1));
+    let used = 1 + left.chars().count() + status_width;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {left}"), Style::default().fg(theme.foreground)),
+            Span::raw(" ".repeat(usize::from(area.width).saturating_sub(used))),
+            Span::styled(status, Style::default().fg(status_color)),
+        ])),
+        area,
+    );
 }
 
 fn compact_number(value: u64) -> String {

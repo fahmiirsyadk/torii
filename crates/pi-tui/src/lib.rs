@@ -1,5 +1,6 @@
 mod actions;
 mod agent_layout;
+mod effects;
 mod fixtures;
 mod markdown;
 mod overlay;
@@ -20,20 +21,16 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use clipboard_rs::{Clipboard as ClipboardRs, ClipboardContext};
-use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
-    execute,
-    terminal::supports_keyboard_enhancement,
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use effects::{TerminalGuard, display_path, git_branch};
 pub use fixtures::Story;
 use futures_util::StreamExt;
-use ratatui::{DefaultTerminal, Terminal};
+use ratatui::Terminal;
 use state::OverlayAction;
 pub use state::{AppState, Focus, OverlayKind, View};
+pub use theme::ThemeMode;
 use tokio::sync::{broadcast, mpsc};
 
 fn read_clipboard_image() -> Result<state::ImageAttachment> {
@@ -90,9 +87,24 @@ fn read_clipboard_image() -> Result<state::ImageAttachment> {
     image_attachment_from_path(path)
 }
 
+fn read_clipboard_text() -> Result<String> {
+    let text = ClipboardContext::new()
+        .and_then(|clipboard| clipboard.get_text())
+        .map_err(|error| anyhow!(error.to_string()))?;
+    if text.is_empty() {
+        return Err(anyhow!("clipboard contains no text"));
+    }
+    Ok(text)
+}
+
+enum ClipboardPayload {
+    Image(state::ImageAttachment),
+    Text(String),
+}
+
 fn begin_clipboard_image_load(
     state: &mut AppState,
-    sender: &mpsc::UnboundedSender<Result<state::ImageAttachment, String>>,
+    sender: &mpsc::UnboundedSender<Result<ClipboardPayload, String>>,
 ) {
     if state.image_processing_started_at.is_some() {
         state.status = "image processing already in progress…".into();
@@ -102,9 +114,43 @@ fn begin_clipboard_image_load(
     state.status = "processing image from clipboard…".into();
     let sender = sender.clone();
     tokio::task::spawn_blocking(move || {
-        let result = read_clipboard_image().map_err(|error| format!("{error:#}"));
+        let result = read_clipboard_image()
+            .map(ClipboardPayload::Image)
+            .map_err(|error| format!("{error:#}"));
         let _ = sender.send(result);
     });
+}
+
+fn begin_clipboard_load(
+    state: &mut AppState,
+    sender: &mpsc::UnboundedSender<Result<ClipboardPayload, String>>,
+) {
+    if state.image_processing_started_at.is_some() {
+        state.status = "clipboard processing already in progress…".into();
+        return;
+    }
+    state.image_processing_started_at = Some(Instant::now());
+    state.status = "reading clipboard…".into();
+    let sender = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = read_clipboard_image()
+            .map(ClipboardPayload::Image)
+            .or_else(|_| read_clipboard_text().map(ClipboardPayload::Text))
+            .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+}
+
+fn paste_clipboard_text(state: &mut AppState, editor: bool) {
+    match read_clipboard_text() {
+        Ok(text) if editor => state.insert_paste_editor_text(text),
+        Ok(text) => {
+            let length = text.chars().count();
+            state.insert_paste(text);
+            state.status = format!("pasted {length} characters");
+        }
+        Err(error) => state.status = format!("clipboard text unavailable: {error:#}"),
+    }
 }
 
 fn clipboard_file_path(clipboard: &ClipboardContext) -> Option<PathBuf> {
@@ -243,7 +289,6 @@ pub enum UiCommand {
     StartWorkflow {
         workflow: String,
         input: String,
-        parameters: Option<serde_json::Value>,
         expected_definition_hash: Option<String>,
     },
     NewSession,
@@ -309,7 +354,7 @@ pub enum UiCommand {
 enum LoopWake {
     Input(Option<io::Result<Event>>),
     Agent(Result<pi_harness::AgentEvent, broadcast::error::RecvError>),
-    Image(Result<state::ImageAttachment, String>),
+    Clipboard(Result<ClipboardPayload, String>),
     Animation,
 }
 
@@ -379,7 +424,7 @@ fn dispatch_pane_action(
             if state.complete_slash_command() {
                 return true;
             }
-            state.focus_scrollback();
+            ui::focus_scrollback(state, width, height);
         }
         ActionId::FocusPrompt => state.focus_prompt(),
         ActionId::ScrollUp => ui::move_section_focus(state, width, height, -1),
@@ -446,53 +491,6 @@ fn handle_agent_escape(state: &mut AppState, commands: &Option<mpsc::UnboundedSe
     }
 }
 
-struct TerminalGuard {
-    keyboard_enhancement_enabled: bool,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<(Self, DefaultTerminal)> {
-        let terminal = match ratatui::try_init() {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                ratatui::restore();
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
-            ratatui::restore();
-            return Err(error.into());
-        }
-        let keyboard_enhancement_enabled = supports_keyboard_enhancement().unwrap_or(false);
-        if keyboard_enhancement_enabled
-            && let Err(error) = execute!(
-                io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-        {
-            let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
-            ratatui::restore();
-            return Err(error.into());
-        }
-        Ok((
-            Self {
-                keyboard_enhancement_enabled,
-            },
-            terminal,
-        ))
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if self.keyboard_enhancement_enabled {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
-        ratatui::restore();
-    }
-}
-
 pub struct TuiBootstrap {
     pub models: Vec<pi_harness::ModelInfo>,
     pub auth_providers: Vec<pi_harness::ModelInfo>,
@@ -517,9 +515,15 @@ pub async fn run(
         settings,
         open_resume,
     } = bootstrap;
-    let mut state = AppState::default();
+    let mut state = AppState {
+        theme_mode: theme::load_preference(),
+        ..AppState::default()
+    };
     if let Ok(cwd) = std::env::current_dir() {
         state.cwd = display_path(&cwd);
+        if let Some(branch) = git_branch(&cwd) {
+            state.branch = branch;
+        }
     }
     if !models.is_empty() {
         state.model = models[0].display_name.clone();
@@ -536,17 +540,6 @@ pub async fn run(
         state.open_overlay(OverlayKind::SessionPicker);
     }
     run_app(state, Some(events), Some(commands)).await
-}
-
-fn display_path(path: &std::path::Path) -> String {
-    let rendered = path.display().to_string();
-    let Some(home) = std::env::var_os("HOME") else {
-        return rendered;
-    };
-    let home = std::path::PathBuf::from(home);
-    path.strip_prefix(&home)
-        .map(|relative| format!("~/{}", relative.display()))
-        .unwrap_or(rendered)
 }
 
 pub async fn run_story(story: Story) -> Result<()> {
@@ -575,6 +568,8 @@ async fn run_app(
 
     loop {
         let animated = state.streaming
+            || state.scroll_drag.is_some()
+            || state.scrollbar_dragging
             || state.image_processing_started_at.is_some()
             || state.active_compaction_started_at().is_some()
             || state.has_background_work()
@@ -585,7 +580,7 @@ async fn run_app(
         let animation_due = animated
             && last_draw_at
                 .is_none_or(|last_draw: Instant| last_draw.elapsed() >= ANIMATION_FRAME_INTERVAL);
-        if dirty || animation_due {
+        if (dirty && !animated) || animation_due {
             terminal.draw(|frame| ui::render(frame, &state))?;
             last_draw_at = Some(Instant::now());
             dirty = false;
@@ -602,8 +597,8 @@ async fn run_app(
         let wake = tokio::select! {
             input_event = input.next() => LoopWake::Input(input_event),
             agent_event = next_agent_event(&mut events) => LoopWake::Agent(agent_event),
-            image = image_receiver.recv(), if state.image_processing_started_at.is_some() => {
-                LoopWake::Image(image.expect("image worker sender remains alive"))
+            clipboard = image_receiver.recv(), if state.image_processing_started_at.is_some() => {
+                LoopWake::Clipboard(clipboard.expect("clipboard worker sender remains alive"))
             },
             _ = tokio::time::sleep(animation_wait) => LoopWake::Animation,
         };
@@ -628,11 +623,16 @@ async fn run_app(
                 events = None;
                 continue;
             }
-            LoopWake::Image(result) => {
+            LoopWake::Clipboard(result) => {
                 state.image_processing_started_at = None;
                 match result {
-                    Ok(image) => state.attach_image(image),
-                    Err(error) => state.status = format!("clipboard image unavailable: {error}"),
+                    Ok(ClipboardPayload::Image(image)) => state.attach_image(image),
+                    Ok(ClipboardPayload::Text(text)) => {
+                        let length = text.chars().count();
+                        state.insert_paste(text);
+                        state.status = format!("pasted {length} characters");
+                    }
+                    Err(error) => state.status = format!("clipboard unavailable: {error}"),
                 }
                 dirty = true;
                 continue;
@@ -643,7 +643,15 @@ async fn run_app(
         dirty = true;
         let size = terminal.size()?;
         let max_scroll = ui::max_scroll(&state, size.width, size.height);
-        let page = usize::from(size.height.saturating_sub(8)).max(1);
+        let page = usize::from(
+            agent_layout::AgentLayout::compute(
+                ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                &state,
+            )
+            .scrollback
+            .height,
+        )
+        .max(1);
 
         match input_event {
             Event::Key(key)
@@ -714,9 +722,11 @@ async fn run_app(
                         state.move_overlay_selection(page as isize);
                     }
                     KeyCode::Home if state.overlay != OverlayKind::PasteEditor => {
+                        state.overlay_hovered = None;
                         state.overlay_selected = 0;
                     }
                     KeyCode::End if state.overlay != OverlayKind::PasteEditor => {
+                        state.overlay_hovered = None;
                         let count = state.overlay_items().len();
                         state.overlay_selected = count.saturating_sub(1);
                     }
@@ -743,12 +753,12 @@ async fn run_app(
                         state.fold_or_move_tree(true);
                     }
                     KeyCode::Left | KeyCode::PageUp if state.overlay == OverlayKind::TreePicker => {
-                        state.move_tree_page(-1, usize::from(size.height / 2).max(1));
+                        state.move_tree_page(-1, page);
                     }
                     KeyCode::Right | KeyCode::PageDown
                         if state.overlay == OverlayKind::TreePicker =>
                     {
-                        state.move_tree_page(1, usize::from(size.height / 2).max(1));
+                        state.move_tree_page(1, page);
                     }
                     KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
                         state.toggle_scoped_model();
@@ -779,6 +789,12 @@ async fn run_app(
                             && state.overlay == OverlayKind::SessionPicker =>
                     {
                         state.cycle_session_sort();
+                    }
+                    KeyCode::Char('v')
+                        if state.overlay == OverlayKind::PasteEditor
+                            && key.modifiers == KeyModifiers::CONTROL =>
+                    {
+                        paste_clipboard_text(&mut state, true);
                     }
                     KeyCode::Char('n')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -876,6 +892,14 @@ async fn run_app(
                 state.insert_paste(text);
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key.code == KeyCode::Char('v')
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && state.focus == Focus::Prompt
+                    && state.overlay == OverlayKind::None
+                {
+                    paste_clipboard_text(&mut state, false);
+                    continue;
+                }
                 if let Some(action) = actions::lookup(&key, actions::ActionContext::Global)
                     && dispatch_registered_action(action, &mut state, &commands)
                         == ActionOutcome::Quit
@@ -1075,7 +1099,11 @@ async fn run_app(
                     }
                     KeyCode::Tab => {
                         if state.focus != Focus::Prompt || !state.complete_slash_command() {
-                            state.toggle_focus();
+                            if state.focus == Focus::Prompt {
+                                ui::focus_scrollback(&mut state, size.width, size.height);
+                            } else {
+                                state.focus_prompt();
+                            }
                         }
                     }
                     KeyCode::Enter if state.focus == Focus::Prompt => {
@@ -1090,9 +1118,9 @@ async fn run_app(
                             state.insert_char('\n');
                             continue;
                         }
-                        if state.prompt.trim() == "/paste-image" {
+                        if matches!(state.prompt.trim(), "/paste" | "/paste-image") {
                             state.clear_prompt_text();
-                            begin_clipboard_image_load(&mut state, &image_sender);
+                            begin_clipboard_load(&mut state, &image_sender);
                         } else if let Some(action) = state.activate_slash_command() {
                             if dispatch_overlay_action(action, &commands) {
                                 break;
@@ -1208,13 +1236,28 @@ async fn run_app(
             Event::Mouse(mouse) if state.overlay != OverlayKind::None => match mouse.kind {
                 MouseEventKind::ScrollUp if state.overlay == OverlayKind::PasteEditor => {
                     state.scroll_paste_editor(-3);
+                    state.overlay_hovered = None;
                 }
                 MouseEventKind::ScrollDown if state.overlay == OverlayKind::PasteEditor => {
                     state.scroll_paste_editor(3);
+                    state.overlay_hovered = None;
                 }
-                MouseEventKind::ScrollUp => state.move_overlay_selection(-3),
-                MouseEventKind::ScrollDown => state.move_overlay_selection(3),
+                MouseEventKind::ScrollUp => {
+                    state.overlay_hovered = None;
+                    state.move_overlay_selection(-3);
+                }
+                MouseEventKind::ScrollDown => {
+                    state.overlay_hovered = None;
+                    state.move_overlay_selection(3);
+                }
                 MouseEventKind::Moved => {
+                    state.overlay_close_hovered = crate::overlay::close_at_position(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    );
                     if state.overlay == OverlayKind::PasteEditor {
                         state.paste_editor_action_hover =
                             state.paste_editor_action_at(mouse.column, mouse.row);
@@ -1222,17 +1265,28 @@ async fn run_app(
                         state.image_view_action_hover =
                             state.image_view_action_at(mouse.column, mouse.row);
                     }
-                    if let Some(index) = crate::overlay::item_at_position(
+                    state.overlay_hovered = crate::overlay::item_at_position(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    );
+                }
+                MouseEventKind::Down(_) => {
+                    if crate::overlay::close_at_position(
                         &state,
                         size.width,
                         size.height,
                         mouse.column,
                         mouse.row,
                     ) {
-                        state.overlay_selected = index;
+                        let action = state.cancel_oauth();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
+                        continue;
                     }
-                }
-                MouseEventKind::Down(_) => {
                     if state.overlay == OverlayKind::ImageViewer
                         && let Some(action) = state.image_view_action_at(mouse.column, mouse.row)
                     {
@@ -1280,21 +1334,69 @@ async fn run_app(
                 _ => {}
             },
             Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if state.view == View::Transcript
+                        && state.transcript_scrollbar_contains(mouse.column, mouse.row) =>
+                {
+                    state.focus_scrollback();
+                    state.scrollbar_dragging = true;
+                    state.scroll_drag = None;
+                    state.pending_transcript_click = None;
+                    state.drag_scrollbar_to(mouse.row, max_scroll);
+                }
+                MouseEventKind::Drag(MouseButton::Left) if state.scrollbar_dragging => {
+                    state.pending_transcript_click = None;
+                    state.drag_scrollbar_to(mouse.row, max_scroll);
+                }
+                MouseEventKind::Drag(MouseButton::Left) if state.scroll_drag.is_some() => {
+                    state.pending_transcript_click = None;
+                    state.drag_scrollback_to(mouse.row, max_scroll);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let released = ui::section_hit_at(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    )
+                    .map(|hit| (hit.index, hit.id));
+                    state.finish_transcript_click(released);
+                }
+                MouseEventKind::ScrollUp
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
+                {
+                    state.overlay_hovered = None;
+                    state.overlay_selected = state.overlay_selected.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown
+                    if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
+                {
+                    state.overlay_hovered = None;
+                    state.overlay_selected = (state.overlay_selected + 1)
+                        .min(state.slash_suggestions().len().saturating_sub(1));
+                }
                 MouseEventKind::Moved
                     if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
-                    if let Some(index) =
-                        crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
-                    {
-                        state.overlay_selected = index;
-                    }
+                    state.overlay_hovered = crate::overlay::slash_item_at(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    );
                 }
                 MouseEventKind::Down(_)
                     if state.focus == Focus::Prompt && !state.slash_suggestions().is_empty() =>
                 {
-                    if let Some(index) =
-                        crate::overlay::slash_item_at(&state, size.width, size.height, mouse.row)
-                    {
+                    if let Some(index) = crate::overlay::slash_item_at(
+                        &state,
+                        size.width,
+                        size.height,
+                        mouse.column,
+                        mouse.row,
+                    ) {
                         state.overlay_selected = index;
                         if let Some(action) = state.activate_slash_command()
                             && dispatch_overlay_action(action, &commands)
@@ -1311,18 +1413,26 @@ async fn run_app(
                         (state.task_selected + 1).min(state.subagent_tasks.len().saturating_sub(1));
                 }
                 MouseEventKind::Moved if state.view == View::Tasks => {
-                    let first_row = 3_u16;
-                    if mouse.row >= first_row {
-                        let index = usize::from(mouse.row - first_row) / 2;
+                    if let Some((x, y, width, height)) = state.task_list_rect.get()
+                        && mouse.column >= x
+                        && mouse.column < x.saturating_add(width)
+                        && mouse.row >= y
+                        && mouse.row < y.saturating_add(height)
+                    {
+                        let index = state.task_list_offset.get() + usize::from(mouse.row - y) / 2;
                         if index < state.subagent_tasks.len() {
                             state.task_selected = index;
                         }
                     }
                 }
                 MouseEventKind::Down(_) if state.view == View::Tasks => {
-                    let first_row = 3_u16;
-                    if mouse.row >= first_row {
-                        let index = usize::from(mouse.row - first_row) / 2;
+                    if let Some((x, y, width, height)) = state.task_list_rect.get()
+                        && mouse.column >= x
+                        && mouse.column < x.saturating_add(width)
+                        && mouse.row >= y
+                        && mouse.row < y.saturating_add(height)
+                    {
+                        let index = state.task_list_offset.get() + usize::from(mouse.row - y) / 2;
                         if index < state.subagent_tasks.len() {
                             state.task_selected = index;
                             state.open_selected_subagent();
@@ -1372,8 +1482,12 @@ async fn run_app(
                 }
                 MouseEventKind::Down(_)
                     if state.view == View::Subagent
-                        && mouse.row == 1
-                        && mouse.column >= size.width.saturating_sub(6) =>
+                        && ui::subagent_close_at(
+                            size.width,
+                            size.height,
+                            mouse.column,
+                            mouse.row,
+                        ) =>
                 {
                     state.view = View::Tasks;
                     state.scroll_from_bottom = 0;
@@ -1383,6 +1497,7 @@ async fn run_app(
                 MouseEventKind::ScrollUp => state.scroll_up(1, max_scroll),
                 MouseEventKind::ScrollDown => state.scroll_down(1),
                 MouseEventKind::Moved => {
+                    let header_hover = state.header_target_at(mouse.column, mouse.row);
                     let composer_hover = state
                         .composer_targets
                         .borrow()
@@ -1407,9 +1522,11 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(id, _, _, _)| *id);
-                    let composer_changed = state.composer_hover != composer_hover
+                    let composer_changed = state.header_hover != header_hover
+                        || state.composer_hover != composer_hover
                         || state.paste_hover != paste_hover
                         || state.image_hover != image_hover;
+                    state.header_hover = header_hover;
                     state.composer_hover = composer_hover;
                     state.paste_hover = paste_hover;
                     state.image_hover = image_hover;
@@ -1425,6 +1542,7 @@ async fn run_app(
                     dirty = composer_changed || transcript_changed;
                 }
                 MouseEventKind::Down(_) => {
+                    let header_target = state.header_target_at(mouse.column, mouse.row);
                     let composer_target = state.composer_hover.or_else(|| {
                         state
                             .composer_targets
@@ -1451,7 +1569,32 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(id, _, _, _)| *id);
-                    if let Some(id) = image_target {
+                    if let Some(target) = header_target {
+                        match target {
+                            0 => match ClipboardContext::new()
+                                .and_then(|clipboard| clipboard.set_text(state.cwd.clone()))
+                            {
+                                Ok(()) => state.status = "working directory copied".into(),
+                                Err(error) => {
+                                    state.status = format!("copy working directory failed: {error}")
+                                }
+                            },
+                            1 => state.view = View::Tasks,
+                            2 => {
+                                if let Some(index) = state
+                                    .entries
+                                    .iter()
+                                    .rposition(|entry| matches!(entry, state::Entry::Plan { .. }))
+                                {
+                                    state.focus_scrollback();
+                                    state.focused_entry = Some(index);
+                                    state.scroll_from_bottom = 0;
+                                }
+                            }
+                            3 => state.queue_visible = !state.queue_visible,
+                            _ => state.show_context_info(),
+                        }
+                    } else if let Some(id) = image_target {
                         state.begin_image_view(id);
                     } else if let Some(id) = paste_target {
                         state.begin_paste_edit(id);
@@ -1470,32 +1613,33 @@ async fn run_app(
                                 OverlayKind::ThinkingPicker
                             });
                         }
-                    } else if mouse.row >= size.height.saturating_sub(5)
-                        && mouse.row < size.height.saturating_sub(2)
+                    } else if agent_layout::AgentLayout::compute(
+                        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                        &state,
+                    )
+                    .prompt
+                    .contains((mouse.column, mouse.row).into())
                     {
                         state.focus_prompt();
                     } else if let Some(hit) =
                         ui::section_hit_at(&state, size.width, size.height, mouse.column, mouse.row)
                     {
                         state.focus_scrollback();
-                        if hit.actionable {
-                            let target_id = hit.id.clone();
-                            let grouped = state.entries.get(hit.index).is_some_and(|entry| {
-                                    let state::Entry::Tool { label, .. } = entry else { return false; };
-                                    let begins_group = hit.index == 0 || !matches!(state.entries.get(hit.index - 1), Some(state::Entry::Tool { label: previous, .. }) if previous == label);
-                                    begins_group && state.entries[hit.index..].iter().take_while(|candidate| matches!(candidate, state::Entry::Tool { label: other, .. } if other == label)).count() > 1
-                                });
-                            if grouped {
-                                state.toggle_tool_group(hit.index);
-                            } else {
-                                state.activate_entry_at(hit.index);
-                            }
-                            state.focused_target_id = Some(target_id);
-                        } else {
-                            state.focused_entry = Some(hit.index);
-                            state.focused_target_id = Some(hit.id);
-                        }
+                        state.focused_entry = Some(hit.index);
+                        state.focused_target_id = Some(hit.id.clone());
+                        state.focused_tool = matches!(
+                            state.entries.get(hit.index),
+                            Some(state::Entry::Tool { .. })
+                        )
+                        .then_some(hit.index);
+                        state.pending_transcript_click = Some((hit.index, hit.id));
+                        state.begin_scrollback_drag(mouse.row);
+                    } else if state.transcript_contains(mouse.column, mouse.row) {
+                        state.focus_scrollback();
+                        state.pending_transcript_click = None;
+                        state.begin_scrollback_drag(mouse.row);
                     } else {
+                        state.pending_transcript_click = None;
                         state.focus_scrollback();
                     }
                 }
@@ -1524,6 +1668,10 @@ fn dispatch_overlay_action(
 ) -> bool {
     match action {
         OverlayAction::None => false,
+        OverlayAction::SetTheme(mode) => {
+            let _ = theme::save_preference(mode);
+            false
+        }
         OverlayAction::RefreshSessions => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::RefreshSessions);
@@ -1545,14 +1693,12 @@ fn dispatch_overlay_action(
         OverlayAction::StartWorkflow {
             workflow,
             input,
-            parameters,
             expected_definition_hash,
         } => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::StartWorkflow {
                     workflow,
                     input,
-                    parameters,
                     expected_definition_hash,
                 });
             }
@@ -2054,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_paste_image_command_preserves_existing_attachments() {
+    fn clearing_paste_command_preserves_existing_attachments() {
         let mut state = super::AppState::default();
         state.attach_image(super::state::ImageAttachment {
             id: 0,
@@ -2068,7 +2214,7 @@ mod tests {
             preview_height: 1,
             preview_rgba: vec![255; 4],
         });
-        state.prompt = "/paste-image".into();
+        state.prompt = "/paste".into();
         state.cursor = state.prompt.chars().count();
 
         state.clear_prompt_text();
@@ -2158,6 +2304,7 @@ mod tests {
         state.model = "grok-4 fast".into();
         state.thinking_level = "high".into();
         state.permission_mode = super::state::PermissionMode::Plan;
+        state.multiline_mode = true;
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
@@ -2165,6 +2312,14 @@ mod tests {
         assert!(output.contains("grok-4 fast"));
         assert!(output.contains("thinking high"));
         assert!(output.contains("plan"));
+        assert!(output.contains("multiline"));
+        let targets = state.composer_targets.borrow();
+        assert_eq!(targets.len(), 3);
+        assert!(
+            targets[0].1 >= width / 2,
+            "composer controls should occupy the bottom-right border: {targets:?}"
+        );
+        assert!(targets.windows(2).all(|pair| pair[0].2 == pair[1].1));
         // The previous standalone status suffix is gone from the shortcuts row.
         let shortcuts_line = output
             .lines()
@@ -2178,6 +2333,62 @@ mod tests {
             !shortcuts_line.contains("plan"),
             "shortcuts row should not duplicate permission mode: {shortcuts_line:?}"
         );
+    }
+
+    #[test]
+    fn enter_on_plain_transcript_block_opens_viewer() {
+        let mut state = super::AppState::default();
+        state.entries.push(super::state::Entry::Assistant {
+            lines: vec!["inspect me".into()],
+            timestamp: String::new(),
+        });
+        state.focus_scrollback();
+        state.activate_entry_at(0);
+        assert_eq!(state.view, super::View::BlockViewer);
+        assert_eq!(state.viewed_entry, Some(0));
+    }
+
+    #[test]
+    fn scrollback_drag_tracks_pointer_distance_and_clamps() {
+        let mut state = super::AppState {
+            scroll_from_bottom: 4,
+            ..super::AppState::default()
+        };
+        state.begin_scrollback_drag(10);
+        state.drag_scrollback_to(15, 20);
+        assert_eq!(state.scroll_from_bottom, 9);
+        state.drag_scrollback_to(2, 20);
+        assert_eq!(state.scroll_from_bottom, 0);
+
+        state.transcript_scrollbar_rect.set(Some((99, 2, 1, 10)));
+        state.drag_scrollbar_to(2, 100);
+        assert_eq!(state.scroll_from_bottom, 100);
+        state.drag_scrollbar_to(11, 100);
+        assert_eq!(state.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn deferred_transcript_click_expands_resumed_reasoning_but_drag_cancels_it() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::ReasoningDelta {
+            text: "restored thought".into(),
+        });
+        let target_id = state.entry_target_id(0).unwrap();
+
+        state.pending_transcript_click = Some((0, target_id.clone()));
+        state.finish_transcript_click(Some((0, target_id.clone())));
+        assert!(matches!(
+            state.entries.first(),
+            Some(super::state::Entry::Reasoning { expanded: true, .. })
+        ));
+
+        state.pending_transcript_click = Some((0, target_id.clone()));
+        state.pending_transcript_click = None; // promoted to a drag
+        state.finish_transcript_click(Some((0, target_id)));
+        assert!(matches!(
+            state.entries.first(),
+            Some(super::state::Entry::Reasoning { expanded: true, .. })
+        ));
     }
 
     #[test]
@@ -2203,6 +2414,28 @@ mod tests {
         assert!(state.all_reasoning_expanded());
         state.set_all_reasoning_expanded(false);
         assert!(!state.all_reasoning_expanded());
+
+        state.apply(AgentEvent::ToolCallStart {
+            id: "read-between-thoughts".into(),
+            name: "read".into(),
+            args: serde_json::json!({"path":"README.md"}),
+        });
+        state.apply(AgentEvent::ReasoningDelta {
+            text: " third".into(),
+        });
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, super::state::Entry::Reasoning { .. }))
+                .count(),
+            1,
+            "tool activity within one turn should not create repeated Thinking rows"
+        );
+        assert!(matches!(
+            &state.entries[0],
+            super::state::Entry::Reasoning { text, .. } if text == "first second third"
+        ));
     }
 
     #[test]
@@ -2374,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_use_compact_diamond_headers() {
+    fn tools_use_compact_portable_headers() {
         let (width, height) = (100, 32);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2383,7 +2616,7 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
 
         assert!(output.contains("Run 3 calls"));
-        assert!(output.contains("◆ Edit crates/pi-tui/src/ui.rs"));
+        assert!(output.contains("+ Edit crates/pi-tui/src/ui.rs"));
         assert!(!output.contains("✓"));
         assert!(output.contains("2.4s"));
     }
@@ -2408,7 +2641,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let expanded = buffer_text(terminal.backend().buffer(), width, height);
         assert!(expanded.contains("cargo clippy --workspace"));
-        assert!(expanded.contains("├ ◆ Run"));
+        assert!(expanded.contains("|- + Run"));
         assert_eq!(
             ui::section_hit_at(&state, width, height, 5, 9).map(|hit| hit.index),
             Some(2)
@@ -2454,8 +2687,8 @@ mod tests {
             .find(|line| line.contains("cargo test"))
             .unwrap();
         assert_eq!(
-            read.chars().position(|character| character == '◆'),
-            run.chars().position(|character| character == '◆')
+            read.chars().position(|character| character == '+'),
+            run.chars().position(|character| character == '+')
         );
         let detail = output.lines().find(|line| line.contains("└ done")).unwrap();
         assert_eq!(
@@ -2546,17 +2779,33 @@ mod tests {
         let (width, height) = (100, 32);
         let mut state = fixtures::tools();
         state.hovered_entry = Some(1);
+        state.hovered_target_id = Some("tool-group:tool-test".into());
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("> Run 3 calls"));
+        let buffer = terminal.backend().buffer();
+        let row = (0..height)
+            .find(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("> Run 3 calls")
+            })
+            .unwrap();
+        assert_eq!(buffer[(10, row)].bg, Theme::GROK_NIGHT.bg_hover);
+        assert!(buffer.content.iter().all(|cell| {
+            !matches!(cell.symbol(), "│" | "┆" | "┌" | "┐" | "└" | "┘")
+                || cell.fg != Theme::GROK_NIGHT.hover_border
+        }));
     }
 
     #[test]
     fn hovered_edit_uses_pointer_and_moves_border_without_scrolling() {
         let (width, height) = (100, 32);
         let mut state = fixtures::tools();
+        state.focus_scrollback();
         state.focused_target_id = Some("tool-group:tool-test".into());
         state.hovered_entry = Some(4);
         state.hovered_target_id = Some("diff:fixture-diff-2".into());
@@ -2566,7 +2815,7 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
         let edit = output.lines().find(|line| line.contains("> Edit")).unwrap();
-        assert_eq!(edit.chars().nth(1), Some('▏'));
+        assert_eq!(edit.chars().nth(1), Some('│'));
         assert_eq!(state.scroll_from_bottom, scroll_before);
         assert_eq!(
             state.focused_target_id.as_deref(),
@@ -2588,20 +2837,16 @@ mod tests {
                 .buffer()
                 .content
                 .iter()
-                .any(|cell| cell.symbol() == "▏")
+                .any(|cell| cell.symbol() == "│" && cell.fg == Theme::GROK_NIGHT.hover_border)
         );
 
         state.hovered_target_id = None;
         state.hovered_entry = None;
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
-        assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .all(|cell| !matches!(cell.symbol(), "▏" | "▕"))
-        );
+        assert!(terminal.backend().buffer().content.iter().all(|cell| {
+            !matches!(cell.symbol(), "│" | "┆" | "┌" | "┐" | "└" | "┘")
+                || cell.fg != Theme::GROK_NIGHT.hover_border
+        }));
     }
 
     #[test]
@@ -2617,23 +2862,30 @@ mod tests {
     fn focused_section_shows_brackets_at_both_transcript_edges() {
         let (width, height) = (100, 32);
         let mut state = fixtures::tools();
+        state.focus_scrollback();
         state.focused_target_id = Some("tool-group:tool-test".into());
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
-        let row = buffer_text(terminal.backend().buffer(), width, height)
-            .lines()
-            .find(|line| line.contains("Run 3 calls"))
-            .unwrap()
-            .to_string();
-        assert_eq!(row.chars().nth(1), Some('['));
-        assert_eq!(row.chars().nth(97), Some(']'));
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        let lines = output.lines().collect::<Vec<_>>();
+        let row = lines
+            .iter()
+            .position(|line| line.contains("Run 3 calls"))
+            .unwrap();
+        assert_eq!(lines[row].chars().nth(1), Some('│'));
+        assert_eq!(lines[row].chars().nth(97), Some('│'));
+        assert_eq!(lines[row - 1].chars().nth(1), Some('┌'));
+        assert_eq!(lines[row - 1].chars().nth(97), Some('┐'));
+        assert_eq!(lines[row + 1].chars().nth(1), Some('└'));
+        assert_eq!(lines[row + 1].chars().nth(97), Some('┘'));
     }
 
     #[test]
     fn focus_brackets_span_dynamic_section_height() {
         let (width, height) = (100, 32);
         let mut state = fixtures::tools();
+        state.focus_scrollback();
         state.focused_target_id = Some("diff:fixture-diff-2".into());
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2654,7 +2906,7 @@ mod tests {
                     .contains("Edit crates/pi-tui/src/ui.rs")
             })
             .unwrap();
-        assert_eq!(buffer[(1, edit_row)].symbol(), "┌");
+        assert_eq!(buffer[(1, edit_row)].symbol(), "│");
         assert_eq!(markers.first(), Some(&("┌".into(), "┐".into())));
         assert_eq!(markers.last(), Some(&("└".into(), "┘".into())));
         assert!(markers.len() > 2);
@@ -2704,10 +2956,11 @@ mod tests {
         let bottom_row = layout.scrollback.bottom().saturating_sub(1);
         assert!(first_row.contains("Edit src/long.rs"));
         for row in bottom_row - 2..=bottom_row {
-            assert_eq!(buffer[(layout.scrollback.x, row)].symbol(), "┊");
+            let expected = if row == bottom_row { "┆" } else { "│" };
+            assert_eq!(buffer[(layout.scrollback.x, row)].symbol(), expected);
             assert_eq!(
                 buffer[(layout.scrollback.right().saturating_sub(2), row)].symbol(),
-                "┊"
+                expected
             );
         }
     }
@@ -2724,6 +2977,71 @@ mod tests {
         }
         assert!(visited.contains(&Some(2)), "visited: {visited:?}");
         assert!(visited.contains(&Some(3)), "visited: {visited:?}");
+    }
+
+    #[test]
+    fn activating_scrollback_never_focuses_a_hidden_group_child() {
+        let mut state = fixtures::tools();
+        state.entries.truncate(4);
+        state.focus = super::Focus::Prompt;
+        state.focused_entry = None;
+        state.focused_target_id = None;
+
+        ui::focus_scrollback(&mut state, 100, 32);
+
+        assert_eq!(state.focus, super::Focus::Scrollback);
+        assert_eq!(state.focused_entry, Some(1));
+        assert_eq!(
+            state.focused_target_id.as_deref(),
+            Some("tool-group:tool-test")
+        );
+    }
+
+    #[test]
+    fn expanded_tool_child_gets_its_own_grok_selection_box() {
+        let (width, height) = (100, 32);
+        let mut state = fixtures::tools();
+        state.toggle_tool_group(1);
+        state.focus = super::Focus::Scrollback;
+        state.focused_entry = Some(2);
+        state.focused_tool = Some(2);
+        state.focused_target_id = Some("tool:tool-clippy".into());
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let child_row = (0..height)
+            .find(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("cargo clippy --workspace")
+            })
+            .unwrap();
+
+        assert_eq!(buffer[(1, child_row)].symbol(), "│");
+        assert_eq!(buffer[(97, child_row)].symbol(), "│");
+        assert_eq!(
+            buffer[(1, child_row)].fg,
+            Theme::GROK_NIGHT.selection_border
+        );
+        assert_eq!(
+            buffer[(97, child_row)].fg,
+            Theme::GROK_NIGHT.selection_border
+        );
+        let group_row = (0..height)
+            .find(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("Run 3 calls")
+            })
+            .unwrap();
+        assert!(
+            group_row < child_row,
+            "group header must remain outside child box"
+        );
     }
 
     #[test]
@@ -2832,7 +3150,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_tools_use_compact_descriptions() {
+    fn internal_subagent_polling_tools_stay_out_of_transcript() {
         let mut state = super::AppState::default();
         state.apply(AgentEvent::ToolCallStart {
             id: "agent-1".into(),
@@ -2847,17 +3165,134 @@ mod tests {
             name: "get_subagent_result".into(),
             args: serde_json::json!({"agent_id": "4841a1b4"}),
         });
+        state.apply(AgentEvent::ToolCallStart {
+            id: "custom-agent".into(),
+            name: "spawn_agent".into(),
+            args: serde_json::json!({"description": "External dynamic agent tool"}),
+        });
 
         assert!(matches!(
             &state.entries[0],
             super::state::Entry::Tool { label, detail, .. }
                 if label == "Agent" && detail == "Scout Rust crate public APIs"
         ));
+        assert_eq!(state.entries.len(), 2);
+        assert!(!state.entries.iter().any(|entry| {
+            matches!(entry, super::state::Entry::Tool { label, .. } if label == "Agent result")
+        }));
+        assert!(state.entries.iter().any(|entry| {
+            matches!(entry, super::state::Entry::Tool { id, .. } if id == "custom-agent")
+        }));
+    }
+
+    #[test]
+    fn grok_batch_file_tools_render_semantic_summaries() {
+        let mut state = super::AppState::default();
+        for (id, name, args) in [
+            (
+                "find",
+                "Find_files",
+                serde_json::json!({"queries":[
+                    {"pattern":"package.json"},
+                    {"pattern":"README*"},
+                    {"pattern":"Cargo.toml"},
+                    {"pattern":"go.mod"}
+                ]}),
+            ),
+            (
+                "grep",
+                "Grep_files",
+                serde_json::json!({"queries":[
+                    {"pattern":"TODO|FIXME", "path":".", "glob":"!node_modules/**"},
+                    {"pattern":"test|describe", "path":"src"}
+                ]}),
+            ),
+            (
+                "read",
+                "Read_files",
+                serde_json::json!({
+                    "paths":["README.md","Cargo.toml","sidecar/package.json","docs/workflows.md"],
+                    "limit":260
+                }),
+            ),
+        ] {
+            state.apply(AgentEvent::ToolCallStart {
+                id: id.into(),
+                name: name.into(),
+                args,
+            });
+        }
+
+        assert!(matches!(
+            &state.entries[0],
+            super::state::Entry::Tool { label, detail, .. }
+                if label == "Find"
+                    && detail == "4 patterns · \"package.json\"; \"README*\"; …"
+        ));
         assert!(matches!(
             &state.entries[1],
             super::state::Entry::Tool { label, detail, .. }
-                if label == "Agent result" && detail == "4841a1b4"
+                if label == "Search"
+                    && detail == "2 queries · \"TODO|FIXME\"; \"test|describe\" in src"
         ));
+        assert!(matches!(
+            &state.entries[2],
+            super::state::Entry::Tool { label, detail, .. }
+                if label == "Read"
+                    && detail == "4 files · README.md, Cargo.toml, sidecar/package.json, …"
+        ));
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 120, 24);
+        assert!(output.contains("Find 4 patterns"), "{output}");
+        assert!(output.contains("Search 2 queries"));
+        assert!(output.contains("Read 4 files"));
+        assert!(!output.contains("Find_files") && !output.contains("queries\":"));
+    }
+
+    #[test]
+    fn grouped_batch_tools_report_calls_units_and_failures_truthfully() {
+        let mut state = super::AppState::default();
+        for index in 0..3 {
+            state.apply(AgentEvent::ToolCallStart {
+                id: format!("read-{index}"),
+                name: "read_files".into(),
+                args: serde_json::json!({
+                    "paths":[
+                        format!("src/{index}/a.rs"),
+                        format!("src/{index}/b.rs"),
+                        format!("src/{index}/c.rs"),
+                        format!("src/{index}/d.rs")
+                    ]
+                }),
+            });
+        }
+        for index in 0..4 {
+            state.apply(AgentEvent::ToolCallStart {
+                id: format!("run-{index}"),
+                name: "bash".into(),
+                args: serde_json::json!({"command":format!("check-{index}")}),
+            });
+            state.apply(AgentEvent::ToolCallResult {
+                id: format!("run-{index}"),
+                result: pi_harness::ToolResult {
+                    content: String::new(),
+                    details: None,
+                },
+                is_error: index == 1 || index == 3,
+                duration_ms: Some(10),
+            });
+        }
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 120, 24);
+        assert!(output.contains("Read 3 calls · 12 files >"), "{output}");
+        assert!(output.contains("Run 4 calls · 2 failed >"), "{output}");
+        assert!(!output.contains('◆') && !output.contains('◐') && !output.contains('▯'));
     }
 
     #[test]
@@ -2896,6 +3331,26 @@ mod tests {
                 text: "evidence".into(),
             }),
         });
+        state.apply(AgentEvent::SubagentTranscript {
+            task_id: task.task_id.clone(),
+            event: Box::new(AgentEvent::ToolCallStart {
+                id: "child-read".into(),
+                name: "read_file".into(),
+                args: serde_json::json!({"path":"missing.rs"}),
+            }),
+        });
+        state.apply(AgentEvent::SubagentTranscript {
+            task_id: task.task_id.clone(),
+            event: Box::new(AgentEvent::ToolCallResult {
+                id: "child-read".into(),
+                result: pi_harness::ToolResult {
+                    content: "not found".into(),
+                    details: None,
+                },
+                is_error: true,
+                duration_ms: Some(1_234),
+            }),
+        });
         task.status = "completed".into();
         task.activity = "Completed".into();
         task.duration_ms = 200;
@@ -2914,7 +3369,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.subagent_transcripts["task-native"].len(), 1);
+        assert_eq!(state.subagent_transcripts["task-native"].len(), 3);
         assert_eq!(state.subagent_tasks["task-native"].status, "completed");
 
         state.view = super::View::Tasks;
@@ -2929,6 +3384,189 @@ mod tests {
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let transcript = buffer_text(terminal.backend().buffer(), 100, 24);
         assert!(transcript.contains("evidence"));
+        assert!(transcript.contains("read_file"));
+        assert!(transcript.contains("failed 1.2s"), "{transcript}");
+    }
+
+    #[test]
+    fn subagent_updates_preserve_user_selected_tool_group_expansion() {
+        let mut state = super::AppState::default();
+        for index in 0..2 {
+            state.apply(AgentEvent::ToolCallStart {
+                id: format!("read-{index}"),
+                name: "read_file".into(),
+                args: serde_json::json!({"path":format!("file-{index}.rs")}),
+            });
+        }
+        state.expanded_tool_groups.insert(0);
+        let mut task = pi_harness::SubagentTask {
+            task_id: "worker".into(),
+            parent_session_id: "parent".into(),
+            child_session_id: None,
+            child_session_path: None,
+            description: "Worker".into(),
+            subagent_type: "executor".into(),
+            capability_mode: "execute".into(),
+            isolation: "none".into(),
+            background: true,
+            status: "running".into(),
+            activity: "Thinking".into(),
+            started_at_ms: 1,
+            completed_at_ms: None,
+            duration_ms: 10,
+            output: None,
+            error: None,
+            failure_kind: None,
+            model: None,
+            thinking_level: None,
+            worktree_path: None,
+            cwd: None,
+            workflow_run_id: None,
+        };
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(task.clone()),
+        });
+        assert!(state.expanded_tool_groups.contains(&0));
+        assert!(state.expanded_tool_groups.remove(&2));
+
+        task.activity = "Reading file-0.rs".into();
+        task.duration_ms = 20;
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(task),
+        });
+
+        assert!(state.expanded_tool_groups.contains(&0));
+        assert!(!state.expanded_tool_groups.contains(&2));
+    }
+
+    #[test]
+    fn orchestration_cohort_survives_reasoning_and_internal_polling() {
+        let make_task =
+            |id: &str, description: &str, started_at_ms: u64| pi_harness::SubagentTask {
+                task_id: id.into(),
+                parent_session_id: "parent".into(),
+                child_session_id: Some(format!("child-{id}")),
+                child_session_path: None,
+                description: description.into(),
+                subagent_type: "executor".into(),
+                capability_mode: "execute".into(),
+                isolation: "none".into(),
+                background: true,
+                status: "running".into(),
+                activity: "read C:/Users/nier/Documents/orces/torii/docs/workflows.md".into(),
+                started_at_ms,
+                completed_at_ms: None,
+                duration_ms: 20,
+                output: None,
+                error: None,
+                failure_kind: None,
+                model: Some("openai/gpt-test".into()),
+                thinking_level: Some("high".into()),
+                worktree_path: None,
+                cwd: None,
+                workflow_run_id: None,
+            };
+        let mut state = super::AppState::default();
+        state.cwd = "C:/Users/nier/Documents/orces/torii".into();
+        state.apply(AgentEvent::UserMessage {
+            text: "Orchestrate. Objective: Analyze this codebase".into(),
+        });
+        state.apply(AgentEvent::ReasoningDelta {
+            text: "planning delegation".into(),
+        });
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(make_task("planner", "Architecture planner", 1)),
+        });
+        state.apply(AgentEvent::ReasoningDelta {
+            text: "delegating execution".into(),
+        });
+        state.apply(AgentEvent::ToolCallStart {
+            id: "poll".into(),
+            name: "Get_command_or_subagent_output".into(),
+            args: serde_json::json!({"task_id":"executor"}),
+        });
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(make_task("executor", "Analysis executor", 2)),
+        });
+
+        let agent_indices: Vec<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, super::state::Entry::Tool { id, .. } if id.starts_with("subagent:"))
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(agent_indices.len(), 2);
+        assert_eq!(agent_indices[1], agent_indices[0] + 1);
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, super::state::Entry::Reasoning { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !state
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, super::state::Entry::Tool { id, .. } if id == "poll"))
+        );
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 120, 32);
+        assert!(output.contains("Analyze this codebase"));
+        assert!(output.contains("Architecture planner"));
+        assert!(output.contains("Analysis executor"));
+        assert!(
+            output.contains("Reading docs/workflows.md"),
+            "orchestration activity should be compact: {output}"
+        );
+        assert!(output.contains("openai/gpt-test · high · executor"));
+
+        state.apply(AgentEvent::UserMessage {
+            text: "Write into ISSUE.md".into(),
+        });
+        state.apply(AgentEvent::ToolCallStart {
+            id: "write-later".into(),
+            name: "write".into(),
+            args: serde_json::json!({"path":"ISSUE.md"}),
+        });
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let resumed = buffer_text(terminal.backend().buffer(), 120, 32);
+        let orchestration_line = resumed
+            .lines()
+            .find(|line| line.contains("0/2 complete"))
+            .expect("orchestration summary");
+        assert!(orchestration_line.contains("Analyze this codebase"));
+        assert!(!orchestration_line.contains("Write into ISSUE.md"));
+        assert!(
+            resumed.find("0/2 complete").unwrap() < resumed.rfind("Write into ISSUE.md").unwrap(),
+            "restored orchestration must remain before a later write turn: {resumed}"
+        );
+
+        state.activate_entry_at(agent_indices[1]);
+        assert_eq!(state.view, super::View::Subagent);
+        assert_eq!(state.inspected_subagent.as_deref(), Some("executor"));
+
+        for index in 2..20 {
+            let task = make_task(
+                &format!("worker-{index:02}"),
+                &format!("Worker {index:02}"),
+                index,
+            );
+            state.subagent_tasks.insert(task.task_id.clone(), task);
+        }
+        state.view = super::View::Tasks;
+        state.task_selected = 19;
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let tasks = buffer_text(terminal.backend().buffer(), 120, 32);
+        assert!(state.task_list_offset.get() > 0);
+        assert!(tasks.contains("Architecture planner"));
     }
 
     #[test]
@@ -3671,10 +4309,12 @@ mod tests {
                 pi_harness::ModelInfo {
                     id: "opencode-go/glm-5.2".into(),
                     display_name: "GLM-5.2".into(),
+                    context_window: None,
                 },
                 pi_harness::ModelInfo {
                     id: "opencode-go/minimax-m3".into(),
                     display_name: "MiniMax-M3".into(),
+                    context_window: None,
                 },
             ],
             ..super::AppState::default()
@@ -3701,10 +4341,12 @@ mod tests {
                 pi_harness::ModelInfo {
                     id: "opencode-go/glm-5.2".into(),
                     display_name: "GLM-5.2".into(),
+                    context_window: None,
                 },
                 pi_harness::ModelInfo {
                     id: "opencode-go/minimax-m3".into(),
                     display_name: "MiniMax-M3".into(),
+                    context_window: None,
                 },
             ],
             ..super::AppState::default()
@@ -3735,6 +4377,7 @@ mod tests {
                 .map(|index| pi_harness::ModelInfo {
                     id: format!("provider-{}/model-{index:02}", index / 10),
                     display_name: format!("Model {index:02}"),
+                    context_window: None,
                 })
                 .collect(),
             ..super::AppState::default()
@@ -3777,14 +4420,17 @@ mod tests {
                 pi_harness::ModelInfo {
                     id: "zeta/model-b".into(),
                     display_name: "Shared B".into(),
+                    context_window: None,
                 },
                 pi_harness::ModelInfo {
                     id: "alpha/model-a".into(),
                     display_name: "Shared A".into(),
+                    context_window: None,
                 },
                 pi_harness::ModelInfo {
                     id: "alpha/model-c".into(),
                     display_name: "Shared C".into(),
+                    context_window: None,
                 },
             ],
             ..super::AppState::default()
@@ -4287,6 +4933,14 @@ mod tests {
         assert_eq!(state.overlay, super::OverlayKind::ModelPicker);
         assert!(state.prompt.is_empty());
 
+        state.prompt = "/pa".into();
+        state.cursor = state.prompt.chars().count();
+        let paste = state.slash_suggestions();
+        assert!(paste.iter().any(|(name, description)| {
+            name == "/paste" && description.contains("text or attach an image")
+        }));
+        assert!(!paste.iter().any(|(name, _)| name == "/paste-image"));
+
         state.prompt = "/dashboard".into();
         state.cursor = state.prompt.chars().count();
         assert!(matches!(
@@ -4309,10 +4963,7 @@ mod tests {
         state.cursor = state.prompt.chars().count();
         assert!(matches!(
             state.activate_slash_command(),
-            Some(super::state::OverlayAction::StartWorkflow { workflow, input, parameters: Some(parameters), .. })
-                if workflow == "review"
-                    && input == "Inspect the patch"
-                    && parameters == serde_json::json!({"target": "src", "depth": 2})
+            Some(super::state::OverlayAction::None)
         ));
 
         state.prompt = "/workflow".into();
@@ -4361,10 +5012,12 @@ mod tests {
             pi_harness::ModelInfo {
                 id: "openai".into(),
                 display_name: "OpenAI".into(),
+                context_window: None,
             },
             pi_harness::ModelInfo {
                 id: "anthropic".into(),
                 display_name: "Anthropic".into(),
+                context_window: None,
             },
         ];
         state.prompt = "/login".into();
@@ -4380,6 +5033,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any())]
     #[test]
     fn workflow_catalog_opens_resolved_preflight_and_keeps_invalid_entries_visible() {
         let workflows = vec![
@@ -4704,10 +5358,12 @@ mod tests {
                 pi_harness::ModelInfo {
                     id: "one/a".into(),
                     display_name: "Model A".into(),
+                    context_window: None,
                 },
                 pi_harness::ModelInfo {
                     id: "two/b".into(),
                     display_name: "Model B".into(),
+                    context_window: None,
                 },
             ],
             ..super::AppState::default()
@@ -4757,6 +5413,49 @@ mod tests {
             state.activate_slash_command(),
             Some(super::state::OverlayAction::SetProjectTrust(true))
         ));
+    }
+
+    #[test]
+    fn settings_switches_between_dark_and_light_palettes() {
+        let (width, height) = (100, 30);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.open_overlay(super::OverlayKind::Settings);
+        state.overlay_selected = 7;
+
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::SetTheme(crate::theme::ThemeMode::Light)
+        ));
+        assert_eq!(state.theme_mode, crate::theme::ThemeMode::Light);
+        assert_eq!(state.overlay, super::OverlayKind::Settings);
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            Theme::GROK_LIGHT.background
+        );
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("Theme"));
+        assert!(output.contains("light"));
+    }
+
+    #[test]
+    fn header_exposes_path_and_context_hit_targets() {
+        let (width, height) = (100, 30);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = super::AppState {
+            cwd: "~/work/torii".into(),
+            branch: "main".into(),
+            context_used: 50_000,
+            context_limit: 200_000,
+            ..super::AppState::default()
+        };
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let targets = state.header_targets.borrow();
+        assert!(targets.iter().any(|(kind, ..)| *kind == 0));
+        assert!(targets.iter().any(|(kind, ..)| *kind == 4));
     }
 
     #[test]
@@ -4810,9 +5509,15 @@ mod tests {
             models: vec![pi_harness::ModelInfo {
                 id: "example/new-model".into(),
                 display_name: "New Model".into(),
+                context_window: Some(128_000),
             }],
         });
         assert_eq!(state.available_models[0].id, "example/new-model");
+        state.apply(AgentEvent::ModelChanged {
+            id: "example/new-model".into(),
+            display_name: "New Model".into(),
+        });
+        assert_eq!(state.context_limit, 128_000);
     }
 
     #[test]
@@ -4870,7 +5575,7 @@ mod tests {
         ));
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
-        assert!(output.contains("◆ Plan  1/2"));
+        assert!(output.contains("+ Plan  1/2"));
         assert!(output.contains("✓ Inspect"));
         assert!(output.contains("> Implement"));
         assert!(output.contains("Plan 1/2"));

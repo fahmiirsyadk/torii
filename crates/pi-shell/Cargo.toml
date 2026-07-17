@@ -15,4 +15,11 @@ pi-harness = { path = "../pi-harness" }
 pi-harness-pi = { path = "../pi-harness-pi" }
 pi-tui = { path = "../pi-tui" }
 serde_json.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+fs2.workspace = true
+sha2.workspace = true
+windows-sys.workspace = true

@@ -1,5 +1,3 @@
-import type { WorkflowAttemptObservabilitySnapshot, WorkflowBudgetSnapshot, WorkflowPreview, WorkflowProviderStateSnapshot } from "./workflows/types.ts";
-
 export type SidecarCommand =
   | { type: "health" }
   | { type: "list_models"; request_id: string }
@@ -45,6 +43,10 @@ export type SidecarCommand =
       type: "open_session";
       request_id: string;
       cwd?: string;
+      model?: string;
+      parent_session_path?: string;
+      thinking_level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+      tools?: string[];
       persistence?:
         | { mode: "persistent" }
         | { mode: "continue" }
@@ -57,14 +59,9 @@ export type SidecarCommand =
   | { type: "cycle_thinking"; request_id: string; session_id: string }
   | { type: "set_thinking"; request_id: string; session_id: string; level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | { type: "clear_queue"; request_id: string; session_id: string }
+  | { type: "host_result"; request_id: string; session_id: string; call_id: string; result: { content: string; details?: unknown }; is_error: boolean }
   | { type: "bash"; request_id: string; session_id: string; command: string; exclude_from_context?: boolean }
   | { type: "cancel"; request_id: string; session_id: string }
-  | { type: "kill_task"; request_id: string; session_id: string; task_id: string }
-  | { type: "workflow_control"; request_id: string; session_id: string; run_id: string; action: "approve" | "reject" | "cancel" | "retry"; step_id?: string }
-  | { type: "workflow_start"; request_id: string; session_id: string; workflow: string; input: string; parameters?: Record<string, unknown>; expected_definition_hash?: string }
-  | { type: "workflow_catalog"; request_id: string; session_id: string }
-  | { type: "workflow_preview"; request_id: string; session_id: string; workflow: string }
-  | { type: "workflow_artifact_read"; request_id: string; session_id: string; run_id: string; artifact_id: string }
   | { type: "close_session"; request_id: string; session_id: string }
   | {
       type: "permission";
@@ -81,7 +78,7 @@ export type SidecarMessage =
       request_id: string;
       session_id?: string;
       history?: AgentEvent[];
-      models?: Array<{ id: string; display_name: string }>;
+      models?: Array<{ id: string; display_name: string; context_window?: number }>;
       files?: string[];
       resources?: {
         commands: Array<{ name: string; description: string; source: string }>;
@@ -151,6 +148,7 @@ export type AgentEvent =
   | { type: "thinking_changed"; level: string }
   | { type: "thinking_options"; levels: string[] }
   | { type: "queue_changed"; steering: string[]; follow_up: string[] }
+  | { type: "host_call"; id: string; name: string; args: unknown }
   | { type: "oauth_request"; id: string; kind: "auth" | "device_code" | "prompt" | "select"; message?: string; url?: string; user_code?: string; verification_uri?: string; interval_seconds?: number; expires_in_seconds?: number; options?: Array<{ id: string; label: string }> }
   | { type: "oauth_complete"; provider: string }
   | { type: "text_delta"; text: string }
@@ -232,7 +230,7 @@ export interface WorkflowStepSnapshot {
   output_contract?: string;
   condition?: string;
   children: WorkflowStepSnapshot[];
-  observability?: WorkflowAttemptObservabilitySnapshot;
+  observability?: unknown;
 }
 
 export interface WorkflowRunSnapshot {
@@ -244,8 +242,8 @@ export interface WorkflowRunSnapshot {
   completed_steps: number;
   total_steps: number;
   artifact_ids: string[];
-  budget?: WorkflowBudgetSnapshot;
-  provider_states: WorkflowProviderStateSnapshot[];
+  budget?: unknown;
+  provider_states: unknown[];
   steps: WorkflowStepSnapshot[];
   created_at_ms: number;
   updated_at_ms: number;
@@ -270,6 +268,8 @@ export interface WorkflowCatalogEntry {
   valid: boolean;
   error?: string;
 }
+
+export type WorkflowPreview = Record<string, unknown>;
 
 export function writeMessage(message: SidecarMessage): void {
   process.stdout.write(`${JSON.stringify(message)}\n`);

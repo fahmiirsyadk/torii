@@ -107,6 +107,8 @@ pub fn render(
     frame: &mut Frame<'_>,
     spec: &PickerSpec<'_>,
     selected: usize,
+    hovered: Option<usize>,
+    close_hovered: bool,
     theme: Theme,
 ) -> PickerLayout {
     let geometry = layout(frame.area(), spec, selected);
@@ -115,7 +117,7 @@ pub fn render(
         .buffer_mut()
         .set_style(frame_area, Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Clear, geometry.modal);
-    let block = modal_block(spec.title, theme);
+    let block = modal_block(spec.title, close_hovered, theme);
     frame.render_widget(block, geometry.modal);
 
     let mut y = geometry.modal.y + 1;
@@ -187,6 +189,7 @@ pub fn render(
     for (offset, row) in visible.iter().enumerate() {
         let row_y = geometry.rows.y + offset as u16;
         let selected_here = row.item_index == Some(selected);
+        let hovered_here = row.item_index == hovered;
         if row.header {
             let available = usize::from(geometry.rows.width).saturating_sub(row.label.width() + 5);
             frame.render_widget(
@@ -207,14 +210,14 @@ pub fn render(
             );
             continue;
         }
-        let row_bg = if selected_here {
+        let row_bg = if selected_here || hovered_here {
             theme.bg_highlight
         } else {
             theme.background
         };
         let primary = if row.disabled {
             theme.subtle
-        } else if selected_here {
+        } else if selected_here || hovered_here {
             theme.foreground
         } else {
             theme.text_secondary
@@ -247,14 +250,13 @@ pub fn render(
         let mut spans = vec![
             Span::styled(
                 left,
-                Style::default()
-                    .fg(primary)
-                    .bg(row_bg)
-                    .add_modifier(if selected_here {
+                Style::default().fg(primary).bg(row_bg).add_modifier(
+                    if selected_here || hovered_here {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
-                    }),
+                    },
+                ),
             ),
             Span::styled(description, Style::default().fg(theme.muted).bg(row_bg)),
             Span::styled(" ".repeat(gap), Style::default().bg(row_bg)),
@@ -303,7 +305,7 @@ pub fn render(
     geometry
 }
 
-pub fn modal_block(title: &str, theme: Theme) -> Block<'static> {
+pub fn modal_block(title: &str, close_hovered: bool, theme: Theme) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -318,8 +320,21 @@ pub fn modal_block(title: &str, theme: Theme) -> Block<'static> {
             .alignment(Alignment::Left),
         )
         .title(
-            Line::from(Span::styled(" [×] ", Style::default().fg(theme.muted)))
-                .alignment(Alignment::Right),
+            Line::from(Span::styled(
+                " [×] ",
+                Style::default()
+                    .fg(if close_hovered {
+                        theme.error
+                    } else {
+                        theme.muted
+                    })
+                    .add_modifier(if close_hovered {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ))
+            .alignment(Alignment::Right),
         )
 }
 

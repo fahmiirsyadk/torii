@@ -1,0 +1,29 @@
+name: focused-review
+description: Parallel read-only review with an explicit synthesis dependency.
+steps:
+  - type: agent
+    id: scope
+    role: explore
+    capability: read-only
+    prompt: Identify the changed surface and its invariants.
+
+  - type: agent
+    id: correctness
+    role: explore
+    capability: read-only
+    depends_on: [scope]
+    prompt: Review correctness and regressions.
+
+  - type: agent
+    id: tests
+    role: explore
+    capability: read-only
+    depends_on: [scope]
+    prompt: Review verification evidence and missing tests.
+
+  - type: agent
+    id: synthesis
+    role: explore
+    capability: read-only
+    depends_on: [correctness, tests]
+    prompt: Reconcile and prioritize the findings.

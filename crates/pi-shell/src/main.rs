@@ -11,6 +11,8 @@ use std::{
 };
 
 pub mod supervisor;
+pub mod task;
+pub mod workflow;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
         let (commands, mut submitted) = tokio::sync::mpsc::unbounded_channel();
         let command_harness = Arc::clone(&harness);
         let supervisor = Arc::new(supervisor::SessionSupervisor::new(Arc::clone(&harness)));
+        supervisor
+            .set_project_trusted(settings.project_trusted)
+            .await;
         let current_path = sessions
             .iter()
             .find(|candidate| candidate.current)
@@ -250,47 +255,75 @@ async fn main() -> Result<()> {
                         let _ = command_harness.clear_queue(&command_session).await;
                     }
                     pi_tui::UiCommand::KillTask(task_id) => {
-                        let _ = command_harness.kill_task(&command_session, task_id).await;
+                        let _ = command_supervisor
+                            .kill_task(&command_session, &task_id)
+                            .await;
                     }
                     pi_tui::UiCommand::WorkflowControl {
                         run_id,
                         action,
                         step_id,
                     } => {
-                        let _ = command_harness
-                            .control_workflow(&command_session, run_id, action, step_id)
+                        let _ = command_supervisor
+                            .workflow_command(
+                                &command_session,
+                                "workflow_control",
+                                serde_json::json!({
+                                    "run_id": run_id,
+                                    "action": action,
+                                    "step_id": step_id,
+                                }),
+                            )
                             .await;
                     }
                     pi_tui::UiCommand::StartWorkflow {
                         workflow,
                         input,
-                        parameters,
                         expected_definition_hash,
                     } => {
-                        let _ = command_harness
-                            .start_workflow(
+                        let _ = command_supervisor
+                            .workflow_command(
                                 &command_session,
-                                workflow,
-                                input,
-                                parameters,
-                                expected_definition_hash,
+                                "workflow_start",
+                                serde_json::json!({
+                                    "workflow": workflow,
+                                    "input": input,
+                                    "expected_definition_hash": expected_definition_hash,
+                                }),
                             )
                             .await;
                     }
                     pi_tui::UiCommand::LoadWorkflowCatalog => {
-                        let _ = command_harness.workflow_catalog(&command_session).await;
+                        let _ = command_supervisor
+                            .workflow_command(
+                                &command_session,
+                                "workflow_catalog",
+                                serde_json::json!({}),
+                            )
+                            .await;
                     }
                     pi_tui::UiCommand::PreviewWorkflow(workflow) => {
-                        let _ = command_harness
-                            .preview_workflow(&command_session, workflow)
+                        let _ = command_supervisor
+                            .workflow_command(
+                                &command_session,
+                                "workflow_preview",
+                                serde_json::json!({ "workflow": workflow }),
+                            )
                             .await;
                     }
                     pi_tui::UiCommand::ReadWorkflowArtifact {
                         run_id,
                         artifact_id,
                     } => {
-                        let _ = command_harness
-                            .read_workflow_artifact(&command_session, run_id, artifact_id)
+                        let _ = command_supervisor
+                            .workflow_command(
+                                &command_session,
+                                "workflow_artifact_read",
+                                serde_json::json!({
+                                    "run_id": run_id,
+                                    "artifact_id": artifact_id,
+                                }),
+                            )
                             .await;
                     }
                     pi_tui::UiCommand::ExecuteBash {
@@ -314,6 +347,7 @@ async fn main() -> Result<()> {
                             .await;
                     }
                     pi_tui::UiCommand::SetProjectTrust(trusted) => {
+                        command_supervisor.set_project_trusted(trusted).await;
                         let _ = command_harness
                             .set_project_trust(&command_session, trusted)
                             .await;

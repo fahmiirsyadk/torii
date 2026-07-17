@@ -21,6 +21,9 @@ pub struct SessionConfig {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub persistence: SessionPersistence,
+    pub parent_session_path: Option<String>,
+    pub thinking_level: Option<String>,
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -100,6 +103,11 @@ pub enum AgentEvent {
     QueueChanged {
         steering: Vec<String>,
         follow_up: Vec<String>,
+    },
+    HostCall {
+        id: String,
+        name: String,
+        args: Value,
     },
     ResourcesChanged {
         resources: RuntimeResources,
@@ -273,6 +281,41 @@ pub struct WorkflowRunSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowArtifactSnapshot {
+    pub run_id: String,
+    pub artifact_id: String,
+    pub step_id: String,
+    pub summary: String,
+    pub producer_role: String,
+    pub producer_model: Option<String>,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowCatalogEntry {
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowPreviewStep {
+    pub id: String,
+    pub r#type: String,
+    pub description: Option<String>,
+    pub role: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub capability: Option<String>,
+    pub reports: Option<String>,
+    #[serde(default)]
+    pub children: Vec<WorkflowPreviewStep>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowBudgetSnapshot {
     pub max_agent_attempts: Option<u64>,
     pub max_prompt_tokens: Option<u64>,
@@ -286,16 +329,6 @@ pub struct WorkflowBudgetSnapshot {
     pub reserved_output_tokens: u64,
     pub reserved_cache_write_tokens: u64,
     pub unknown_usage_attempts: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowProviderPolicySnapshot {
-    pub provider: String,
-    pub max_concurrency: Option<u64>,
-    pub max_starts: Option<u64>,
-    pub window_ms: Option<u64>,
-    pub failure_threshold: Option<u64>,
-    pub cooldown_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,85 +378,6 @@ pub struct WorkflowAttemptObservability {
     pub provider_failure_kind: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowArtifactSnapshot {
-    pub run_id: String,
-    pub artifact_id: String,
-    pub step_id: String,
-    pub summary: String,
-    pub producer_role: String,
-    pub producer_model: Option<String>,
-    pub content: String,
-    pub truncated: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowCatalogEntry {
-    pub name: String,
-    pub description: Option<String>,
-    pub source: String,
-    pub valid: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct WorkflowPreviewStep {
-    pub id: String,
-    pub r#type: String,
-    pub description: Option<String>,
-    pub role: Option<String>,
-    pub agent: Option<String>,
-    pub model: Option<String>,
-    pub model_route: Option<String>,
-    pub model_candidates: Option<Vec<String>>,
-    pub thinking: Option<String>,
-    pub capability: Option<String>,
-    pub isolation: Option<String>,
-    pub session: Option<String>,
-    pub session_key: Option<String>,
-    #[serde(default)]
-    pub tools: Vec<String>,
-    #[serde(default)]
-    pub forced_read_only: bool,
-    pub reports: Option<String>,
-    pub timeout_ms: Option<u64>,
-    pub max_attempts: Option<usize>,
-    pub retry_backoff_ms: Option<u64>,
-    #[serde(default)]
-    pub retry_on: Vec<String>,
-    pub output_contract: Option<String>,
-    pub condition: Option<String>,
-    pub guardrails: Option<WorkflowGuardrailsPreview>,
-    pub external_effects: Option<WorkflowExternalEffectsPreview>,
-    pub source: Option<String>,
-    #[serde(default)]
-    pub parameter_scope: Option<String>,
-    #[serde(default)]
-    pub parameter_keys: Vec<String>,
-    #[serde(default)]
-    pub children: Vec<WorkflowPreviewStep>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowExternalEffectsPreview {
-    pub approved_by: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct WorkflowGuardrailsPreview {
-    pub max_prompt_bytes: Option<u64>,
-    pub max_artifact_bytes: Option<u64>,
-    pub max_artifacts: Option<usize>,
-    pub max_prompt_tokens: Option<u64>,
-    pub max_output_tokens: Option<u64>,
-    pub max_cache_write_tokens: Option<u64>,
-    pub min_cache_hit_rate: Option<f64>,
-    pub allowed_models: Option<Vec<String>>,
-    pub allowed_tools: Option<Vec<String>>,
-    pub require_stable_cache_prefix: bool,
-    pub on_violation: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowPreview {
     pub name: String,
@@ -431,48 +385,9 @@ pub struct WorkflowPreview {
     pub description: Option<String>,
     pub definition_hash: String,
     pub resolved_at_ms: u64,
-    pub budget: Option<WorkflowBudgetSnapshot>,
-    #[serde(default)]
-    pub provider_policies: Vec<WorkflowProviderPolicySnapshot>,
-    #[serde(default)]
-    pub contracts: Vec<WorkflowContractPreview>,
-    #[serde(default)]
-    pub parameters: Option<WorkflowParameterPreview>,
-    #[serde(default)]
-    pub components: Vec<WorkflowComponentPreview>,
     pub steps: Vec<WorkflowPreviewStep>,
     #[serde(default)]
     pub readiness: WorkflowReadiness,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowContractPreview {
-    pub name: String,
-    pub description: Option<String>,
-    pub max_bytes: u64,
-    pub schema_hash: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct WorkflowParameterPreview {
-    pub description: Option<String>,
-    pub max_bytes: u64,
-    pub schema_hash: String,
-    #[serde(default)]
-    pub required: Vec<String>,
-    #[serde(default)]
-    pub defaults: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct WorkflowComponentPreview {
-    pub invocation: String,
-    pub workflow: String,
-    pub version: Option<Value>,
-    pub definition_hash: String,
-    pub parameter_binding_hash: Option<String>,
-    #[serde(default)]
-    pub parameter_bindings: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -531,6 +446,8 @@ pub struct MessageImage {
 pub struct ModelInfo {
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -652,30 +569,6 @@ pub trait AgentHarness: Send + Sync {
         exclude_from_context: bool,
     ) -> Result<()>;
     async fn cancel(&self, id: &SessionId) -> Result<()>;
-    async fn kill_task(&self, id: &SessionId, task_id: String) -> Result<()>;
-    async fn control_workflow(
-        &self,
-        id: &SessionId,
-        run_id: String,
-        action: String,
-        step_id: Option<String>,
-    ) -> Result<()>;
-    async fn start_workflow(
-        &self,
-        id: &SessionId,
-        workflow: String,
-        input: String,
-        parameters: Option<Value>,
-        expected_definition_hash: Option<String>,
-    ) -> Result<()>;
-    async fn workflow_catalog(&self, id: &SessionId) -> Result<()>;
-    async fn preview_workflow(&self, id: &SessionId, workflow: String) -> Result<()>;
-    async fn read_workflow_artifact(
-        &self,
-        id: &SessionId,
-        run_id: String,
-        artifact_id: String,
-    ) -> Result<()>;
     async fn close_session(&self, id: &SessionId) -> Result<()> {
         self.cancel(id).await
     }
@@ -684,6 +577,13 @@ pub trait AgentHarness: Send + Sync {
         id: &SessionId,
         request_id: String,
         decision: PermissionDecision,
+    ) -> Result<()>;
+    async fn reply_host_call(
+        &self,
+        id: &SessionId,
+        call_id: String,
+        result: ToolResult,
+        is_error: bool,
     ) -> Result<()>;
     async fn set_model(&self, id: &SessionId, model: String) -> Result<()>;
     async fn list_models(&self) -> Result<Vec<ModelInfo>>;
@@ -829,48 +729,6 @@ impl AgentHarness for MockHarness {
         Ok(())
     }
 
-    async fn kill_task(&self, _id: &SessionId, _task_id: String) -> Result<()> {
-        Ok(())
-    }
-
-    async fn control_workflow(
-        &self,
-        _id: &SessionId,
-        _run_id: String,
-        _action: String,
-        _step_id: Option<String>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn start_workflow(
-        &self,
-        _id: &SessionId,
-        _workflow: String,
-        _input: String,
-        _parameters: Option<Value>,
-        _expected_definition_hash: Option<String>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn workflow_catalog(&self, _id: &SessionId) -> Result<()> {
-        Ok(())
-    }
-
-    async fn preview_workflow(&self, _id: &SessionId, _workflow: String) -> Result<()> {
-        Ok(())
-    }
-
-    async fn read_workflow_artifact(
-        &self,
-        _id: &SessionId,
-        _run_id: String,
-        _artifact_id: String,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     async fn deliver_message(
         &self,
         id: &SessionId,
@@ -933,6 +791,16 @@ impl AgentHarness for MockHarness {
         Ok(())
     }
 
+    async fn reply_host_call(
+        &self,
+        _id: &SessionId,
+        _call_id: String,
+        _result: ToolResult,
+        _is_error: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn set_model(&self, _id: &SessionId, _model: String) -> Result<()> {
         Ok(())
     }
@@ -941,6 +809,7 @@ impl AgentHarness for MockHarness {
         Ok(vec![ModelInfo {
             id: "mock".into(),
             display_name: "Mock model".into(),
+            context_window: Some(200_000),
         }])
     }
     async fn list_files(&self, _id: &SessionId) -> Result<Vec<String>> {

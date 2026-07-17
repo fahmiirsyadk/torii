@@ -9,7 +9,15 @@ use std::{
     time::Instant,
 };
 
+use crate::theme::{Theme, ThemeMode};
+
 pub type TranscriptHitRegion = (String, usize, u16, u16, bool);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollDrag {
+    pub start_row: u16,
+    pub start_from_bottom: usize,
+}
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/dashboard",
@@ -28,7 +36,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/thinking",
     "/context",
     "/reload",
-    "/paste-image",
+    "/paste",
     "/scoped-models",
     "/subagent-model",
     "/trust",
@@ -59,7 +67,8 @@ pub enum View {
     Transcript,
 }
 
-fn append_workflow_preview_step(
+#[cfg(any())]
+fn append_workflow_preview_step_legacy(
     lines: &mut Vec<String>,
     step: &WorkflowPreviewStep,
     number: &str,
@@ -218,6 +227,39 @@ fn append_workflow_preview_step(
     }
 }
 
+fn append_workflow_preview_step(
+    lines: &mut Vec<String>,
+    step: &WorkflowPreviewStep,
+    number: &str,
+    indent: &str,
+) {
+    lines.push(format!("{indent}{number}. {} [{}]", step.id, step.r#type));
+    if step.r#type == "checkpoint" {
+        lines.push(format!(
+            "{indent}   {}",
+            step.description.as_deref().unwrap_or("Manual approval")
+        ));
+        return;
+    }
+    lines.push(format!(
+        "{indent}   role={} · model={} · capability={}",
+        step.role.as_deref().unwrap_or("default"),
+        step.model.as_deref().unwrap_or("parent"),
+        step.capability.as_deref().unwrap_or("read-only"),
+    ));
+    lines.push(format!(
+        "{indent}   thinking={} · depends_on={}",
+        step.thinking.as_deref().unwrap_or("default"),
+        step.reports
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("none"),
+    ));
+    for (index, child) in step.children.iter().enumerate() {
+        append_workflow_preview_step(lines, child, &format!("{number}.{}", index + 1), "  ");
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayKind {
     None,
@@ -280,7 +322,6 @@ pub enum OverlayAction {
     StartWorkflow {
         workflow: String,
         input: String,
-        parameters: Option<serde_json::Value>,
         expected_definition_hash: Option<String>,
     },
     Quit,
@@ -323,6 +364,7 @@ pub enum OverlayAction {
     },
     CycleThinking,
     SetThinking(String),
+    SetTheme(ThemeMode),
     ReloadResources,
     SetRuntimeSetting {
         key: String,
@@ -562,12 +604,17 @@ pub struct AppState {
     pub inspected_subagent: Option<String>,
     pub viewed_entry: Option<usize>,
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub task_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub task_list_offset: Cell<usize>,
+    pub header_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
+    pub header_hover: Option<u8>,
     pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
     pub composer_hover: Option<u8>,
     pub paste_hover: Option<u64>,
     pub paste_targets: RefCell<Vec<(u64, u16, u16, u16)>>,
     pub branch: String,
     pub cwd: String,
+    pub theme_mode: ThemeMode,
     pub context_used: u64,
     pub context_limit: u64,
     pub tasks_complete: usize,
@@ -635,6 +682,8 @@ pub struct AppState {
     pub overlay_stack: Vec<OverlaySnapshot>,
     pub overlay_query: String,
     pub overlay_selected: usize,
+    pub overlay_hovered: Option<usize>,
+    pub overlay_close_hovered: bool,
     pub pending_permission: Option<PendingPermission>,
     pub pending_oauth: Option<PendingOauth>,
     pub available_models: Vec<ModelInfo>,
@@ -643,6 +692,7 @@ pub struct AppState {
     pub runtime_sessions: HashMap<String, pi_harness::RuntimeSessionInfo>,
     pub subagent_tasks: HashMap<String, SubagentTask>,
     pub subagent_transcripts: HashMap<String, Vec<AgentEvent>>,
+    pub active_subagent_task_ids: Vec<String>,
     pub workflow_runs: HashMap<String, WorkflowRunSnapshot>,
     pub workflow_catalog: Vec<WorkflowCatalogEntry>,
     pub workflow_preview: Option<WorkflowPreview>,
@@ -670,33 +720,24 @@ pub struct AppState {
     pub hovered_entry: Option<usize>,
     pub hovered_target_id: Option<String>,
     pub transcript_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub transcript_scrollbar_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub transcript_hit_regions: RefCell<Vec<TranscriptHitRegion>>,
+    pub scroll_drag: Option<ScrollDrag>,
+    pub scrollbar_dragging: bool,
+    pub pending_transcript_click: Option<(usize, String)>,
 }
 
-fn parse_workflow_start_argument(
-    value: &str,
-) -> Result<(String, String, Option<serde_json::Value>), ()> {
+fn parse_workflow_start_argument(value: &str) -> Result<(String, String), ()> {
     let mut parts = value.splitn(2, char::is_whitespace);
     let workflow = parts.next().unwrap_or_default().trim();
     let remainder = parts.next().unwrap_or_default().trim();
     if workflow.is_empty() || remainder.is_empty() {
         return Err(());
     }
-    let Some(json_source) = remainder.strip_prefix("--params ").map(str::trim_start) else {
-        return Ok((workflow.into(), remainder.into(), None));
-    };
-    let mut values = serde_json::Deserializer::from_str(json_source).into_iter();
-    let parameters: serde_json::Value = values.next().ok_or(())?.map_err(|_| ())?;
-    if !parameters.is_object() {
+    if remainder.starts_with("--params ") {
         return Err(());
     }
-    let task = json_source[values.byte_offset()..]
-        .trim_start()
-        .strip_prefix("--")
-        .map(str::trim)
-        .filter(|task| !task.is_empty())
-        .ok_or(())?;
-    Ok((workflow.into(), task.into(), Some(parameters)))
+    Ok((workflow.into(), remainder.into()))
 }
 
 impl Default for AppState {
@@ -709,12 +750,17 @@ impl Default for AppState {
             inspected_subagent: None,
             viewed_entry: None,
             dashboard_list_rect: Cell::new(None),
+            task_list_rect: Cell::new(None),
+            task_list_offset: Cell::new(0),
+            header_targets: RefCell::new(Vec::new()),
+            header_hover: None,
             composer_targets: RefCell::new(Vec::new()),
             composer_hover: None,
             paste_hover: None,
             paste_targets: RefCell::new(Vec::new()),
             branch: "torii".into(),
             cwd: "~/dev/torii".into(),
+            theme_mode: ThemeMode::Dark,
             context_used: 0,
             context_limit: 200_000,
             tasks_complete: 0,
@@ -771,17 +817,21 @@ impl Default for AppState {
             overlay_stack: Vec::new(),
             overlay_query: String::new(),
             overlay_selected: 0,
+            overlay_hovered: None,
+            overlay_close_hovered: false,
             pending_permission: None,
             pending_oauth: None,
             available_models: vec![ModelInfo {
                 id: "mock".into(),
                 display_name: "Mock model".into(),
+                context_window: Some(200_000),
             }],
             available_auth_providers: Vec::new(),
             available_sessions: Vec::new(),
             runtime_sessions: HashMap::new(),
             subagent_tasks: HashMap::new(),
             subagent_transcripts: HashMap::new(),
+            active_subagent_task_ids: Vec::new(),
             workflow_runs: HashMap::new(),
             workflow_catalog: Vec::new(),
             workflow_preview: None,
@@ -809,12 +859,49 @@ impl Default for AppState {
             hovered_entry: None,
             hovered_target_id: None,
             transcript_rect: Cell::new(None),
+            transcript_scrollbar_rect: Cell::new(None),
             transcript_hit_regions: RefCell::new(Vec::new()),
+            scroll_drag: None,
+            scrollbar_dragging: false,
+            pending_transcript_click: None,
         }
     }
 }
 
 impl AppState {
+    pub const fn theme(&self) -> Theme {
+        Theme::for_mode(self.theme_mode)
+    }
+
+    pub fn header_target_at(&self, column: u16, row: u16) -> Option<u8> {
+        self.header_targets
+            .borrow()
+            .iter()
+            .find(|(_, start, end, target_row)| {
+                row == *target_row && column >= *start && column < *end
+            })
+            .map(|(kind, _, _, _)| *kind)
+    }
+
+    pub fn show_context_info(&mut self) {
+        let mut lines = vec![format!(
+            "Context: {} / {} tokens",
+            self.context_used, self.context_limit
+        )];
+        if self.context_files.is_empty() {
+            lines.push("No Pi context files loaded".into());
+        } else {
+            lines.push("Loaded Pi context files:".into());
+            lines.extend(self.context_files.iter().map(|path| format!("• {path}")));
+        }
+        self.entries.push(Entry::Assistant {
+            lines,
+            timestamp: String::new(),
+        });
+        self.scroll_from_bottom = 0;
+        self.status = "context details".into();
+    }
+
     fn command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
         let query = self.overlay_query.trim().to_ascii_lowercase();
         let mut entries = crate::actions::palette(&query)
@@ -1130,7 +1217,7 @@ impl AppState {
                     return Some(OverlayAction::PreviewWorkflow { workflow });
                 }
                 let parsed = argument.and_then(|value| parse_workflow_start_argument(value).ok());
-                if let Some((workflow, input, parameters)) = parsed {
+                if let Some((workflow, input)) = parsed {
                     let expected_definition_hash = self
                         .workflow_preview
                         .as_ref()
@@ -1140,13 +1227,10 @@ impl AppState {
                     OverlayAction::StartWorkflow {
                         workflow,
                         input,
-                        parameters,
                         expected_definition_hash,
                     }
                 } else {
-                    self.push_command_usage(
-                        "Usage: /workflow <name> [--params <json-object> --] <task>",
-                    );
+                    self.push_command_usage("Usage: /workflow <name> <task>");
                     OverlayAction::None
                 }
             }
@@ -1291,11 +1375,16 @@ impl AppState {
     }
 
     pub fn open_overlay(&mut self, overlay: OverlayKind) {
+        self.scroll_drag = None;
+        self.scrollbar_dragging = false;
+        self.pending_transcript_click = None;
         self.overlay = overlay;
         self.overlay_stack.clear();
         self.overlay_query.clear();
         self.overlay_cursor = 0;
         self.overlay_selected = 0;
+        self.overlay_hovered = None;
+        self.overlay_close_hovered = false;
     }
 
     pub fn open_child_overlay(&mut self, overlay: OverlayKind) {
@@ -1308,6 +1397,8 @@ impl AppState {
         self.overlay = overlay;
         self.overlay_cursor = 0;
         self.overlay_selected = 0;
+        self.overlay_hovered = None;
+        self.overlay_close_hovered = false;
     }
 
     pub fn close_overlay(&mut self) {
@@ -1325,6 +1416,8 @@ impl AppState {
             }
             self.pending_paste_id = None;
             self.pending_image_id = None;
+            self.overlay_hovered = None;
+            self.overlay_close_hovered = false;
         }
     }
 
@@ -1460,6 +1553,7 @@ impl AppState {
                         .as_deref()
                         .unwrap_or("inherit parent")
                 ),
+                format!("Theme: {}", self.theme_mode.label()),
             ],
             OverlayKind::ScopedModels => self
                 .filtered_models()
@@ -1594,6 +1688,7 @@ impl AppState {
             ),
             format!("Readiness: {}", preview.readiness.status),
         ];
+        #[cfg(any())]
         if let Some(budget) = preview.budget.as_ref() {
             let limits = [
                 budget
@@ -1614,6 +1709,7 @@ impl AppState {
             .collect::<Vec<_>>();
             lines.push(format!("Workflow budget: {}", limits.join(" Â· ")));
         }
+        #[cfg(any())]
         for policy in &preview.provider_policies {
             let limits = [
                 policy
@@ -1639,6 +1735,7 @@ impl AppState {
                 limits.join(" Â· ")
             ));
         }
+        #[cfg(any())]
         for component in &preview.components {
             lines.push(format!(
                 "Component {}: {}{} Â· definition {}{}",
@@ -1679,6 +1776,7 @@ impl AppState {
                 lines.push(format!("  parameter map: {}", bindings.join(", ")));
             }
         }
+        #[cfg(any())]
         for contract in &preview.contracts {
             lines.push(format!(
                 "Contract {}: max {}B Â· schema {}{}",
@@ -1692,6 +1790,7 @@ impl AppState {
                     .unwrap_or_default()
             ));
         }
+        #[cfg(any())]
         if let Some(parameters) = preview.parameters.as_ref() {
             let defaults = parameters.defaults.to_string();
             let defaults = if defaults.chars().count() > 240 {
@@ -1742,6 +1841,7 @@ impl AppState {
     }
 
     pub fn move_overlay_selection(&mut self, delta: isize) {
+        self.overlay_hovered = None;
         // Tree rows are rendered directly from SessionTreeEntry. Building
         // overlay_items() here would format every row merely to learn the
         // count, making each arrow-key repeat noticeably expensive on long
@@ -1781,6 +1881,7 @@ impl AppState {
     }
 
     pub fn insert_overlay_char(&mut self, character: char) {
+        self.overlay_hovered = None;
         if matches!(
             self.overlay,
             OverlayKind::CommandPalette
@@ -1816,6 +1917,7 @@ impl AppState {
     }
 
     pub fn overlay_backspace(&mut self) {
+        self.overlay_hovered = None;
         if self.overlay == OverlayKind::PasteEditor {
             if self.overlay_cursor > 0 {
                 let start = char_to_byte(&self.overlay_query, self.overlay_cursor - 1);
@@ -2101,9 +2203,14 @@ impl AppState {
                         self.open_child_overlay(OverlayKind::ScopedModels);
                         return OverlayAction::None;
                     }
-                    _ => {
+                    6 => {
                         self.open_child_overlay(OverlayKind::SubagentModelPicker);
                         return OverlayAction::None;
+                    }
+                    _ => {
+                        self.theme_mode = self.theme_mode.next();
+                        self.status = format!("{} theme", self.theme_mode.label());
+                        return OverlayAction::SetTheme(self.theme_mode);
                     }
                 };
                 self.apply_runtime_setting(&action);
@@ -2402,6 +2509,7 @@ impl AppState {
     }
 
     pub fn move_tree_page(&mut self, direction: isize, page: usize) {
+        self.overlay_hovered = None;
         let count = self.filtered_tree().len();
         if count == 0 {
             self.overlay_selected = 0;
@@ -2642,11 +2750,22 @@ impl AppState {
         if text.is_empty() {
             return;
         }
+        let continuation = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::Reasoning { active: true, .. }))
+            .filter(|index| {
+                self.entries[index + 1..]
+                    .iter()
+                    .all(|entry| matches!(entry, Entry::Tool { .. } | Entry::Diff { .. }))
+            });
+        let target_index = continuation.or_else(|| self.entries.len().checked_sub(1));
+        let target = target_index.and_then(|index| self.entries.get_mut(index));
         if let Some(Entry::Reasoning {
             text: current,
             active: true,
             ..
-        }) = self.entries.last_mut()
+        }) = target
         {
             current.push_str(text);
         } else {
@@ -2690,10 +2809,99 @@ impl AppState {
 
     pub fn focus_prompt(&mut self) {
         self.focus = Focus::Prompt;
+        self.scroll_drag = None;
+        self.scrollbar_dragging = false;
+        self.pending_transcript_click = None;
     }
 
     pub fn focus_scrollback(&mut self) {
         self.focus = Focus::Scrollback;
+        if self.focused_entry.is_none()
+            && let Some(index) = self.entries.len().checked_sub(1)
+        {
+            self.focused_entry = Some(index);
+            self.focused_target_id = self.entry_target_id(index);
+        }
+    }
+
+    pub fn subagent_task_for_entry(&self, entry: &Entry) -> Option<&SubagentTask> {
+        let Entry::Tool { id, .. } = entry else {
+            return None;
+        };
+        self.subagent_tasks.get(id.strip_prefix("subagent:")?)
+    }
+
+    fn rebuild_active_subagent_entries(&mut self) {
+        if self.active_subagent_task_ids.is_empty() {
+            return;
+        }
+        let expanded_ids: HashSet<String> = self
+            .expanded_tool_groups
+            .iter()
+            .filter_map(|index| match self.entries.get(*index) {
+                Some(Entry::Tool { id, .. }) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let active_ids: HashSet<&str> = self
+            .active_subagent_task_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let first = self
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, Entry::Tool { id, .. } if id.strip_prefix("subagent:").is_some_and(|id| active_ids.contains(id)))
+            })
+            .unwrap_or(self.entries.len());
+        let initializing_group = first == self.entries.len();
+        self.entries.retain(|entry| {
+            !matches!(entry, Entry::Tool { id, .. } if id.strip_prefix("subagent:").is_some_and(|id| active_ids.contains(id)))
+        });
+        let mut tasks: Vec<_> = self
+            .active_subagent_task_ids
+            .iter()
+            .filter_map(|id| self.subagent_tasks.get(id))
+            .cloned()
+            .collect();
+        tasks.sort_by_key(|task| task.started_at_ms);
+        let entries = tasks.into_iter().map(|task| {
+            let status = match task.status.as_str() {
+                "running" => ToolStatus::Running,
+                "completed" => ToolStatus::Success,
+                _ => ToolStatus::Error,
+            };
+            let duration = (task.status != "running")
+                .then(|| format_elapsed(std::time::Duration::from_millis(task.duration_ms)));
+            let started_at = (task.status == "running").then(|| {
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(task.duration_ms))
+                    .unwrap_or_else(Instant::now)
+            });
+            Entry::Tool {
+                id: format!("subagent:{}", task.task_id),
+                label: "Agent".into(),
+                detail: task.description,
+                status,
+                duration,
+                started_at,
+                result: task.output.or(task.error),
+                expanded: false,
+            }
+        });
+        let insertion = first.min(self.entries.len());
+        self.entries.splice(insertion..insertion, entries);
+        self.expanded_tool_groups.clear();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if matches!(entry, Entry::Tool { id, .. } if expanded_ids.contains(id)) {
+                self.expanded_tool_groups.insert(index);
+            }
+        }
+        if initializing_group {
+            self.expanded_tool_groups.insert(insertion);
+        }
+        self.entry_ids.borrow_mut().clear();
     }
 
     pub fn insert_char(&mut self, character: char) {
@@ -3286,8 +3494,99 @@ impl AppState {
             self.view = View::Subagent;
             self.scroll_from_bottom = 0;
         } else {
-            self.toggle_entry_at(index);
+            let foldable = matches!(
+                self.entries.get(index),
+                Some(
+                    Entry::Reasoning { .. }
+                        | Entry::Diff { .. }
+                        | Entry::Plan { .. }
+                        | Entry::Tool { .. }
+                )
+            );
+            if foldable {
+                self.toggle_entry_at(index);
+            } else if self.entries.get(index).is_some() {
+                self.viewed_entry = Some(index);
+                self.view = View::BlockViewer;
+                self.scroll_from_bottom = 0;
+            }
         }
+    }
+
+    pub fn activate_transcript_target(&mut self, index: usize, target_id: &str) {
+        if target_id.starts_with("tool-group:") {
+            self.toggle_tool_group(index);
+        } else {
+            self.activate_entry_at(index);
+        }
+        self.focused_entry = Some(index);
+        self.focused_target_id = Some(target_id.to_string());
+    }
+
+    pub fn finish_transcript_click(&mut self, released: Option<(usize, String)>) {
+        let pending = self.pending_transcript_click.take();
+        self.scroll_drag = None;
+        self.scrollbar_dragging = false;
+        if let (Some((index, target_id)), Some((_, released_id))) = (pending, released)
+            && target_id == released_id
+        {
+            self.activate_transcript_target(index, &target_id);
+        }
+    }
+
+    pub fn begin_scrollback_drag(&mut self, row: u16) {
+        self.scroll_drag = Some(ScrollDrag {
+            start_row: row,
+            start_from_bottom: self.scroll_from_bottom,
+        });
+    }
+
+    pub fn transcript_contains(&self, column: u16, row: u16) -> bool {
+        self.transcript_rect
+            .get()
+            .is_some_and(|(x, y, width, height)| {
+                column >= x
+                    && column < x.saturating_add(width)
+                    && row >= y
+                    && row < y.saturating_add(height)
+            })
+    }
+
+    pub fn transcript_scrollbar_contains(&self, column: u16, row: u16) -> bool {
+        self.transcript_scrollbar_rect
+            .get()
+            .is_some_and(|(x, y, width, height)| {
+                column >= x
+                    && column < x.saturating_add(width)
+                    && row >= y
+                    && row < y.saturating_add(height)
+            })
+    }
+
+    pub fn drag_scrollback_to(&mut self, row: u16, max_scroll: usize) {
+        let Some(drag) = self.scroll_drag else {
+            return;
+        };
+        self.scroll_from_bottom = if row >= drag.start_row {
+            drag.start_from_bottom
+                .saturating_add(usize::from(row - drag.start_row))
+                .min(max_scroll)
+        } else {
+            drag.start_from_bottom
+                .saturating_sub(usize::from(drag.start_row - row))
+        };
+    }
+
+    pub fn drag_scrollbar_to(&mut self, row: u16, max_scroll: usize) {
+        let Some((_, y, _, height)) = self.transcript_scrollbar_rect.get() else {
+            return;
+        };
+        if height <= 1 {
+            return;
+        }
+        let position = usize::from(row.saturating_sub(y).min(height - 1));
+        let from_top = max_scroll.saturating_mul(position) / usize::from(height - 1);
+        self.scroll_from_bottom = max_scroll.saturating_sub(from_top);
     }
 
     pub fn all_reasoning_expanded(&self) -> bool {
@@ -3524,17 +3823,36 @@ impl AppState {
                 self.workflow_runs.clear();
                 self.workflow_selected = 0;
                 self.workflow_artifact = None;
+                self.subagent_tasks.clear();
+                self.subagent_transcripts.clear();
+                self.active_subagent_task_ids.clear();
+                self.task_selected = 0;
+                self.inspected_subagent = None;
             }
             AgentEvent::UserMessage { text } => {
+                if self.active_subagent_task_ids.iter().all(|id| {
+                    self.subagent_tasks
+                        .get(id)
+                        .is_none_or(|task| task.status != "running")
+                }) {
+                    self.active_subagent_task_ids.clear();
+                }
                 self.entries.push(Entry::User {
                     text,
                     timestamp: String::new(),
                 });
             }
-            AgentEvent::ModelChanged {
-                id: _,
-                display_name,
-            } => self.model = display_name,
+            AgentEvent::ModelChanged { id, display_name } => {
+                self.model = display_name;
+                if let Some(limit) = self
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == id)
+                    .and_then(|model| model.context_window)
+                {
+                    self.context_limit = limit;
+                }
+            }
             AgentEvent::ModelsChanged { models } => {
                 self.available_models = models;
                 self.status = format!("{} models available", self.available_models.len());
@@ -3711,7 +4029,7 @@ impl AppState {
                 if name.eq_ignore_ascii_case("update_plan") {
                     return;
                 }
-                if name.eq_ignore_ascii_case("spawn_subagent") {
+                if is_internal_subagent_tool(&name) {
                     self.status = "starting subagent…".into();
                     return;
                 }
@@ -3746,76 +4064,8 @@ impl AppState {
                 self.status = "running tool…".into();
             }
             AgentEvent::SubagentUpdate { task } => {
-                let append_background_notice = task.background
-                    && task.status != "running"
-                    && self
-                        .subagent_tasks
-                        .get(&task.task_id)
-                        .is_some_and(|previous| previous.status == "running");
-                let entry_id = format!("subagent:{}", task.task_id);
-                let status = match task.status.as_str() {
-                    "running" => ToolStatus::Running,
-                    "completed" => ToolStatus::Success,
-                    _ => ToolStatus::Error,
-                };
-                let detail = if task.activity.is_empty() {
-                    task.description.clone()
-                } else {
-                    format!("{} — {}", task.description, task.activity)
-                };
-                let duration = (task.status != "running")
-                    .then(|| format_elapsed(std::time::Duration::from_millis(task.duration_ms)));
-                let started_at = (task.status == "running").then(|| {
-                    Instant::now()
-                        .checked_sub(std::time::Duration::from_millis(task.duration_ms))
-                        .unwrap_or_else(Instant::now)
-                });
-                let result = task.output.clone().or_else(|| task.error.clone());
-                if let Some(Entry::Tool {
-                    detail: current_detail,
-                    status: current_status,
-                    duration: current_duration,
-                    started_at: current_started_at,
-                    result: current_result,
-                    ..
-                }) = self
-                    .entries
-                    .iter_mut()
-                    .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == &entry_id))
-                {
-                    *current_detail = detail;
-                    *current_status = status;
-                    *current_duration = duration.clone();
-                    *current_started_at = started_at;
-                    *current_result = result.clone();
-                } else {
-                    self.entries.push(Entry::Tool {
-                        id: entry_id,
-                        label: "Agent".into(),
-                        detail,
-                        status,
-                        duration: duration.clone(),
-                        started_at,
-                        result: result.clone(),
-                        expanded: false,
-                    });
-                }
-                if append_background_notice {
-                    self.entries.push(Entry::Tool {
-                        id: format!("subagent-notice:{}", task.task_id),
-                        label: match task.status.as_str() {
-                            "completed" => "Agent completed",
-                            "cancelled" => "Agent cancelled",
-                            _ => "Agent failed",
-                        }
-                        .into(),
-                        detail: task.description.clone(),
-                        status,
-                        duration: duration.clone(),
-                        started_at: None,
-                        result: result.clone(),
-                        expanded: false,
-                    });
+                if !self.active_subagent_task_ids.contains(&task.task_id) {
+                    self.active_subagent_task_ids.push(task.task_id.clone());
                 }
                 if task.status == "running" {
                     self.status = format!("subagent working: {}", task.description);
@@ -3831,6 +4081,10 @@ impl AppState {
                     };
                 }
                 self.subagent_tasks.insert(task.task_id.clone(), *task);
+                self.task_selected = self
+                    .task_selected
+                    .min(self.subagent_tasks.len().saturating_sub(1));
+                self.rebuild_active_subagent_entries();
             }
             AgentEvent::SubagentTranscript { task_id, event } => {
                 self.subagent_transcripts
@@ -4035,7 +4289,7 @@ fn builtin_description(command: &str) -> &'static str {
         "/thinking" => "Cycle thinking level",
         "/context" => "Show loaded context files",
         "/reload" => "Reload Pi resources",
-        "/paste-image" => "Attach image from clipboard",
+        "/paste" => "Paste clipboard text or attach an image",
         "/scoped-models" => "Choose models for cycling",
         "/subagent-model" => "Choose the persistent model for native subagents",
         "/trust" => "Save project trust decision",
@@ -4222,11 +4476,13 @@ fn active_first_tree_order<'a>(
 fn tool_display(name: &str, args: &serde_json::Value) -> (String, String) {
     let normalized = name.to_ascii_lowercase();
     let label = match normalized.as_str() {
-        "bash" | "shell" | "run" => "Run".to_string(),
-        "read" => "Read".to_string(),
+        "bash" | "shell" | "run" | "run_terminal_command" | "run_terminal_cmd" => "Run".to_string(),
+        "read" | "read_file" | "read_files" => "Read".to_string(),
+        "ls" | "list" | "list_dir" => "List".to_string(),
+        "find" | "find_file" | "find_files" | "glob" => "Find".to_string(),
         "edit" => "Edit".to_string(),
         "write" => "Write".to_string(),
-        "search" | "grep" | "web_search" => "Search".to_string(),
+        "search" | "grep" | "grep_file" | "grep_files" | "web_search" => "Search".to_string(),
         "web_fetch" => "Fetch".to_string(),
         "agent" | "spawn_agent" => "Agent".to_string(),
         "get_subagent_result" => "Agent result".to_string(),
@@ -4251,7 +4507,13 @@ fn tool_display(name: &str, args: &serde_json::Value) -> (String, String) {
     .iter()
     .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
     .map_or_else(|| args.to_string(), str::to_string);
-    if label == "Search" {
+    if normalized == "read_files" {
+        detail = format_string_list(args, "paths", "file");
+    } else if normalized == "find_files" {
+        detail = format_query_list(args, "pattern", "pattern");
+    } else if normalized == "grep_files" {
+        detail = format_query_list(args, "pattern", "query");
+    } else if label == "Search" {
         let query = args
             .get("query")
             .or_else(|| args.get("pattern"))
@@ -4282,6 +4544,91 @@ fn tool_display(name: &str, args: &serde_json::Value) -> (String, String) {
         }
     }
     (label, detail)
+}
+
+fn format_string_list(args: &serde_json::Value, key: &str, noun: &str) -> String {
+    let values: Vec<_> = args
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    match values.as_slice() {
+        [] => args.to_string(),
+        [only] => (*only).to_string(),
+        values => {
+            let preview = values
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} {noun}s · {preview}{}",
+                values.len(),
+                if values.len() > 3 { ", …" } else { "" }
+            )
+        }
+    }
+}
+
+fn format_query_list(args: &serde_json::Value, key: &str, noun: &str) -> String {
+    let queries: Vec<_> = args
+        .get("queries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+        .collect();
+    if queries.is_empty() {
+        return args.to_string();
+    }
+    let render = |query: &&serde_json::Map<String, serde_json::Value>| {
+        let value = query
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let path = query
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty() && *path != ".");
+        path.map_or_else(
+            || format!("\"{value}\""),
+            |path| format!("\"{value}\" in {path}"),
+        )
+    };
+    match queries.as_slice() {
+        [only] => render(only),
+        queries => {
+            let preview = queries
+                .iter()
+                .take(2)
+                .map(render)
+                .collect::<Vec<_>>()
+                .join("; ");
+            let plural = if let Some(stem) = noun.strip_suffix('y') {
+                format!("{stem}ies")
+            } else {
+                format!("{noun}s")
+            };
+            format!(
+                "{} {plural} · {preview}{}",
+                queries.len(),
+                if queries.len() > 2 { "; …" } else { "" }
+            )
+        }
+    }
+}
+
+fn is_internal_subagent_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "spawn_subagent"
+            | "get_command_or_subagent_output"
+            | "wait_commands_or_subagents"
+            | "get_subagent_result"
+    )
 }
 
 fn search_match_count(result: &str) -> Option<usize> {
