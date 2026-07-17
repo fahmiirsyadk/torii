@@ -1,7 +1,8 @@
 use pi_harness::{
-    AgentEvent, AppUpdateStatus, ModelInfo, PermissionDecision, RuntimeCommand, RuntimeSettings,
-    SessionInfo, SessionTreeEntry, SubagentTask, ToolResult, Usage, WorkflowArtifactSnapshot,
-    WorkflowCatalogEntry, WorkflowPreview, WorkflowPreviewStep, WorkflowRunSnapshot,
+    AgentEvent, AppUpdateStatus, AuthProviderInfo, AuthType, ModelInfo, PermissionDecision,
+    RuntimeCommand, RuntimeSettings, SessionInfo, SessionTreeEntry, SubagentTask, ToolResult,
+    Usage, WorkflowArtifactSnapshot, WorkflowCatalogEntry, WorkflowPreview, WorkflowPreviewStep,
+    WorkflowRunSnapshot,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -288,6 +289,7 @@ pub enum OverlayKind {
     ScopedModels,
     Extensions,
     SubagentModelPicker,
+    ApiKeyPrompt,
     OauthPrompt,
     OauthSelect,
     LoginProvider,
@@ -387,6 +389,10 @@ pub enum OverlayAction {
     ExportSession(Option<String>),
     ImportSession(String),
     CopyLast,
+    SetApiKey {
+        provider: String,
+        key: String,
+    },
     OauthReply {
         id: String,
         value: Option<String>,
@@ -703,8 +709,9 @@ pub struct AppState {
     pub overlay_close_hovered: bool,
     pub pending_permission: Option<PendingPermission>,
     pub pending_oauth: Option<PendingOauth>,
+    pub pending_api_key_provider: Option<String>,
     pub available_models: Vec<ModelInfo>,
-    pub available_auth_providers: Vec<ModelInfo>,
+    pub available_auth_providers: Vec<AuthProviderInfo>,
     pub available_sessions: Vec<SessionInfo>,
     pub runtime_sessions: HashMap<String, pi_harness::RuntimeSessionInfo>,
     pub subagent_tasks: HashMap<String, SubagentTask>,
@@ -844,6 +851,7 @@ impl Default for AppState {
             overlay_close_hovered: false,
             pending_permission: None,
             pending_oauth: None,
+            pending_api_key_provider: None,
             available_models: vec![ModelInfo {
                 id: "mock".into(),
                 display_name: "Mock model".into(),
@@ -1352,7 +1360,18 @@ impl AppState {
             }
             "/copy" => OverlayAction::CopyLast,
             "/login" if argument.is_some() => {
-                OverlayAction::BeginOauth(argument.unwrap().to_string())
+                let id = argument.unwrap();
+                let provider = self
+                    .available_auth_providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+                    .cloned();
+                if let Some(provider) = provider {
+                    self.start_auth(provider)
+                } else {
+                    self.push_command_usage(&format!("Unknown auth provider: {id}"));
+                    OverlayAction::None
+                }
             }
             "/login" => {
                 self.open_overlay(OverlayKind::LoginProvider);
@@ -1528,6 +1547,10 @@ impl AppState {
             self.overlay,
             OverlayKind::OauthPrompt | OverlayKind::OauthSelect
         ) {
+            if self.overlay == OverlayKind::ApiKeyPrompt {
+                self.pending_api_key_provider = None;
+                self.overlay_query.clear();
+            }
             self.close_overlay();
             return OverlayAction::None;
         }
@@ -1539,6 +1562,21 @@ impl AppState {
         OverlayAction::OauthReply {
             id: pending.id,
             value: None,
+        }
+    }
+
+    fn start_auth(&mut self, provider: AuthProviderInfo) -> OverlayAction {
+        match provider.auth_type {
+            AuthType::Oauth => {
+                self.close_overlay();
+                self.status = format!("starting OAuth for {}…", provider.id);
+                OverlayAction::BeginOauth(provider.id)
+            }
+            AuthType::ApiKey => {
+                self.pending_api_key_provider = Some(provider.id);
+                self.open_overlay(OverlayKind::ApiKeyPrompt);
+                OverlayAction::None
+            }
         }
     }
 
@@ -1673,7 +1711,7 @@ impl AppState {
                 );
                 items
             }
-            OverlayKind::OauthPrompt => Vec::new(),
+            OverlayKind::ApiKeyPrompt | OverlayKind::OauthPrompt => Vec::new(),
             OverlayKind::OauthSelect => self
                 .pending_oauth
                 .as_ref()
@@ -1686,9 +1724,9 @@ impl AppState {
                 })
                 .unwrap_or_default(),
             OverlayKind::LoginProvider => self
-                .available_auth_providers
-                .iter()
-                .map(|provider| provider.display_name.clone())
+                .filtered_auth_providers()
+                .into_iter()
+                .map(auth_provider_label)
                 .collect(),
             OverlayKind::ThinkingPicker => self.thinking_levels.clone(),
             OverlayKind::RewindPicker => self
@@ -1721,6 +1759,7 @@ impl AppState {
                         | OverlayKind::Extensions
                         | OverlayKind::ScopedModels
                         | OverlayKind::SubagentModelPicker
+                        | OverlayKind::LoginProvider
                 ) || query.is_empty()
                     || item.to_ascii_lowercase().contains(&query)
             })
@@ -1744,6 +1783,18 @@ impl AppState {
                 .then_with(|| left.display_name.cmp(&right.display_name))
         });
         models
+    }
+
+    fn filtered_auth_providers(&self) -> Vec<&AuthProviderInfo> {
+        let query = self.overlay_query.to_ascii_lowercase();
+        self.available_auth_providers
+            .iter()
+            .filter(|provider| {
+                query.is_empty()
+                    || provider.display_name.to_ascii_lowercase().contains(&query)
+                    || provider.id.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
     }
 
     pub(crate) fn filtered_extensions(&self) -> Vec<&pi_harness::RuntimeExtension> {
@@ -2004,6 +2055,7 @@ impl AppState {
                 | OverlayKind::Extensions
                 | OverlayKind::ScopedModels
                 | OverlayKind::SubagentModelPicker
+                | OverlayKind::ApiKeyPrompt
                 | OverlayKind::OauthPrompt
                 | OverlayKind::OauthSelect
                 | OverlayKind::LoginProvider
@@ -2090,6 +2142,20 @@ impl AppState {
                 id: pending.id,
                 value,
             };
+        }
+        if self.overlay == OverlayKind::ApiKeyPrompt {
+            let Some(provider) = self.pending_api_key_provider.take() else {
+                return OverlayAction::None;
+            };
+            if self.overlay_query.is_empty() {
+                self.pending_api_key_provider = Some(provider);
+                self.status = "API key cannot be empty".into();
+                return OverlayAction::None;
+            }
+            let key = std::mem::take(&mut self.overlay_query);
+            self.close_overlay();
+            self.status = format!("updating credentials for {provider}…");
+            return OverlayAction::SetApiKey { provider, key };
         }
         if self.overlay == OverlayKind::LabelEditor {
             let Some(entry_id) = self.pending_label_entry.take() else {
@@ -2373,12 +2439,11 @@ impl AppState {
             }
             OverlayKind::LoginProvider => {
                 let provider = self
-                    .available_auth_providers
-                    .iter()
-                    .find(|provider| provider.display_name == item)
-                    .map(|provider| provider.id.clone());
-                self.close_overlay();
-                return provider.map_or(OverlayAction::None, OverlayAction::BeginOauth);
+                    .filtered_auth_providers()
+                    .get(self.overlay_selected)
+                    .copied()
+                    .cloned();
+                return provider.map_or(OverlayAction::None, |provider| self.start_auth(provider));
             }
             OverlayKind::ThinkingPicker => {
                 self.close_overlay();
@@ -2426,7 +2491,8 @@ impl AppState {
                     };
                 }
             }
-            OverlayKind::OauthPrompt
+            OverlayKind::ApiKeyPrompt
+            | OverlayKind::OauthPrompt
             | OverlayKind::SessionRename
             | OverlayKind::SessionDeleteConfirm
             | OverlayKind::TreeSummaryEditor
@@ -3965,6 +4031,7 @@ impl AppState {
                 self.queued_follow_up.clear();
                 self.pending_permission = None;
                 self.pending_oauth = None;
+                self.pending_api_key_provider = None;
                 self.overlay = OverlayKind::None;
                 self.overlay_stack.clear();
                 self.escape_armed_at = None;
@@ -4123,6 +4190,30 @@ impl AppState {
                 self.entries.push(Entry::Assistant {
                     lines: vec![format!(
                         "Authentication successful for {provider}. Model list refreshed; use /model to switch."
+                    )],
+                    timestamp: String::new(),
+                });
+            }
+            AgentEvent::AuthChanged {
+                provider,
+                configured,
+            } => {
+                if let Some(info) = self
+                    .available_auth_providers
+                    .iter_mut()
+                    .find(|info| info.id == provider)
+                {
+                    info.configured = configured;
+                }
+                self.status = if configured {
+                    format!("updated credentials for {provider}")
+                } else {
+                    format!("removed credentials for {provider}")
+                };
+                self.entries.push(Entry::Assistant {
+                    lines: vec![format!(
+                        "{} Pi credentials for {provider}.",
+                        if configured { "Updated" } else { "Removed" }
                     )],
                     timestamp: String::new(),
                 });
@@ -4542,6 +4633,23 @@ fn char_to_byte(value: &str, character_index: usize) -> usize {
         .char_indices()
         .nth(character_index)
         .map_or(value.len(), |(index, _)| index)
+}
+
+fn auth_provider_label(provider: &AuthProviderInfo) -> String {
+    let auth = match provider.auth_type {
+        AuthType::ApiKey => "API key",
+        AuthType::Oauth => "OAuth",
+    };
+    format!(
+        "{}  · {}{}",
+        provider.display_name,
+        auth,
+        if provider.configured {
+            "  · configured"
+        } else {
+            ""
+        }
+    )
 }
 
 pub(crate) fn session_label(session: &SessionInfo, show_path: bool) -> String {

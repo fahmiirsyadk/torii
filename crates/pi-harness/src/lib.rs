@@ -137,6 +137,10 @@ pub enum AgentEvent {
     OauthComplete {
         provider: String,
     },
+    AuthChanged {
+        provider: String,
+        configured: bool,
+    },
     RewindList {
         checkpoints: Vec<RewindCheckpoint>,
     },
@@ -487,6 +491,30 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    ApiKey,
+    Oauth,
+}
+
+impl std::fmt::Display for AuthType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ApiKey => "api_key",
+            Self::Oauth => "oauth",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthProviderInfo {
+    pub id: String,
+    pub display_name: String,
+    pub auth_type: AuthType,
+    pub configured: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -636,7 +664,7 @@ pub trait AgentHarness: Send + Sync {
     ) -> Result<()>;
     async fn set_model(&self, id: &SessionId, model: String) -> Result<()>;
     async fn list_models(&self) -> Result<Vec<ModelInfo>>;
-    async fn list_auth_providers(&self, _id: &SessionId) -> Result<Vec<ModelInfo>> {
+    async fn list_auth_providers(&self, _id: &SessionId) -> Result<Vec<AuthProviderInfo>> {
         Ok(Vec::new())
     }
     async fn list_files(&self, id: &SessionId) -> Result<Vec<String>>;
@@ -656,6 +684,9 @@ pub trait AgentHarness: Send + Sync {
     async fn import_session(&self, id: &SessionId, path: String) -> Result<()>;
     async fn copy_last(&self, id: &SessionId) -> Result<()>;
     async fn begin_oauth(&self, id: &SessionId, provider: String) -> Result<()>;
+    async fn set_api_key(&self, _id: &SessionId, _provider: String, _key: String) -> Result<()> {
+        Err(anyhow!("API-key authentication is not supported"))
+    }
     async fn reply_oauth(
         &self,
         id: &SessionId,

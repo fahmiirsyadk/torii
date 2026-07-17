@@ -338,12 +338,14 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "set_api_key") {
     pi.setApiKey(active, command.provider, command.key);
+    emit({ type: "auth_changed", provider: command.provider, configured: true });
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }
 
   if (command.type === "logout") {
     pi.removeAuth(active, command.provider);
+    emit({ type: "auth_changed", provider: command.provider, configured: false });
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }

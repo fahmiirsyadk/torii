@@ -333,6 +333,10 @@ pub enum UiCommand {
     ExportSession(Option<String>),
     ImportSession(String),
     CopyLast,
+    SetApiKey {
+        provider: String,
+        key: String,
+    },
     BeginOauth(String),
     OauthReply {
         id: String,
@@ -498,7 +502,7 @@ fn handle_agent_escape(state: &mut AppState, commands: &Option<mpsc::UnboundedSe
 
 pub struct TuiBootstrap {
     pub models: Vec<pi_harness::ModelInfo>,
-    pub auth_providers: Vec<pi_harness::ModelInfo>,
+    pub auth_providers: Vec<pi_harness::AuthProviderInfo>,
     pub sessions: Vec<pi_harness::SessionInfo>,
     pub files: Vec<String>,
     pub resources: pi_harness::RuntimeResources,
@@ -1946,6 +1950,12 @@ fn dispatch_overlay_action(
         OverlayAction::CopyLast => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::CopyLast);
+            }
+            false
+        }
+        OverlayAction::SetApiKey { provider, key } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetApiKey { provider, key });
             }
             false
         }
@@ -5304,15 +5314,17 @@ mod tests {
         }
 
         state.available_auth_providers = vec![
-            pi_harness::ModelInfo {
-                id: "openai".into(),
-                display_name: "OpenAI".into(),
-                context_window: None,
+            pi_harness::AuthProviderInfo {
+                id: "opencode-go".into(),
+                display_name: "Opencode Go".into(),
+                auth_type: pi_harness::AuthType::ApiKey,
+                configured: false,
             },
-            pi_harness::ModelInfo {
+            pi_harness::AuthProviderInfo {
                 id: "anthropic".into(),
                 display_name: "Anthropic".into(),
-                context_window: None,
+                auth_type: pi_harness::AuthType::Oauth,
+                configured: false,
             },
         ];
         state.prompt = "/login".into();
@@ -5321,11 +5333,40 @@ mod tests {
         for character in "anth".chars() {
             state.insert_overlay_char(character);
         }
-        assert_eq!(state.overlay_items(), vec!["Anthropic"]);
+        assert_eq!(state.overlay_items(), vec!["Anthropic  · OAuth"]);
         assert!(matches!(
             state.activate_overlay(),
             super::state::OverlayAction::BeginOauth(provider) if provider == "anthropic"
         ));
+
+        state.prompt = "/login opencode-go".into();
+        assert!(matches!(
+            state.activate_slash_command(),
+            Some(super::state::OverlayAction::None)
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::ApiKeyPrompt);
+        for character in "secret-key".chars() {
+            state.insert_overlay_char(character);
+        }
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| overlay::render(frame, &state))
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer(), 60, 16);
+        assert!(!rendered.contains("secret-key"));
+        assert!(rendered.contains("••••••••••"));
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::SetApiKey { provider, key }
+                if provider == "opencode-go" && key == "secret-key"
+        ));
+        state.apply(AgentEvent::AuthChanged {
+            provider: "opencode-go".into(),
+            configured: true,
+        });
+        assert_eq!(state.status, "updated credentials for opencode-go");
+        assert!(state.available_auth_providers[0].configured);
     }
 
     #[cfg(any())]

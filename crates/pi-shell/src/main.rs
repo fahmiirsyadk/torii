@@ -4,7 +4,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use pi_harness::{AgentEvent, AgentHarness, MockHarness, SessionConfig, SessionPersistence};
-use pi_harness_pi::{AuthProviderInfo, PiHarness};
+use pi_harness::{AuthProviderInfo, AuthType};
+use pi_harness_pi::PiHarness;
 use std::{
     io::{self, IsTerminal, Write},
     sync::Arc,
@@ -459,6 +460,11 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::CopyLast => {
                         let _ = command_harness.copy_last(&command_session).await;
                     }
+                    pi_tui::UiCommand::SetApiKey { provider, key } => {
+                        let _ = command_harness
+                            .set_api_key(&command_session, provider, key)
+                            .await;
+                    }
                     pi_tui::UiCommand::BeginOauth(provider) => {
                         let _ = command_harness
                             .begin_oauth(&command_session, provider)
@@ -691,7 +697,7 @@ async fn login(requested_provider: Option<&str>) -> Result<()> {
         None => choose_provider(&providers)?,
     };
 
-    if provider.auth_type == "oauth" {
+    if provider.auth_type == AuthType::Oauth {
         let mut events = harness.subscribe(&session)?;
         harness.begin_oauth(&session, provider.id.clone()).await?;
         loop {
@@ -767,7 +773,9 @@ async fn login(requested_provider: Option<&str>) -> Result<()> {
     if key.is_empty() {
         return Err(anyhow::anyhow!("API key cannot be empty"));
     }
-    harness.set_api_key(&session, &provider.id, key).await?;
+    harness
+        .set_api_key(&session, provider.id.clone(), key)
+        .await?;
     println!("Updated Pi credentials for {}", provider.id);
     Ok(())
 }

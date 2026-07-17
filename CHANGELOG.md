@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3 - 2026-07-17
+
+### Authentication
+
+- Dashboard login preserves Pi's typed provider authentication metadata instead
+  of routing every provider through OAuth.
+- API-based providers such as `opencode-go` use a masked API-key prompt, while
+  OAuth providers retain their existing authorization flow.
+- Credential changes are shown only after Pi confirms them, and storage
+  failures surface as authentication errors.
+
 ## 0.1.2 - 2026-07-17
 
 ### Workflow visibility

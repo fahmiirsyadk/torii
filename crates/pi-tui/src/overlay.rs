@@ -53,7 +53,7 @@ struct GenericPickerData {
 
 fn render_grok_picker(frame: &mut Frame<'_>, state: &AppState) {
     let data = generic_picker_data(state);
-    let display_query = if state.overlay == OverlayKind::OauthPrompt {
+    let display_query = if is_secret_overlay(state.overlay) {
         "•".repeat(state.overlay_query.chars().count())
     } else {
         state.overlay_query.clone()
@@ -99,6 +99,7 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
         OverlayKind::Extensions => "Pi extensions",
         OverlayKind::ScopedModels => "Scoped models",
         OverlayKind::SubagentModelPicker => "Subagent model",
+        OverlayKind::ApiKeyPrompt => "API key",
         OverlayKind::OauthPrompt => "OAuth input",
         OverlayKind::OauthSelect => "OAuth selection",
         OverlayKind::LoginProvider => "Login provider",
@@ -112,6 +113,7 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
         OverlayKind::LabelEditor => "Label",
         OverlayKind::SessionRename => "Name",
         OverlayKind::TreeSummaryEditor => "Instructions",
+        OverlayKind::ApiKeyPrompt => "Key",
         OverlayKind::OauthPrompt => "Reply",
         _ => "Search",
     });
@@ -1219,7 +1221,7 @@ pub fn item_at_position(
         }
         _ => {
             let data = generic_picker_data(state);
-            let display_query = if state.overlay == OverlayKind::OauthPrompt {
+            let display_query = if is_secret_overlay(state.overlay) {
                 "•".repeat(state.overlay_query.chars().count())
             } else {
                 state.overlay_query.clone()
@@ -1262,7 +1264,7 @@ pub fn close_at_position(state: &AppState, width: u16, height: u16, column: u16,
         OverlayKind::None => return false,
         _ => {
             let data = generic_picker_data(state);
-            let display_query = if state.overlay == OverlayKind::OauthPrompt {
+            let display_query = if is_secret_overlay(state.overlay) {
                 "•".repeat(state.overlay_query.chars().count())
             } else {
                 state.overlay_query.clone()
@@ -1389,10 +1391,18 @@ fn overlay_has_query(overlay: OverlayKind) -> bool {
             | OverlayKind::FilePicker
             | OverlayKind::ScopedModels
             | OverlayKind::SubagentModelPicker
+            | OverlayKind::ApiKeyPrompt
             | OverlayKind::OauthPrompt
             | OverlayKind::OauthSelect
             | OverlayKind::LoginProvider
             | OverlayKind::RewindPicker
+    )
+}
+
+fn is_secret_overlay(overlay: OverlayKind) -> bool {
+    matches!(
+        overlay,
+        OverlayKind::ApiKeyPrompt | OverlayKind::OauthPrompt
     )
 }
 

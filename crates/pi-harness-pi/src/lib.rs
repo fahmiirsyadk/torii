@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use pi_harness::{
-    AgentEvent, AgentHarness, MessageDelivery, MessageImage, ModelInfo, PermissionDecision,
-    RewindCheckpoint, RuntimeResources, RuntimeSettings, SessionConfig, SessionId, SessionInfo,
-    SessionStats, SessionTreeEntry,
+    AgentEvent, AgentHarness, AuthProviderInfo, MessageDelivery, MessageImage, ModelInfo,
+    PermissionDecision, RewindCheckpoint, RuntimeResources, RuntimeSettings, SessionConfig,
+    SessionId, SessionInfo, SessionStats, SessionTreeEntry,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -33,14 +33,6 @@ const INFERENCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Clone)]
 pub struct PiHarness {
     inner: Arc<Inner>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct AuthProviderInfo {
-    pub id: String,
-    pub display_name: String,
-    pub auth_type: String,
-    pub configured: bool,
 }
 
 struct Inner {
@@ -196,7 +188,7 @@ impl PiHarness {
             .unwrap_or_default())
     }
 
-    pub async fn set_api_key(&self, id: &SessionId, provider: &str, key: String) -> Result<()> {
+    async fn store_api_key(&self, id: &SessionId, provider: &str, key: String) -> Result<()> {
         self.request(
             json!({
                 "type": "set_api_key",
@@ -491,25 +483,27 @@ impl AgentHarness for PiHarness {
             .unwrap_or_default())
     }
 
-    async fn list_auth_providers(&self, id: &SessionId) -> Result<Vec<ModelInfo>> {
-        Ok(self
-            .auth_provider_details(id)
-            .await?
-            .into_iter()
-            .map(|provider| ModelInfo {
-                id: provider.id,
-                display_name: format!(
-                    "{}{}",
-                    provider.display_name,
-                    if provider.configured {
-                        "  ✓ configured"
-                    } else {
-                        ""
-                    }
-                ),
-                context_window: None,
-            })
-            .collect())
+    async fn list_auth_providers(&self, id: &SessionId) -> Result<Vec<AuthProviderInfo>> {
+        self.auth_provider_details(id).await
+    }
+
+    async fn set_api_key(&self, id: &SessionId, provider: String, key: String) -> Result<()> {
+        if let Err(error) = self.store_api_key(id, &provider, key).await {
+            if let Some(sender) = self
+                .inner
+                .sessions
+                .read()
+                .ok()
+                .and_then(|sessions| sessions.get(id).cloned())
+            {
+                let _ = sender.send(AgentEvent::Error {
+                    kind: pi_harness::AgentErrorKind::Authentication,
+                    message: format!("failed to update credentials for {provider}: {error}"),
+                });
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn list_files(&self, id: &SessionId) -> Result<Vec<String>> {
