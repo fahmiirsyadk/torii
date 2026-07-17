@@ -60,7 +60,8 @@ struct Resident {
 
 impl Resident {
     /// Fold one event into the live runtime status/timer bookkeeping.
-    fn observe(&mut self, event: &AgentEvent) {
+    fn observe(&mut self, event: &AgentEvent) -> bool {
+        let before = (self.status, self.started_at);
         match event {
             AgentEvent::RuntimeState { idle, .. } => {
                 self.turn_running = !idle;
@@ -144,6 +145,7 @@ impl Resident {
             }
             _ => {}
         }
+        before != (self.status, self.started_at)
     }
 
     /// Collapse the state left by a replayed transcript into a resumed baseline.
@@ -243,20 +245,24 @@ impl SessionSupervisor {
                 };
                 let sessions = {
                     let mut residents = task_residents.write().await;
-                    if let Some(resident) = residents.get_mut(&owner_path) {
+                    let changed = if let Some(resident) = residents.get_mut(&owner_path) {
                         resident.history.push(event.clone());
-                        resident.observe(&event);
-                    }
-                    runtime_infos(&residents)
+                        resident.observe(&event)
+                    } else {
+                        false
+                    };
+                    changed.then(|| runtime_infos(&residents))
                 };
                 let _ = task_events.send(TaggedEvent {
                     session_id: owner.clone(),
                     event,
                 });
-                let _ = task_events.send(TaggedEvent {
-                    session_id: owner,
-                    event: AgentEvent::RuntimeSessions { sessions },
-                });
+                if let Some(sessions) = sessions {
+                    let _ = task_events.send(TaggedEvent {
+                        session_id: owner,
+                        event: AgentEvent::RuntimeSessions { sessions },
+                    });
+                }
             }
         });
         let mut workflow_updates = workflows.subscribe();
@@ -295,20 +301,24 @@ impl SessionSupervisor {
                 };
                 let sessions = {
                     let mut residents = workflow_residents.write().await;
-                    if let Some(resident) = residents.get_mut(&owner_path) {
+                    let changed = if let Some(resident) = residents.get_mut(&owner_path) {
                         resident.history.push(event.clone());
-                        resident.observe(&event);
-                    }
-                    runtime_infos(&residents)
+                        resident.observe(&event)
+                    } else {
+                        false
+                    };
+                    changed.then(|| runtime_infos(&residents))
                 };
                 let _ = workflow_events.send(TaggedEvent {
                     session_id: owner.clone(),
                     event,
                 });
-                let _ = workflow_events.send(TaggedEvent {
-                    session_id: owner,
-                    event: AgentEvent::RuntimeSessions { sessions },
-                });
+                if let Some(sessions) = sessions {
+                    let _ = workflow_events.send(TaggedEvent {
+                        session_id: owner,
+                        event: AgentEvent::RuntimeSessions { sessions },
+                    });
+                }
             }
         });
         let cwd = std::env::current_dir()
@@ -782,14 +792,16 @@ impl SessionSupervisor {
                 }
                 let sessions = {
                     let mut residents = residents.write().await;
-                    if let Some(resident) = residents.get_mut(&path) {
+                    let changed = if let Some(resident) = residents.get_mut(&path) {
                         if resident.history.len() >= MAX_REPLAY_EVENTS {
                             resident.history.drain(..1_000);
                         }
                         resident.history.push(event.clone());
-                        resident.observe(&event);
-                    }
-                    runtime_infos(&residents)
+                        resident.observe(&event)
+                    } else {
+                        false
+                    };
+                    changed.then(|| runtime_infos(&residents))
                 };
                 let _ = output.send(TaggedEvent {
                     session_id: id.clone(),
@@ -805,7 +817,7 @@ impl SessionSupervisor {
                 }
                 // During replay a single settled snapshot (emitted once the queue
                 // drains) is enough; only live events need a per-event refresh.
-                if !replaying {
+                if !replaying && let Some(sessions) = sessions {
                     let _ = output.send(TaggedEvent {
                         session_id: id.clone(),
                         event: AgentEvent::RuntimeSessions { sessions },
@@ -864,6 +876,25 @@ fn runtime_infos(residents: &HashMap<String, Resident>) -> Vec<RuntimeSessionInf
 mod tests {
     use super::*;
     use pi_harness::{MockHarness, SubagentTask, Usage, WorkflowRunSnapshot};
+
+    #[test]
+    fn transcript_deltas_do_not_invalidate_runtime_sessions() {
+        let mut resident = Resident {
+            id: SessionId("session-1".into()),
+            status: RuntimeStatus::Idle,
+            started_at: None,
+            history: Vec::new(),
+            turn_running: false,
+            running_tools: HashMap::new(),
+            background_tasks: HashSet::new(),
+        };
+        assert!(!resident.observe(&AgentEvent::TextDelta {
+            text: "streamed child detail".into(),
+        }));
+        assert!(resident.observe(&AgentEvent::SubagentUpdate {
+            task: Box::new(task("running")),
+        }));
+    }
 
     fn task(status: &str) -> SubagentTask {
         SubagentTask {

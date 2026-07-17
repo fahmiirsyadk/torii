@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.2 - 2026-07-17
+
+### Workflow visibility
+
+- The transcript now keeps an actionable workflow status row above the
+  composer. Approval, failure, and interruption states take priority, and the
+  row opens the exact workflow run when clicked.
+- Closing a workflow-owned agent detail returns to its workflow. Other agent
+  details return to the transcript or task list that opened them.
+
+### Rendering and orchestration
+
+- Subagent presentation events retain only visible tool metadata, coalesce
+  streamed deltas, and omit full tool result and write bodies from parent UI
+  state.
+- Runtime-session snapshots are emitted only when resident status changes.
+- Animation redraws match the visible spinner cadence instead of rebuilding
+  active views thirty times per second.
+
+### Distribution
+
+- Linux and Windows installers are immutable, checksum-listed release assets
+  instead of mutable branch files.
+
 ## 0.1.1 - 2026-07-17
 
 ### Pi runtime

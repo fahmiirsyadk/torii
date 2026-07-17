@@ -570,7 +570,10 @@ async fn run_app(
     let (image_sender, mut image_receiver) = mpsc::unbounded_channel();
     let mut dirty = true;
     let mut last_draw_at = None;
-    const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+    // Every animated glyph in the TUI advances at 80-100 ms. Drawing faster
+    // cannot produce a different frame and makes long transcripts compete with
+    // input handling while agents stream.
+    const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
         let animated = state.streaming
@@ -957,8 +960,7 @@ async fn run_app(
                     KeyCode::Down if state.view == View::BlockViewer => state.scroll_down(3),
                     _ if state.view == View::BlockViewer => {}
                     KeyCode::Esc | KeyCode::Char('q') if state.view == View::Subagent => {
-                        state.view = View::Tasks;
-                        state.scroll_from_bottom = 0;
+                        state.close_subagent();
                     }
                     KeyCode::Esc | KeyCode::Char('q') if state.view == View::Workflows => {
                         state.view = View::Transcript;
@@ -1545,8 +1547,7 @@ async fn run_app(
                             mouse.row,
                         ) =>
                 {
-                    state.view = View::Tasks;
-                    state.scroll_from_bottom = 0;
+                    state.close_subagent();
                 }
                 MouseEventKind::Moved | MouseEventKind::Down(_) if state.view == View::Subagent => {
                 }
@@ -1554,6 +1555,16 @@ async fn run_app(
                 MouseEventKind::ScrollDown => state.scroll_down(1),
                 MouseEventKind::Moved => {
                     let header_hover = state.header_target_at(mouse.column, mouse.row);
+                    let workflow_widget_hovered =
+                        state
+                            .workflow_widget_rect
+                            .get()
+                            .is_some_and(|(x, y, width, height)| {
+                                mouse.column >= x
+                                    && mouse.column < x.saturating_add(width)
+                                    && mouse.row >= y
+                                    && mouse.row < y.saturating_add(height)
+                            });
                     let composer_hover = state
                         .composer_targets
                         .borrow()
@@ -1580,10 +1591,12 @@ async fn run_app(
                         .map(|(id, _, _, _)| *id);
                     let composer_changed = state.header_hover != header_hover
                         || state.composer_hover != composer_hover
+                        || state.workflow_widget_hovered != workflow_widget_hovered
                         || state.paste_hover != paste_hover
                         || state.image_hover != image_hover;
                     state.header_hover = header_hover;
                     state.composer_hover = composer_hover;
+                    state.workflow_widget_hovered = workflow_widget_hovered;
                     state.paste_hover = paste_hover;
                     state.image_hover = image_hover;
                     let hovered = ui::section_hit_at(
@@ -1599,6 +1612,16 @@ async fn run_app(
                 }
                 MouseEventKind::Down(_) => {
                     let header_target = state.header_target_at(mouse.column, mouse.row);
+                    let workflow_target =
+                        state
+                            .workflow_widget_rect
+                            .get()
+                            .is_some_and(|(x, y, width, height)| {
+                                mouse.column >= x
+                                    && mouse.column < x.saturating_add(width)
+                                    && mouse.row >= y
+                                    && mouse.row < y.saturating_add(height)
+                            });
                     let composer_target = state.composer_hover.or_else(|| {
                         state
                             .composer_targets
@@ -1625,7 +1648,14 @@ async fn run_app(
                             mouse.row == *row && mouse.column >= *start && mouse.column < *end
                         })
                         .map(|(id, _, _, _)| *id);
-                    if let Some(target) = header_target {
+                    if workflow_target {
+                        if let Some(run_id) = state
+                            .workflow_widget()
+                            .map(|workflow| workflow.run_id.clone())
+                        {
+                            state.open_workflow(&run_id);
+                        }
+                    } else if let Some(target) = header_target {
                         match target {
                             0 => match ClipboardContext::new()
                                 .and_then(|clipboard| clipboard.set_text(state.cwd.clone()))
@@ -1976,6 +2006,30 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{buffer_text, fixtures, overlay, theme::Theme, ui};
+
+    fn workflow_snapshot(
+        run_id: &str,
+        status: &str,
+        current_step: Option<&str>,
+        updated_at_ms: u64,
+    ) -> pi_harness::WorkflowRunSnapshot {
+        pi_harness::WorkflowRunSnapshot {
+            run_id: run_id.into(),
+            name: "production-change".into(),
+            description: Some("Plan, approve, implement, and review".into()),
+            status: status.into(),
+            current_step: current_step.map(str::to_owned),
+            completed_steps: usize::from(status == "paused"),
+            total_steps: 4,
+            artifact_ids: Vec::new(),
+            budget: None,
+            provider_states: Vec::new(),
+            steps: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms,
+            error: None,
+        }
+    }
 
     #[test]
     fn conversation_story_renders_at_reference_sizes() {
@@ -3448,6 +3502,185 @@ mod tests {
         assert!(transcript.contains("evidence"));
         assert!(transcript.contains("read_file"));
         assert!(transcript.contains("failed 1.2s"), "{transcript}");
+    }
+
+    #[test]
+    fn subagent_detail_returns_to_its_originating_view() {
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(pi_harness::SubagentTask {
+                task_id: "worker".into(),
+                parent_session_id: "parent".into(),
+                child_session_id: Some("child".into()),
+                child_session_path: None,
+                description: "Workflow implement".into(),
+                subagent_type: "general-purpose".into(),
+                capability_mode: "all".into(),
+                isolation: "none".into(),
+                background: true,
+                status: "running".into(),
+                activity: "Running".into(),
+                started_at_ms: 1,
+                completed_at_ms: None,
+                duration_ms: 10,
+                output: None,
+                error: None,
+                failure_kind: None,
+                model: None,
+                thinking_level: None,
+                worktree_path: None,
+                cwd: None,
+                workflow_run_id: None,
+            }),
+        });
+        let index = state
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::state::Entry::Tool { id, .. } if id == "subagent:worker")
+            })
+            .unwrap();
+
+        state.activate_entry_at(index);
+        assert_eq!(state.view, super::View::Subagent);
+        assert_eq!(state.subagent_return_view, super::View::Transcript);
+        state.close_subagent();
+        assert_eq!(state.view, super::View::Transcript);
+
+        state.view = super::View::Tasks;
+        state.open_selected_subagent();
+        assert_eq!(state.subagent_return_view, super::View::Tasks);
+        state.close_subagent();
+        assert_eq!(state.view, super::View::Tasks);
+    }
+
+    #[test]
+    fn workflow_owned_agent_detail_returns_to_its_workflow() {
+        let mut state = super::AppState::default();
+        state.workflow_runs.insert(
+            "workflow-1".into(),
+            workflow_snapshot("workflow-1", "running", Some("implement"), 10),
+        );
+        state.apply(AgentEvent::SubagentUpdate {
+            task: Box::new(pi_harness::SubagentTask {
+                task_id: "worker".into(),
+                parent_session_id: "parent".into(),
+                child_session_id: Some("child".into()),
+                child_session_path: None,
+                description: "Workflow implement".into(),
+                subagent_type: "general-purpose".into(),
+                capability_mode: "all".into(),
+                isolation: "none".into(),
+                background: true,
+                status: "running".into(),
+                activity: "Running".into(),
+                started_at_ms: 1,
+                completed_at_ms: None,
+                duration_ms: 10,
+                output: None,
+                error: None,
+                failure_kind: None,
+                model: None,
+                thinking_level: None,
+                worktree_path: None,
+                cwd: None,
+                workflow_run_id: Some("workflow-1".into()),
+            }),
+        });
+        let index = state
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::state::Entry::Tool { id, .. } if id == "subagent:worker")
+            })
+            .unwrap();
+
+        state.activate_entry_at(index);
+        assert_eq!(state.subagent_return_view, super::View::Workflows);
+        state.close_subagent();
+        assert_eq!(state.view, super::View::Workflows);
+        assert_eq!(state.selected_workflow().unwrap().run_id, "workflow-1");
+    }
+
+    #[test]
+    fn subagent_transcript_coalesces_deltas_and_drops_result_bodies() {
+        let mut state = super::AppState::default();
+        for text in ["one", " two"] {
+            state.apply(AgentEvent::SubagentTranscript {
+                task_id: "worker".into(),
+                event: Box::new(AgentEvent::TextDelta { text: text.into() }),
+            });
+        }
+        state.apply(AgentEvent::SubagentTranscript {
+            task_id: "worker".into(),
+            event: Box::new(AgentEvent::RuntimeState {
+                idle: false,
+                streaming: true,
+                compacting: false,
+                context_tokens: None,
+                context_window: None,
+                context_percent: None,
+            }),
+        });
+        state.apply(AgentEvent::SubagentTranscript {
+            task_id: "worker".into(),
+            event: Box::new(AgentEvent::ToolCallResult {
+                id: "read".into(),
+                result: pi_harness::ToolResult {
+                    content: "x".repeat(1_000_000),
+                    details: Some(serde_json::json!({"raw":"unused"})),
+                },
+                is_error: false,
+                duration_ms: Some(20),
+            }),
+        });
+
+        let transcript = &state.subagent_transcripts["worker"];
+        assert_eq!(transcript.len(), 2);
+        assert!(matches!(
+            &transcript[0],
+            AgentEvent::TextDelta { text } if text == "one two"
+        ));
+        assert!(matches!(
+            &transcript[1],
+            AgentEvent::ToolCallResult { result, .. }
+                if result.content.is_empty() && result.details.is_none()
+        ));
+    }
+
+    #[test]
+    fn workflow_widget_surfaces_approval_and_opens_the_exact_run() {
+        let mut state = super::AppState::default();
+        state.workflow_runs.insert(
+            "older".into(),
+            workflow_snapshot("older", "running", Some("implement"), 20),
+        );
+        state.workflow_runs.insert(
+            "approval".into(),
+            workflow_snapshot("approval", "paused", Some("approve-plan"), 10),
+        );
+        let without_widget = super::agent_layout::AgentLayout::compute(
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+            &super::AppState::default(),
+        );
+        let with_widget = super::agent_layout::AgentLayout::compute(
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+            &state,
+        );
+        assert_eq!(without_widget.prompt, with_widget.prompt);
+        assert_eq!(with_widget.workflow_status.height, 1);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 100, 30);
+        assert!(output.contains("Approval required"), "{output}");
+        assert!(output.contains("approve-plan"), "{output}");
+        assert!(state.workflow_widget_rect.get().is_some());
+
+        state.open_workflow("older");
+        assert_eq!(state.view, super::View::Workflows);
+        assert_eq!(state.selected_workflow().unwrap().run_id, "older");
     }
 
     #[test]

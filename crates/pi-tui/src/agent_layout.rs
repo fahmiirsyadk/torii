@@ -12,6 +12,7 @@ pub struct AgentLayout {
     pub status: Rect,
     pub scrollback: Rect,
     pub queue: Rect,
+    pub workflow_status: Rect,
     pub turn_status: Rect,
     pub compaction: Rect,
     pub permission: Rect,
@@ -48,6 +49,7 @@ impl AgentLayout {
         } else {
             0
         };
+        let workflow_height = u16::from(state.workflow_widget().is_some());
         let permission_height = if state.pending_permission.is_some() {
             if compact { 4 } else { 5 }
         } else {
@@ -61,6 +63,7 @@ impl AgentLayout {
                 Constraint::Length(status_gap),
                 Constraint::Min(5),
                 Constraint::Length(queue_height),
+                Constraint::Length(workflow_height),
                 Constraint::Length(turn_height),
                 Constraint::Length(compaction_height),
                 Constraint::Length(permission_height),
@@ -73,11 +76,12 @@ impl AgentLayout {
             status: chunks[0],
             scrollback: chunks[2],
             queue: chunks[3],
-            turn_status: chunks[4],
-            compaction: chunks[5],
-            permission: chunks[6],
-            prompt: chunks[7],
-            shortcuts: chunks[8],
+            workflow_status: chunks[4],
+            turn_status: chunks[5],
+            compaction: chunks[6],
+            permission: chunks[7],
+            prompt: chunks[8],
+            shortcuts: chunks[9],
             compact,
         }
     }

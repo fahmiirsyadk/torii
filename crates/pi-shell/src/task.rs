@@ -56,6 +56,44 @@ impl TaskStatus {
     }
 }
 
+fn subagent_presentation_event(event: &AgentEvent) -> Option<AgentEvent> {
+    match event {
+        AgentEvent::ToolCallStart { id, name, args, .. } => {
+            let mut visible = serde_json::Map::new();
+            for key in ["path", "command"] {
+                if let Some(value) = args.get(key) {
+                    visible.insert(key.into(), value.clone());
+                    break;
+                }
+            }
+            Some(AgentEvent::ToolCallStart {
+                id: id.clone(),
+                name: name.clone(),
+                args: Value::Object(visible),
+            })
+        }
+        AgentEvent::ToolCallResult {
+            id,
+            is_error,
+            duration_ms,
+            ..
+        } => Some(AgentEvent::ToolCallResult {
+            id: id.clone(),
+            result: ToolResult {
+                content: String::new(),
+                details: None,
+            },
+            is_error: *is_error,
+            duration_ms: *duration_ms,
+        }),
+        AgentEvent::ReasoningDelta { .. }
+        | AgentEvent::TextDelta { .. }
+        | AgentEvent::UserMessage { .. }
+        | AgentEvent::Error { .. } => Some(event.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TaskSnapshot {
     pub id: String,
@@ -486,14 +524,16 @@ impl TaskCoordinator {
                 event = events.recv() => {
                     match event {
                         Ok(event) => {
-                            let _ = self.updates.send(TaskNotice::Event {
-                                owner: request.owner.clone(),
-                                owner_path: request.owner_path.clone(),
-                                event: AgentEvent::SubagentTranscript {
-                                    task_id: id.clone(),
-                                    event: Box::new(event.clone()),
-                                },
-                            });
+                            if let Some(event) = subagent_presentation_event(&event) {
+                                let _ = self.updates.send(TaskNotice::Event {
+                                    owner: request.owner.clone(),
+                                    owner_path: request.owner_path.clone(),
+                                    event: AgentEvent::SubagentTranscript {
+                                        task_id: id.clone(),
+                                        event: Box::new(event),
+                                    },
+                                });
+                            }
                             match event {
                                 AgentEvent::TextDelta { text } => output.push_str(&text),
                                 AgentEvent::PermissionRequest { .. } => {
@@ -890,6 +930,62 @@ mod tests {
     use pi_harness::MockHarness;
 
     use super::*;
+
+    #[test]
+    fn subagent_presentation_drops_tool_output_bodies() {
+        let event = AgentEvent::ToolCallResult {
+            id: "large-read".into(),
+            result: ToolResult {
+                content: "x".repeat(1_000_000),
+                details: Some(json!({"raw":"not presentation state"})),
+            },
+            is_error: false,
+            duration_ms: Some(42),
+        };
+        let Some(AgentEvent::ToolCallResult {
+            result,
+            duration_ms,
+            ..
+        }) = subagent_presentation_event(&event)
+        else {
+            panic!("tool completion should remain visible");
+        };
+        assert!(result.content.is_empty());
+        assert!(result.details.is_none());
+        assert_eq!(duration_ms, Some(42));
+    }
+
+    #[test]
+    fn subagent_presentation_keeps_only_visible_tool_arguments() {
+        let event = AgentEvent::ToolCallStart {
+            id: "write".into(),
+            name: "write".into(),
+            args: json!({
+                "path": "src/main.rs",
+                "content": "x".repeat(1_000_000),
+            }),
+        };
+        let Some(AgentEvent::ToolCallStart { args, .. }) = subagent_presentation_event(&event)
+        else {
+            panic!("tool start should remain visible");
+        };
+        assert_eq!(args, json!({"path":"src/main.rs"}));
+    }
+
+    #[test]
+    fn subagent_presentation_omits_nonvisual_runtime_events() {
+        assert!(
+            subagent_presentation_event(&AgentEvent::RuntimeState {
+                idle: false,
+                streaming: true,
+                compacting: false,
+                context_tokens: None,
+                context_window: None,
+                context_percent: None,
+            })
+            .is_none()
+        );
+    }
 
     fn request(owner: &SessionId) -> TaskRequest {
         TaskRequest {

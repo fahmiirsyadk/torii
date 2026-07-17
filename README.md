@@ -45,13 +45,13 @@ Linux x86-64:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/fahmiirsyadk/torii/main/install.sh | sh
+  https://github.com/fahmiirsyadk/torii/releases/latest/download/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/fahmiirsyadk/torii/main/install.ps1 | iex
+irm https://github.com/fahmiirsyadk/torii/releases/latest/download/install.ps1 | iex
 ```
 
 The installer verifies the platform release digest and installs a stable

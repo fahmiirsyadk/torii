@@ -614,6 +614,7 @@ pub struct AppState {
     pub task_selected: usize,
     pub workflow_selected: usize,
     pub inspected_subagent: Option<String>,
+    pub subagent_return_view: View,
     pub viewed_entry: Option<usize>,
     pub dashboard_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
     pub task_list_rect: Cell<Option<(u16, u16, u16, u16)>>,
@@ -622,6 +623,8 @@ pub struct AppState {
     pub header_hover: Option<u8>,
     pub composer_targets: RefCell<Vec<(u8, u16, u16, u16)>>,
     pub composer_hover: Option<u8>,
+    pub workflow_widget_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    pub workflow_widget_hovered: bool,
     pub paste_hover: Option<u64>,
     pub paste_targets: RefCell<Vec<(u64, u16, u16, u16)>>,
     pub branch: String,
@@ -763,6 +766,7 @@ impl Default for AppState {
             task_selected: 0,
             workflow_selected: 0,
             inspected_subagent: None,
+            subagent_return_view: View::Transcript,
             viewed_entry: None,
             dashboard_list_rect: Cell::new(None),
             task_list_rect: Cell::new(None),
@@ -771,6 +775,8 @@ impl Default for AppState {
             header_hover: None,
             composer_targets: RefCell::new(Vec::new()),
             composer_hover: None,
+            workflow_widget_rect: Cell::new(None),
+            workflow_widget_hovered: false,
             paste_hover: None,
             paste_targets: RefCell::new(Vec::new()),
             branch: "torii".into(),
@@ -1010,6 +1016,40 @@ impl AppState {
         self.sorted_workflows().get(self.workflow_selected).copied()
     }
 
+    pub fn workflow_widget(&self) -> Option<&WorkflowRunSnapshot> {
+        let workflows = self.sorted_workflows();
+        workflows
+            .iter()
+            .copied()
+            .find(|workflow| {
+                matches!(
+                    workflow.status.as_str(),
+                    "paused" | "failed" | "interrupted"
+                )
+            })
+            .or_else(|| {
+                workflows
+                    .into_iter()
+                    .find(|workflow| matches!(workflow.status.as_str(), "pending" | "running"))
+            })
+    }
+
+    fn select_workflow(&mut self, run_id: &str) {
+        if let Some(index) = self
+            .sorted_workflows()
+            .iter()
+            .position(|workflow| workflow.run_id == run_id)
+        {
+            self.workflow_selected = index;
+        }
+    }
+
+    pub fn open_workflow(&mut self, run_id: &str) {
+        self.select_workflow(run_id);
+        self.workflow_widget_hovered = false;
+        self.view = View::Workflows;
+    }
+
     pub fn selected_workflow_control(&self, action: &str) -> Option<(String, Option<String>)> {
         let workflow = self.selected_workflow()?;
         let allowed = match action {
@@ -1047,8 +1087,16 @@ impl AppState {
     pub fn open_selected_subagent(&mut self) {
         if let Some(task_id) = self.selected_subagent_id() {
             self.inspected_subagent = Some(task_id);
+            self.subagent_return_view = self.view;
             self.view = View::Subagent;
+            self.scroll_from_bottom = 0;
         }
+    }
+
+    pub fn close_subagent(&mut self) {
+        self.view = self.subagent_return_view;
+        self.inspected_subagent = None;
+        self.scroll_from_bottom = 0;
     }
 
     pub fn dashboard_selected_path(&self) -> Option<String> {
@@ -3562,12 +3610,26 @@ impl AppState {
     }
 
     pub fn activate_entry_at(&mut self, index: usize) {
-        let subagent_id = self.entries.get(index).and_then(|entry| match entry {
-            Entry::Tool { id, .. } => id.strip_prefix("subagent:").map(str::to_owned),
+        let subagent = self.entries.get(index).and_then(|entry| match entry {
+            Entry::Tool { id, .. } => {
+                let task_id = id.strip_prefix("subagent:")?;
+                Some((
+                    task_id.to_owned(),
+                    self.subagent_tasks
+                        .get(task_id)
+                        .and_then(|task| task.workflow_run_id.clone()),
+                ))
+            }
             _ => None,
         });
-        if let Some(task_id) = subagent_id {
+        if let Some((task_id, workflow_run_id)) = subagent {
             self.inspected_subagent = Some(task_id);
+            self.subagent_return_view = if let Some(run_id) = workflow_run_id {
+                self.select_workflow(&run_id);
+                View::Workflows
+            } else {
+                self.view
+            };
             self.view = View::Subagent;
             self.scroll_from_bottom = 0;
         } else {
@@ -3929,6 +3991,7 @@ impl AppState {
                 self.active_subagent_task_ids.clear();
                 self.task_selected = 0;
                 self.inspected_subagent = None;
+                self.subagent_return_view = View::Transcript;
             }
             AgentEvent::UserMessage { text } => {
                 if self.active_subagent_task_ids.iter().all(|id| {
@@ -4189,10 +4252,45 @@ impl AppState {
                 self.rebuild_active_subagent_entries();
             }
             AgentEvent::SubagentTranscript { task_id, event } => {
-                self.subagent_transcripts
-                    .entry(task_id)
-                    .or_default()
-                    .push(*event);
+                let transcript = self.subagent_transcripts.entry(task_id).or_default();
+                match *event {
+                    AgentEvent::ReasoningDelta { text } => {
+                        if let Some(AgentEvent::ReasoningDelta { text: current }) =
+                            transcript.last_mut()
+                        {
+                            current.push_str(&text);
+                        } else {
+                            transcript.push(AgentEvent::ReasoningDelta { text });
+                        }
+                    }
+                    AgentEvent::TextDelta { text } => {
+                        if let Some(AgentEvent::TextDelta { text: current }) = transcript.last_mut()
+                        {
+                            current.push_str(&text);
+                        } else {
+                            transcript.push(AgentEvent::TextDelta { text });
+                        }
+                    }
+                    AgentEvent::ToolCallResult {
+                        id,
+                        mut result,
+                        is_error,
+                        duration_ms,
+                    } => {
+                        result.content.clear();
+                        result.details = None;
+                        transcript.push(AgentEvent::ToolCallResult {
+                            id,
+                            result,
+                            is_error,
+                            duration_ms,
+                        });
+                    }
+                    event @ (AgentEvent::UserMessage { .. }
+                    | AgentEvent::ToolCallStart { .. }
+                    | AgentEvent::Error { .. }) => transcript.push(event),
+                    _ => {}
+                }
             }
             AgentEvent::WorkflowUpdate { workflow } => {
                 let workflow = *workflow;

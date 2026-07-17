@@ -345,6 +345,7 @@ fn select_layout_section(
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let theme = state.theme();
+    state.workflow_widget_rect.set(None);
     // Clear symbols as well as styles. This matters when a resume replaces a
     // tall focused/hovered section with shorter content in terminals that keep
     // the previous alternate-screen cells until explicitly overwritten.
@@ -394,6 +395,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     if layout.queue.height > 0 {
         render_queue(frame, layout.queue, state, theme);
     }
+    if layout.workflow_status.height > 0 {
+        render_workflow_widget(frame, layout.workflow_status, state, theme);
+    }
     if working_active {
         render_working_banner(frame, layout.turn_status, state, theme);
     }
@@ -408,6 +412,61 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     if state.overlay != OverlayKind::Permission {
         crate::overlay::render(frame, state);
     }
+}
+
+fn render_workflow_widget(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
+    let Some(workflow) = state.workflow_widget() else {
+        return;
+    };
+    state
+        .workflow_widget_rect
+        .set(Some((area.x, area.y, area.width, area.height)));
+    let (marker, status, color) = match workflow.status.as_str() {
+        "paused" => ("!", "Approval required", theme.warning),
+        "failed" | "interrupted" => ("!", "Needs attention", theme.error),
+        "pending" => ("Â·", "Pending", theme.muted),
+        _ => ("â–¶", "Running", theme.accent),
+    };
+    let step = workflow
+        .current_step
+        .as_deref()
+        .map(|step| format!(" Â· {step}"))
+        .unwrap_or_default();
+    let progress = format!(
+        "{}/{}",
+        workflow.completed_steps.min(workflow.total_steps),
+        workflow.total_steps
+    );
+    let suffix = if workflow.status == "paused" {
+        "click to review and approve"
+    } else {
+        "click to inspect"
+    };
+    let label = format!(
+        " {marker} Workflow {} Â· {status} Â· {progress}{step} Â· {suffix}",
+        workflow.name
+    );
+    frame.render_widget(
+        Paragraph::new(truncate(&label, usize::from(area.width))).style(
+            Style::default()
+                .fg(if state.workflow_widget_hovered {
+                    theme.foreground
+                } else {
+                    color
+                })
+                .bg(if state.workflow_widget_hovered {
+                    theme.bg_hover
+                } else {
+                    theme.background
+                })
+                .add_modifier(if workflow.status == "paused" {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        area,
+    );
 }
 
 fn render_permission_panel(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
