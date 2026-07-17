@@ -96,6 +96,7 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
         OverlayKind::ImageViewer => "Image attachment",
         OverlayKind::LabelEditor => "Entry label",
         OverlayKind::FilePicker => "Reference file",
+        OverlayKind::Extensions => "Pi extensions",
         OverlayKind::ScopedModels => "Scoped models",
         OverlayKind::SubagentModelPicker => "Subagent model",
         OverlayKind::OauthPrompt => "OAuth input",
@@ -204,6 +205,20 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
                         .unwrap_or(item)
                         .to_string();
                 }
+                if state.overlay == OverlayKind::Extensions {
+                    let extension = state.filtered_extensions().get(index).copied();
+                    row.checked = extension.map(|extension| extension.enabled);
+                    row.label = item
+                        .strip_prefix("[✓] ")
+                        .or_else(|| item.strip_prefix("[ ] "))
+                        .unwrap_or(item)
+                        .to_string();
+                    if let Some(extension) = extension {
+                        row.description = extension.source.clone();
+                        row.right = extension.scope.clone();
+                        row.disabled = extension.scope == "temporary";
+                    }
+                }
                 if state.overlay == OverlayKind::CommandPalette {
                     let parts = item.split("  ·  ").collect::<Vec<_>>();
                     row.label = parts.first().copied().unwrap_or(item).to_string();
@@ -233,6 +248,7 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
             "↑/↓ navigate · Enter open · Ctrl+S sort · Ctrl+N named · Ctrl+P paths · Ctrl+R rename · Ctrl+D delete · Esc close"
         }
         OverlayKind::ScopedModels => "↑/↓ navigate · Space toggle · Enter apply · Esc back",
+        OverlayKind::Extensions => "↑/↓ navigate · Space/Enter toggle · Esc back",
         OverlayKind::Settings => "↑/↓ navigate · Space/Enter change · Esc close",
         OverlayKind::WorkflowPreview => "↑/↓ scroll · Enter use workflow · Esc back",
         OverlayKind::SessionDeleteConfirm => "Enter delete · Esc cancel",
@@ -305,12 +321,22 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
                 row
             }),
     );
+    rows.push(PickerRow::header("Resources"));
+    let mut extensions = PickerRow::item(5, "Pi extensions");
+    extensions.right = state
+        .runtime_extensions
+        .iter()
+        .filter(|extension| extension.enabled)
+        .count()
+        .to_string();
+    extensions.description = "Inspect and enable or disable SDK extensions".into();
+    rows.push(extensions);
     rows.push(PickerRow::header("Models"));
-    let mut scoped = PickerRow::item(5, "Scoped models");
+    let mut scoped = PickerRow::item(6, "Scoped models");
     scoped.right = state.runtime_settings.enabled_models.len().to_string();
     scoped.description = "Limit model cycling and selection".into();
     rows.push(scoped);
-    let mut subagent = PickerRow::item(6, "Subagent model");
+    let mut subagent = PickerRow::item(7, "Subagent model");
     subagent.right = state
         .runtime_settings
         .subagent_model
@@ -320,7 +346,7 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
     subagent.description = "Default model for native delegated tasks".into();
     rows.push(subagent);
     rows.push(PickerRow::header("Appearance"));
-    let mut theme = PickerRow::item(7, "Theme");
+    let mut theme = PickerRow::item(8, "Theme");
     theme.right = state.theme_mode.label().into();
     theme.description = "Switch between Grok dark and light palettes".into();
     rows.push(theme);

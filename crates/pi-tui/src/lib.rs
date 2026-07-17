@@ -326,6 +326,10 @@ pub enum UiCommand {
     },
     SetProjectTrust(bool),
     SetScopedModels(Vec<String>),
+    SetExtensionEnabled {
+        path: String,
+        enabled: bool,
+    },
     ExportSession(Option<String>),
     ImportSession(String),
     CopyLast,
@@ -535,6 +539,7 @@ pub async fn run(
     state.available_files = files;
     state.runtime_commands = resources.commands;
     state.context_files = resources.context_files;
+    state.runtime_extensions = resources.extensions;
     state.runtime_settings = settings;
     state.view = View::Dashboard;
     if open_resume {
@@ -763,6 +768,12 @@ async fn run_app(
                     }
                     KeyCode::Char(' ') if state.overlay == OverlayKind::ScopedModels => {
                         state.toggle_scoped_model();
+                    }
+                    KeyCode::Char(' ') if state.overlay == OverlayKind::Extensions => {
+                        let action = state.activate_overlay();
+                        if dispatch_overlay_action(action, &commands) {
+                            break;
+                        }
                     }
                     KeyCode::Char(' ') if state.overlay == OverlayKind::Settings => {
                         let action = state.activate_overlay();
@@ -1026,6 +1037,21 @@ async fn run_app(
                     KeyCode::Down if state.view == View::Dashboard => {
                         state.dashboard_selected = (state.dashboard_selected + 1)
                             .min(state.available_sessions.len().saturating_sub(1));
+                    }
+                    KeyCode::PageUp if state.view == View::Dashboard => {
+                        state.dashboard_selected = state.dashboard_selected.saturating_sub(page);
+                    }
+                    KeyCode::PageDown if state.view == View::Dashboard => {
+                        state.dashboard_selected = state
+                            .dashboard_selected
+                            .saturating_add(page)
+                            .min(state.available_sessions.len().saturating_sub(1));
+                    }
+                    KeyCode::Home if state.view == View::Dashboard => {
+                        state.dashboard_selected = 0;
+                    }
+                    KeyCode::End if state.view == View::Dashboard => {
+                        state.dashboard_selected = state.available_sessions.len().saturating_sub(1);
                     }
                     KeyCode::Enter if state.view == View::Dashboard => {
                         if let Some(path) = state.activate_dashboard_session()
@@ -1866,6 +1892,12 @@ fn dispatch_overlay_action(
         OverlayAction::SetScopedModels(models) => {
             if let Some(sender) = commands {
                 let _ = sender.send(UiCommand::SetScopedModels(models));
+            }
+            false
+        }
+        OverlayAction::SetExtensionEnabled { path, enabled } => {
+            if let Some(sender) = commands {
+                let _ = sender.send(UiCommand::SetExtensionEnabled { path, enabled });
             }
             false
         }
@@ -5405,7 +5437,7 @@ mod tests {
         );
         assert_eq!(state.overlay, super::OverlayKind::Settings);
 
-        state.overlay_selected = 5;
+        state.overlay_selected = 6;
         assert!(matches!(
             state.activate_overlay(),
             super::state::OverlayAction::None
@@ -5413,7 +5445,7 @@ mod tests {
         assert_eq!(state.overlay, super::OverlayKind::ScopedModels);
         state.close_overlay();
         assert_eq!(state.overlay, super::OverlayKind::Settings);
-        assert_eq!(state.overlay_selected, 5);
+        assert_eq!(state.overlay_selected, 6);
 
         state.open_overlay(super::OverlayKind::ScopedModels);
         state.toggle_scoped_model();
@@ -5452,7 +5484,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = super::AppState::default();
         state.open_overlay(super::OverlayKind::Settings);
-        state.overlay_selected = 7;
+        state.overlay_selected = 8;
 
         assert!(matches!(
             state.activate_overlay(),
@@ -5468,6 +5500,49 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("Theme"));
         assert!(output.contains("light"));
+    }
+
+    #[test]
+    fn pi_extensions_menu_reports_and_toggles_resolved_sdk_extensions() {
+        let mut state = super::AppState {
+            runtime_extensions: vec![
+                pi_harness::RuntimeExtension {
+                    path: "/home/user/.pi/agent/extensions/review.ts".into(),
+                    label: "review.ts".into(),
+                    source: "local".into(),
+                    scope: "user".into(),
+                    enabled: true,
+                    loaded: true,
+                },
+                pi_harness::RuntimeExtension {
+                    path: "/project/.pi/extensions/legacy.ts".into(),
+                    label: "legacy.ts".into(),
+                    source: "local".into(),
+                    scope: "project".into(),
+                    enabled: false,
+                    loaded: false,
+                },
+            ],
+            ..super::AppState::default()
+        };
+        state.open_overlay(super::OverlayKind::Settings);
+        state.overlay_selected = 5;
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::None
+        ));
+        assert_eq!(state.overlay, super::OverlayKind::Extensions);
+        assert_eq!(
+            state.overlay_items(),
+            vec!["[✓] review.ts", "[ ] legacy.ts"]
+        );
+
+        assert!(matches!(
+            state.activate_overlay(),
+            super::state::OverlayAction::SetExtensionEnabled { path, enabled }
+                if path.ends_with("review.ts") && !enabled
+        ));
+        assert!(state.runtime_extensions[0].enabled);
     }
 
     #[test]

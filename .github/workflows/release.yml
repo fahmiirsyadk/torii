@@ -65,11 +65,13 @@ jobs:
           test "$(node -p "require('./sidecar/package.json').version")" = "$version"
       - name: Install sidecar dependencies
         run: npm ci --prefix sidecar
-      - name: Test
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+      - name: Test SDK sidecar
+        working-directory: sidecar
         run: |
-          cargo test --workspace --locked
-          bun --cwd sidecar run check
-          bun --cwd sidecar run test
+          bun run check
+          bun run test
       - name: Build Rust host
         run: cargo build --release --locked -p torii --target ${{ matrix.rust_target }}
       - name: Assemble release

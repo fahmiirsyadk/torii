@@ -25,6 +25,7 @@ import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
   createAgentSessionServices,
+  DefaultPackageManager,
   type AgentSession,
   type AgentSessionEvent,
   type ExtensionAPI,
@@ -37,6 +38,7 @@ import {
   getAgentDir,
   SessionManager,
   type SettingsManager,
+  type ResolvedResource,
 } from "@earendil-works/pi-coding-agent";
 
 // OAuth callback types — the SDK reuses Pi-AI's OAuth shapes. We mirror them
@@ -79,6 +81,7 @@ export interface ActiveSession {
   agentDir: string;
   lastCompletion?: Extract<AgentEvent, { type: "turn_complete" }>;
   toolStarted: Map<string, number>;
+  compacting: boolean;
 }
 
 const PARENT_ONLY_TOOLS = new Set([
@@ -806,9 +809,11 @@ export function handlePiEvent(
       emitEvent(sessionId, { type: "thinking_changed", level: event.level });
       break;
     case "compaction_start":
+      active.compacting = true;
       emitEvent(sessionId, { type: "compaction", phase: "start", reason: event.reason });
       break;
     case "compaction_end": {
+      active.compacting = false;
       const payload: {
         type: "compaction";
         phase: "end";
@@ -833,6 +838,17 @@ export function handlePiEvent(
       emitEvent(sessionId, payload);
       break;
     }
+  }
+  if (
+    event.type === "agent_start"
+    || event.type === "agent_settled"
+    || event.type === "queue_update"
+    || event.type === "compaction_start"
+    || event.type === "compaction_end"
+    || event.type === "auto_retry_start"
+    || event.type === "auto_retry_end"
+  ) {
+    emitEvent(sessionId, runtimeState(active));
   }
 }
 
@@ -987,10 +1003,30 @@ export async function openSession(
     settingsManager: services.settingsManager,
     agentDir: services.agentDir,
     toolStarted: new Map(),
+    compacting: false,
   };
-  const history = loadedHistory(session, sessionManager);
+  const history = [...loadedHistory(session, sessionManager), runtimeState(active)];
   await bindRuntime(active, hooks.emitEvent);
   return { active, history };
+}
+
+export function runtimeState(active: ActiveSession): AgentEvent {
+  const context = active.session.getContextUsage();
+  return {
+    type: "runtime_state",
+    idle: active.session.isIdle,
+    streaming: active.session.isStreaming,
+    compacting: active.compacting,
+    ...(context?.tokens === null || context?.tokens === undefined
+      ? {}
+      : { context_tokens: context.tokens }),
+    ...(context === undefined
+      ? {}
+      : {
+          context_window: context.contextWindow,
+          ...(context.percent === null ? {} : { context_percent: context.percent }),
+        }),
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -1039,7 +1075,21 @@ export function listAuthProviders(active: ActiveSession) {
     }));
 }
 
-export function listResources(active: ActiveSession) {
+function extensionLabel(path: string): string {
+  const name = basename(path);
+  return name === "index.ts" || name === "index.js" ? basename(dirname(path)) : name;
+}
+
+async function resolvedExtensions(active: ActiveSession): Promise<ResolvedResource[]> {
+  const manager = new DefaultPackageManager({
+    cwd: active.cwd,
+    agentDir: active.agentDir,
+    settingsManager: active.settingsManager,
+  });
+  return (await manager.resolve(async () => "skip")).extensions;
+}
+
+export async function listResources(active: ActiveSession) {
   const loader = active.session.resourceLoader;
   const prompts = loader.getPrompts().prompts.map((prompt) => ({ name: `/${prompt.name}`, description: prompt.description || "Prompt template", source: "prompt" }));
   const skills = loader.getSkills().skills.map((skill) => ({ name: `/skill:${skill.name}`, description: skill.description || "Agent skill", source: "skill" }));
@@ -1047,10 +1097,65 @@ export function listResources(active: ActiveSession) {
     .getExtensions()
     .extensions.flatMap((extension) => [...extension.commands.values()])
     .map((registered) => ({ name: `/${registered.name}`, description: registered.description ?? "Extension command", source: "extension" }));
+  const loaded = new Set(loader.getExtensions().extensions.map((extension) => resolve(extension.path)));
+  const configurable = (await resolvedExtensions(active)).map((extension) => ({
+    path: extension.path,
+    label: extensionLabel(extension.path),
+    source: extension.metadata.source,
+    scope: extension.metadata.scope,
+    enabled: extension.enabled,
+    loaded: loaded.has(resolve(extension.path)),
+  }));
   return {
     commands: [...extensions, ...prompts, ...skills],
     context_files: loader.getAgentsFiles().agentsFiles.map((file) => file.path),
+    extensions: configurable,
   };
+}
+
+function stripResourcePrefix(value: string): string {
+  return /^[!+-]/.test(value) ? value.slice(1) : value;
+}
+
+export async function setExtensionEnabled(active: ActiveSession, path: string, enabled: boolean): Promise<void> {
+  const extension = (await resolvedExtensions(active)).find((candidate) => resolve(candidate.path) === resolve(path));
+  if (extension === undefined) throw new Error(`Pi extension not found: ${path}`);
+  if (extension.metadata.scope === "temporary") throw new Error("temporary Pi extensions cannot be persisted");
+
+  const project = extension.metadata.scope === "project";
+  if (extension.metadata.origin === "top-level") {
+    const settings = project
+      ? active.settingsManager.getProjectSettings()
+      : active.settingsManager.getGlobalSettings();
+    const base = extension.metadata.baseDir ?? (project ? join(active.cwd, ".pi") : active.agentDir);
+    const pattern = relative(base, extension.path);
+    const updated = [...(settings.extensions ?? [])]
+      .filter((entry) => stripResourcePrefix(entry) !== pattern);
+    updated.push(`${enabled ? "+" : "-"}${pattern}`);
+    if (project) active.settingsManager.setProjectExtensionPaths(updated);
+    else active.settingsManager.setExtensionPaths(updated);
+  } else {
+    const settings = project
+      ? active.settingsManager.getProjectSettings()
+      : active.settingsManager.getGlobalSettings();
+    const packages = [...(settings.packages ?? [])];
+    const index = packages.findIndex((entry) =>
+      (typeof entry === "string" ? entry : entry.source) === extension.metadata.source
+    );
+    if (index < 0) throw new Error(`Pi package not configured: ${extension.metadata.source}`);
+    const current = packages[index]!;
+    const entry = typeof current === "string" ? { source: current } : { ...current };
+    const pattern = relative(extension.metadata.baseDir ?? dirname(extension.path), extension.path);
+    const filters = [...(entry.extensions ?? [])]
+      .filter((value) => stripResourcePrefix(value) !== pattern);
+    filters.push(`${enabled ? "+" : "-"}${pattern}`);
+    entry.extensions = filters;
+    packages[index] = entry;
+    if (project) active.settingsManager.setProjectPackages(packages);
+    else active.settingsManager.setPackages(packages);
+  }
+  await active.settingsManager.flush();
+  await active.session.reload();
 }
 
 export function getSettings(active: ActiveSession) {

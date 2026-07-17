@@ -180,7 +180,9 @@ async fn main() -> Result<()> {
                         status
                     }
                     Ok(None) => pi_harness::AppUpdateStatus::Current,
-                    Err(_) => pi_harness::AppUpdateStatus::Current,
+                    Err(error) => pi_harness::AppUpdateStatus::Failed {
+                        message: error.to_string(),
+                    },
                 };
                 update_supervisor
                     .publish_host_event(AgentEvent::AppUpdate { status })
@@ -441,6 +443,11 @@ async fn main() -> Result<()> {
                     pi_tui::UiCommand::SetScopedModels(models) => {
                         let _ = command_harness
                             .set_scoped_models(&command_session, models)
+                            .await;
+                    }
+                    pi_tui::UiCommand::SetExtensionEnabled { path, enabled } => {
+                        let _ = command_harness
+                            .set_extension_enabled(&command_session, path, enabled)
                             .await;
                     }
                     pi_tui::UiCommand::ExportSession(path) => {

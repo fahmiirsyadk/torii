@@ -4,6 +4,7 @@ export type SidecarCommand =
   | { type: "list_files"; request_id: string; session_id: string }
   | { type: "list_resources"; request_id: string; session_id: string }
   | { type: "reload_resources"; request_id: string; session_id: string }
+  | { type: "set_extension_enabled"; request_id: string; session_id: string; path: string; enabled: boolean }
   | { type: "get_settings"; request_id: string; session_id: string }
   | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust" | "subagent_model"; value: string | boolean | null }
   | { type: "set_scoped_models"; request_id: string; session_id: string; models: string[] }
@@ -83,6 +84,7 @@ export type SidecarMessage =
       resources?: {
         commands: Array<{ name: string; description: string; source: string }>;
         context_files: string[];
+        extensions: Array<{ path: string; label: string; source: string; scope: string; enabled: boolean; loaded: boolean }>;
       };
       settings?: {
         steering_mode: "all" | "one-at-a-time";
@@ -141,6 +143,7 @@ export type SidecarMessage =
 
 export type AgentEvent =
   | { type: "session_reset" }
+  | { type: "runtime_state"; idle: boolean; streaming: boolean; compacting: boolean; context_tokens?: number; context_window?: number; context_percent?: number }
   | { type: "user_message"; text: string }
   | { type: "model_changed"; id: string; display_name: string }
   | { type: "session_info"; summary: string }

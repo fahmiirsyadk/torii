@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.1 - 2026-07-17
+
+### Pi runtime
+
+- Pi is the default backend; the mock backend remains available through
+  `--backend mock`.
+- Resumed sessions restore Pi's authoritative context usage and live working
+  state instead of reconstructing them from incomplete transcript events.
+- Settings now lists resolved Pi extensions and persists enable or disable
+  choices through Pi's package configuration.
+
+### Dashboard and updates
+
+- Dashboard sessions reuse the bounded picker pager, with keyboard paging and
+  consistent scrollbar behavior.
+- Resumed session attention is derived from unresolved current work rather than
+  stale historical failures.
+- Background update-check failures are reported instead of appearing current.
+- Release builds run the Rust and TypeScript test suites before packaging.
+
 ## 0.1.0 - 2026-07-17
 
 First public release.

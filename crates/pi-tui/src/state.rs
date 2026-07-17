@@ -286,6 +286,7 @@ pub enum OverlayKind {
     LabelEditor,
     FilePicker,
     ScopedModels,
+    Extensions,
     SubagentModelPicker,
     OauthPrompt,
     OauthSelect,
@@ -379,6 +380,10 @@ pub enum OverlayAction {
     },
     SetProjectTrust(bool),
     SetScopedModels(Vec<String>),
+    SetExtensionEnabled {
+        path: String,
+        enabled: bool,
+    },
     ExportSession(Option<String>),
     ImportSession(String),
     CopyLast,
@@ -623,6 +628,7 @@ pub struct AppState {
     pub cwd: String,
     pub theme_mode: ThemeMode,
     pub context_used: u64,
+    pub context_known: bool,
     pub context_limit: u64,
     pub tasks_complete: usize,
     pub tasks_total: usize,
@@ -712,6 +718,7 @@ pub struct AppState {
     pub available_files: Vec<String>,
     pub runtime_commands: Vec<RuntimeCommand>,
     pub context_files: Vec<String>,
+    pub runtime_extensions: Vec<pi_harness::RuntimeExtension>,
     pub runtime_settings: RuntimeSettings,
     pub session_tree: Vec<SessionTreeEntry>,
     pub rewind_checkpoints: Vec<pi_harness::RewindCheckpoint>,
@@ -770,6 +777,7 @@ impl Default for AppState {
             cwd: "~/dev/torii".into(),
             theme_mode: ThemeMode::Dark,
             context_used: 0,
+            context_known: false,
             context_limit: 200_000,
             tasks_complete: 0,
             tasks_total: 0,
@@ -852,6 +860,7 @@ impl Default for AppState {
             available_files: Vec::new(),
             runtime_commands: Vec::new(),
             context_files: Vec::new(),
+            runtime_extensions: Vec::new(),
             runtime_settings: RuntimeSettings::default(),
             session_tree: Vec::new(),
             rewind_checkpoints: Vec::new(),
@@ -1091,8 +1100,9 @@ impl AppState {
         let selected = self
             .dashboard_selected
             .min(self.available_sessions.len().saturating_sub(1));
-        let start = selected.saturating_sub(visible_rows.saturating_sub(1));
-        let index = start + row;
+        let viewport =
+            crate::picker::list_viewport(selected, self.available_sessions.len(), visible_rows);
+        let index = viewport.start + row;
         (index < self.available_sessions.len()).then_some(index)
     }
 
@@ -1340,6 +1350,7 @@ impl AppState {
                 self.workflow_runs.clear();
                 self.workflow_artifact = None;
                 self.context_used = 0;
+                self.context_known = false;
                 self.scroll_from_bottom = 0;
                 OverlayAction::None
             }
@@ -1563,6 +1574,7 @@ impl AppState {
                         "no"
                     }
                 ),
+                format!("Pi extensions: {}", self.runtime_extensions.len()),
                 format!(
                     "Scoped models: {}",
                     self.runtime_settings.enabled_models.len()
@@ -1576,6 +1588,17 @@ impl AppState {
                 ),
                 format!("Theme: {}", self.theme_mode.label()),
             ],
+            OverlayKind::Extensions => self
+                .filtered_extensions()
+                .into_iter()
+                .map(|extension| {
+                    format!(
+                        "[{}] {}",
+                        if extension.enabled { "✓" } else { " " },
+                        extension.label
+                    )
+                })
+                .collect(),
             OverlayKind::ScopedModels => self
                 .filtered_models()
                 .into_iter()
@@ -1647,6 +1670,7 @@ impl AppState {
                     OverlayKind::SessionPicker
                         | OverlayKind::ModelPicker
                         | OverlayKind::WorkflowPicker
+                        | OverlayKind::Extensions
                         | OverlayKind::ScopedModels
                         | OverlayKind::SubagentModelPicker
                 ) || query.is_empty()
@@ -1672,6 +1696,19 @@ impl AppState {
                 .then_with(|| left.display_name.cmp(&right.display_name))
         });
         models
+    }
+
+    pub(crate) fn filtered_extensions(&self) -> Vec<&pi_harness::RuntimeExtension> {
+        let query = self.overlay_query.trim().to_ascii_lowercase();
+        self.runtime_extensions
+            .iter()
+            .filter(|extension| {
+                query.is_empty()
+                    || extension.label.to_ascii_lowercase().contains(&query)
+                    || extension.path.to_ascii_lowercase().contains(&query)
+                    || extension.source.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
     }
 
     pub(crate) fn filtered_workflows(&self) -> Vec<&WorkflowCatalogEntry> {
@@ -1916,6 +1953,7 @@ impl AppState {
                 | OverlayKind::ImageViewer
                 | OverlayKind::LabelEditor
                 | OverlayKind::FilePicker
+                | OverlayKind::Extensions
                 | OverlayKind::ScopedModels
                 | OverlayKind::SubagentModelPicker
                 | OverlayKind::OauthPrompt
@@ -2221,10 +2259,14 @@ impl AppState {
                     }
                     4 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
                     5 => {
-                        self.open_child_overlay(OverlayKind::ScopedModels);
+                        self.open_child_overlay(OverlayKind::Extensions);
                         return OverlayAction::None;
                     }
                     6 => {
+                        self.open_child_overlay(OverlayKind::ScopedModels);
+                        return OverlayAction::None;
+                    }
+                    7 => {
                         self.open_child_overlay(OverlayKind::SubagentModelPicker);
                         return OverlayAction::None;
                     }
@@ -2236,6 +2278,18 @@ impl AppState {
                 };
                 self.apply_runtime_setting(&action);
                 return action;
+            }
+            OverlayKind::Extensions => {
+                let extensions = self.filtered_extensions();
+                let Some(extension) = extensions.get(self.overlay_selected) else {
+                    return OverlayAction::None;
+                };
+                if extension.scope == "temporary" {
+                    return OverlayAction::None;
+                }
+                let path = extension.path.clone();
+                let enabled = !extension.enabled;
+                return OverlayAction::SetExtensionEnabled { path, enabled };
             }
             OverlayKind::ScopedModels => {
                 let models = self.runtime_settings.enabled_models.clone();
@@ -3811,6 +3865,26 @@ impl AppState {
 
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::RuntimeState {
+                idle,
+                streaming,
+                compacting,
+                context_tokens,
+                context_window,
+                ..
+            } => {
+                self.context_known = context_tokens.is_some();
+                if let Some(tokens) = context_tokens {
+                    self.context_used = tokens;
+                }
+                if let Some(window) = context_window {
+                    self.context_limit = window;
+                }
+                self.streaming = streaming;
+                if idle && !compacting {
+                    self.turn_started_at = None;
+                }
+            }
             AgentEvent::AppUpdate { status } => {
                 self.app_update = (!matches!(status, AppUpdateStatus::Current)).then_some(status);
             }
@@ -3833,6 +3907,7 @@ impl AppState {
                 self.overlay_stack.clear();
                 self.escape_armed_at = None;
                 self.context_used = 0;
+                self.context_known = false;
                 self.scroll_from_bottom = 0;
                 self.status = "session resumed".into();
                 self.streaming = false;
@@ -3936,6 +4011,7 @@ impl AppState {
             AgentEvent::ResourcesChanged { resources } => {
                 self.runtime_commands = resources.commands;
                 self.context_files = resources.context_files;
+                self.runtime_extensions = resources.extensions;
                 self.status = "resources reloaded".into();
             }
             AgentEvent::OauthRequest {
@@ -4218,6 +4294,7 @@ impl AppState {
                 ..
             } => {
                 self.context_used = input_tokens + output_tokens;
+                self.context_known = true;
                 self.turn_input_tokens = input_tokens;
                 self.turn_output_chars = 0;
                 self.turn_started_at = None;

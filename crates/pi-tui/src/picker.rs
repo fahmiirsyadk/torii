@@ -65,6 +65,21 @@ pub struct PickerLayout {
     pub selected_visual: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ListViewport {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub fn list_viewport(selected: usize, total: usize, capacity: usize) -> ListViewport {
+    let capacity = capacity.max(1);
+    let start = centered_window(selected.min(total.saturating_sub(1)), total, capacity);
+    ListViewport {
+        start,
+        end: (start + capacity).min(total),
+    }
+}
+
 pub fn layout(area: Rect, spec: &PickerSpec<'_>, selected: usize) -> PickerLayout {
     let width = area
         .width
@@ -91,14 +106,14 @@ pub fn layout(area: Rect, spec: &PickerSpec<'_>, selected: usize) -> PickerLayou
         .iter()
         .position(|row| row.item_index == Some(selected));
     let capacity = usize::from(rows_area.height).max(1);
-    let visible_start = selected_visual
-        .map(|visual| centered_window(visual, spec.rows.len(), capacity))
-        .unwrap_or(0);
+    let viewport = selected_visual
+        .map(|visual| list_viewport(visual, spec.rows.len(), capacity))
+        .unwrap_or_default();
     PickerLayout {
         modal,
         rows: rows_area,
-        visible_start,
-        visible_end: (visible_start + capacity).min(spec.rows.len()),
+        visible_start: viewport.start,
+        visible_end: viewport.end,
         selected_visual,
     }
 }

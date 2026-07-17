@@ -68,6 +68,14 @@ pub enum AgentErrorKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    RuntimeState {
+        idle: bool,
+        streaming: bool,
+        compacting: bool,
+        context_tokens: Option<u64>,
+        context_window: Option<u64>,
+        context_percent: Option<f64>,
+    },
     AppUpdate {
         status: AppUpdateStatus,
     },
@@ -527,6 +535,8 @@ pub struct SessionTreeEntry {
 pub struct RuntimeResources {
     pub commands: Vec<RuntimeCommand>,
     pub context_files: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<RuntimeExtension>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -534,6 +544,16 @@ pub struct RuntimeCommand {
     pub name: String,
     pub description: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeExtension {
+    pub path: String,
+    pub label: String,
+    pub source: String,
+    pub scope: String,
+    pub enabled: bool,
+    pub loaded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -622,6 +642,12 @@ pub trait AgentHarness: Send + Sync {
     async fn list_files(&self, id: &SessionId) -> Result<Vec<String>>;
     async fn runtime_resources(&self, id: &SessionId) -> Result<RuntimeResources>;
     async fn reload_resources(&self, id: &SessionId) -> Result<()>;
+    async fn set_extension_enabled(
+        &self,
+        id: &SessionId,
+        path: String,
+        enabled: bool,
+    ) -> Result<RuntimeResources>;
     async fn runtime_settings(&self, id: &SessionId) -> Result<RuntimeSettings>;
     async fn set_runtime_setting(&self, id: &SessionId, key: String, value: Value) -> Result<()>;
     async fn set_scoped_models(&self, id: &SessionId, models: Vec<String>) -> Result<()>;
@@ -849,6 +875,14 @@ impl AgentHarness for MockHarness {
     }
     async fn reload_resources(&self, _id: &SessionId) -> Result<()> {
         Ok(())
+    }
+    async fn set_extension_enabled(
+        &self,
+        _id: &SessionId,
+        _path: String,
+        _enabled: bool,
+    ) -> Result<RuntimeResources> {
+        Ok(RuntimeResources::default())
     }
     async fn runtime_settings(&self, _id: &SessionId) -> Result<RuntimeSettings> {
         Ok(RuntimeSettings::default())

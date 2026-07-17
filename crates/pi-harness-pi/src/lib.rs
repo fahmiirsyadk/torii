@@ -553,6 +553,40 @@ impl AgentHarness for PiHarness {
         Ok(())
     }
 
+    async fn set_extension_enabled(
+        &self,
+        id: &SessionId,
+        path: String,
+        enabled: bool,
+    ) -> Result<RuntimeResources> {
+        let resources = self
+            .request_with_timeout(
+                json!({
+                    "type": "set_extension_enabled",
+                    "session_id": id.0,
+                    "path": path,
+                    "enabled": enabled,
+                }),
+                None,
+                INFERENCE_OPERATION_TIMEOUT,
+            )
+            .await?
+            .resources
+            .unwrap_or_default();
+        if let Some(sender) = self
+            .inner
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("Pi session map lock poisoned"))?
+            .get(id)
+        {
+            let _ = sender.send(AgentEvent::ResourcesChanged {
+                resources: resources.clone(),
+            });
+        }
+        Ok(resources)
+    }
+
     async fn runtime_settings(&self, id: &SessionId) -> Result<RuntimeSettings> {
         Ok(self
             .request(json!({ "type": "get_settings", "session_id": id.0 }), None)

@@ -62,6 +62,16 @@ impl Resident {
     /// Fold one event into the live runtime status/timer bookkeeping.
     fn observe(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::RuntimeState { idle, .. } => {
+                self.turn_running = !idle;
+                if !idle || !self.background_tasks.is_empty() {
+                    self.status = RuntimeStatus::Running;
+                    self.started_at.get_or_insert_with(Instant::now);
+                } else if self.status != RuntimeStatus::Attention {
+                    self.status = RuntimeStatus::Idle;
+                    self.started_at = None;
+                }
+            }
             AgentEvent::UserMessage { .. } => {
                 self.turn_running = true;
                 self.status = RuntimeStatus::Running;
@@ -150,17 +160,38 @@ impl Resident {
         self.running_tools.clear();
         self.background_tasks.clear();
         self.started_at = None;
-        let needs_attention = self.history.iter().any(|event| match event {
-            AgentEvent::SubagentUpdate { task } => {
-                task.status == "failed" || task.status == "interrupted"
-            }
-            AgentEvent::Error { .. } => true,
-            AgentEvent::WorkflowUpdate { workflow } => matches!(
-                workflow.status.as_str(),
-                "failed" | "interrupted" | "paused"
-            ),
-            _ => false,
+        let last_completed = self
+            .history
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::TurnComplete { .. }));
+        let unresolved_error = self.history.iter().enumerate().any(|(index, event)| {
+            matches!(event, AgentEvent::Error { .. })
+                && last_completed.is_none_or(|completed| index > completed)
         });
+        let mut task_states = HashMap::new();
+        let mut workflow_states = HashMap::new();
+        for event in self.history.iter().rev() {
+            match event {
+                AgentEvent::SubagentUpdate { task } => {
+                    task_states
+                        .entry(task.task_id.clone())
+                        .or_insert_with(|| task.status.clone());
+                }
+                AgentEvent::WorkflowUpdate { workflow } => {
+                    workflow_states
+                        .entry(workflow.run_id.clone())
+                        .or_insert_with(|| workflow.status.clone());
+                }
+                _ => {}
+            }
+        }
+        let needs_attention = unresolved_error
+            || task_states
+                .values()
+                .any(|status| status == "failed" || status == "interrupted")
+            || workflow_states
+                .values()
+                .any(|status| matches!(status.as_str(), "failed" | "interrupted" | "paused"));
         self.status = if needs_attention {
             RuntimeStatus::Attention
         } else {

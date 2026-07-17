@@ -155,13 +155,19 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   }
 
   if (command.type === "list_resources") {
-    writeMessage({ type: "response", request_id: command.request_id, resources: pi.listResources(active) });
+    writeMessage({ type: "response", request_id: command.request_id, resources: await pi.listResources(active) });
     return;
   }
 
   if (command.type === "reload_resources") {
     await pi.reloadSession(active);
     writeMessage({ type: "response", request_id: command.request_id });
+    return;
+  }
+
+  if (command.type === "set_extension_enabled") {
+    await pi.setExtensionEnabled(active, command.path, command.enabled);
+    writeMessage({ type: "response", request_id: command.request_id, resources: await pi.listResources(active) });
     return;
   }
 

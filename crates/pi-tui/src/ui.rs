@@ -1461,14 +1461,14 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     let selected = state
         .dashboard_selected
         .min(state.available_sessions.len().saturating_sub(1));
-    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let viewport = crate::picker::list_viewport(selected, state.available_sessions.len(), visible);
     let mut lines = Vec::new();
     for (index, session) in state
         .available_sessions
         .iter()
         .enumerate()
-        .skip(start)
-        .take(visible)
+        .skip(viewport.start)
+        .take(viewport.end.saturating_sub(viewport.start))
     {
         let selected_here = index == selected;
         let runtime = state.runtime_sessions.get(&session.path);
@@ -1546,6 +1546,14 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         chunks[3].height,
     )));
     frame.render_widget(Paragraph::new(lines), chunks[3]);
+    crate::picker::render_scrollbar_for(
+        frame,
+        chunks[3],
+        viewport.start,
+        viewport.end.saturating_sub(viewport.start),
+        state.available_sessions.len(),
+        theme,
+    );
     let actions = state.dashboard_actions();
     let mut footer = String::from("↑/↓ select   Enter open   n new   r rename");
     if actions.delete {
@@ -1733,7 +1741,11 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: The
     } else {
         ""
     };
-    let used_label = compact_number(context_used);
+    let used_label = if state.context_known {
+        compact_number(context_used)
+    } else {
+        "?".into()
+    };
     let limit_label = compact_number(state.context_limit);
     let token_label = format!("{estimate}{used_label} / {limit_label}");
     let context_label = if state.header_hover == Some(4) {
