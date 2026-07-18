@@ -441,13 +441,19 @@ fn render_workflow_widget(frame: &mut Frame<'_>, area: Rect, state: &AppState, t
         workflow.completed_steps.min(workflow.total_steps),
         workflow.total_steps
     );
+    let elapsed = matches!(workflow.status.as_str(), "pending" | "running").then(|| {
+        format_dashboard_elapsed(unix_time_ms().saturating_sub(u128::from(workflow.created_at_ms)))
+    });
     let suffix = if workflow.status == "paused" {
         "click to review and approve"
     } else {
         "click to inspect"
     };
+    let elapsed = elapsed
+        .map(|elapsed| format!(" · {elapsed}"))
+        .unwrap_or_default();
     let label = format!(
-        " {marker} Workflow {} Â· {status} Â· {progress}{step} Â· {suffix}",
+        " {marker} Workflow {} · {status}{elapsed} · {progress}{step} · {suffix}",
         workflow.name
     );
     frame.render_widget(
@@ -615,6 +621,7 @@ fn render_workflows(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     );
 
     let mut details = Vec::new();
+    let mut active_line = None;
     if let Some(workflow) = state.selected_workflow() {
         if let Some(description) = &workflow.description {
             details.push(Line::from(Span::styled(
@@ -685,6 +692,9 @@ fn render_workflows(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
             details.push(Line::raw(""));
         }
         for step in &workflow.steps {
+            if workflow.current_step.as_deref() == Some(step.id.as_str()) {
+                active_line = Some(details.len());
+            }
             let marker = match step.status.as_str() {
                 "completed" => "[x]",
                 "skipped" => "[~]",
@@ -764,6 +774,9 @@ fn render_workflows(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
                 append_workflow_observability(&mut details, observability, "       ", theme);
             }
             for child in &step.children {
+                if workflow.current_step.as_deref() == Some(child.id.as_str()) {
+                    active_line = Some(details.len());
+                }
                 let marker = match child.status.as_str() {
                     "completed" => "[x]",
                     "skipped" => "[~]",
@@ -834,8 +847,14 @@ fn render_workflows(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
             Style::default().fg(theme.muted),
         )));
     }
+    let viewport_height = usize::from(columns[1].height.saturating_sub(2)).max(1);
+    let max_scroll = details.len().saturating_sub(viewport_height);
+    let scroll = active_line
+        .map(|line| line.saturating_sub(viewport_height / 2).min(max_scroll))
+        .unwrap_or(0)
+        .min(usize::from(u16::MAX)) as u16;
     frame.render_widget(
-        Paragraph::new(details).block(
+        Paragraph::new(details).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Execution plan ")
@@ -1458,7 +1477,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         vertical: 1,
     });
     let width = area.width.min(86);
-    let height = area.height.min(30);
+    let height = area.height.min(33);
     let panel = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1469,6 +1488,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     let logo_height = if compact { 5 } else { TORII.len() as u16 };
     let chunks = Layout::vertical([
         Constraint::Length(logo_height),
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(4),
@@ -1511,16 +1531,49 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         .alignment(Alignment::Center),
         chunks[1],
     );
+    let input_width = usize::from(chunks[2].width.saturating_sub(4)).max(1);
+    let cursor = state.cursor.min(state.prompt.chars().count());
+    let first = cursor.saturating_sub(input_width.saturating_sub(1));
+    let visible_prompt = state
+        .prompt
+        .chars()
+        .skip(first)
+        .take(input_width)
+        .collect::<String>();
+    frame.render_widget(
+        Paragraph::new(format!("❯ {visible_prompt}"))
+            .style(Style::default().fg(theme.foreground))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(
+                        " New session in {} · /cd PATH switches workspace ",
+                        truncate_text(&state.cwd, 34)
+                    ))
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+        chunks[2],
+    );
+    let cursor_column = cursor
+        .saturating_sub(first)
+        .min(input_width.saturating_sub(1));
+    frame.set_cursor_position((
+        chunks[2]
+            .x
+            .saturating_add(3)
+            .saturating_add(cursor_column as u16),
+        chunks[2].y.saturating_add(1),
+    ));
     frame.render_widget(
         Paragraph::new("Sessions").style(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        chunks[2],
+        chunks[3],
     );
 
-    let visible = chunks[3].height as usize;
+    let visible = chunks[4].height as usize;
     let selected = state
         .dashboard_selected
         .min(state.available_sessions.len().saturating_sub(1));
@@ -1603,30 +1656,30 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         )));
     }
     state.dashboard_list_rect.set(Some((
-        chunks[3].x,
-        chunks[3].y,
-        chunks[3].width,
-        chunks[3].height,
+        chunks[4].x,
+        chunks[4].y,
+        chunks[4].width,
+        chunks[4].height,
     )));
-    frame.render_widget(Paragraph::new(lines), chunks[3]);
+    frame.render_widget(Paragraph::new(lines), chunks[4]);
     crate::picker::render_scrollbar_for(
         frame,
-        chunks[3],
+        chunks[4],
         viewport.start,
         viewport.end.saturating_sub(viewport.start),
         state.available_sessions.len(),
         theme,
     );
     let actions = state.dashboard_actions();
-    let mut footer = String::from("↑/↓ select   Enter open   n new   r rename");
+    let mut footer = String::from("Enter send/open   ^N blank   ↑/↓ select   ^R rename");
     if actions.delete {
-        footer.push_str("   d delete");
+        footer.push_str("   ^D delete");
     }
     if actions.stop {
-        footer.push_str("   s stop");
+        footer.push_str("   ^S stop");
     }
     if actions.close {
-        footer.push_str("   x close");
+        footer.push_str("   ^X close");
     }
     footer.push_str("   Esc return");
     let mut footer_lines = Vec::with_capacity(2);
@@ -1638,7 +1691,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         Paragraph::new(footer_lines)
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.muted)),
-        chunks[4],
+        chunks[5],
     );
 }
 
@@ -1651,7 +1704,7 @@ fn update_status_line(status: &AppUpdateStatus, theme: Theme) -> Line<'static> {
             size_bytes,
         } => (
             format!(
-                "Torii v{version} available  ·  {}  ·  u update   l later",
+                "Torii v{version} available  ·  {}  ·  Ctrl+U update   Ctrl+L later",
                 format_bytes(*size_bytes)
             ),
             theme.accent,

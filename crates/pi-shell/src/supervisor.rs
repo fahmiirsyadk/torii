@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -38,6 +41,9 @@ pub enum RuntimeStatus {
 pub struct TaggedEvent {
     pub session_id: SessionId,
     pub event: AgentEvent,
+    /// Present only for an activation replay. Prevents a delayed replay from
+    /// an older A -> B -> A switch from resetting the current A view.
+    pub activation_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +212,7 @@ pub struct SessionSupervisor {
     harness: Arc<dyn AgentHarness>,
     residents: Arc<RwLock<HashMap<String, Resident>>>,
     active_path: Arc<RwLock<Option<String>>>,
+    active_epoch: Arc<AtomicU64>,
     events: broadcast::Sender<TaggedEvent>,
     tasks: TaskCoordinator,
     workflows: WorkflowCoordinator,
@@ -256,11 +263,13 @@ impl SessionSupervisor {
                 let _ = task_events.send(TaggedEvent {
                     session_id: owner.clone(),
                     event,
+                    activation_epoch: None,
                 });
                 if let Some(sessions) = sessions {
                     let _ = task_events.send(TaggedEvent {
                         session_id: owner,
                         event: AgentEvent::RuntimeSessions { sessions },
+                        activation_epoch: None,
                     });
                 }
             }
@@ -312,11 +321,13 @@ impl SessionSupervisor {
                 let _ = workflow_events.send(TaggedEvent {
                     session_id: owner.clone(),
                     event,
+                    activation_epoch: None,
                 });
                 if let Some(sessions) = sessions {
                     let _ = workflow_events.send(TaggedEvent {
                         session_id: owner,
                         event: AgentEvent::RuntimeSessions { sessions },
+                        activation_epoch: None,
                     });
                 }
             }
@@ -329,6 +340,7 @@ impl SessionSupervisor {
             harness,
             residents,
             active_path: Arc::new(RwLock::new(None)),
+            active_epoch: Arc::new(AtomicU64::new(0)),
             events,
             tasks,
             workflows,
@@ -372,6 +384,7 @@ impl SessionSupervisor {
     pub fn foreground_events(&self) -> broadcast::Receiver<AgentEvent> {
         let mut tagged = self.subscribe();
         let active_path = Arc::clone(&self.active_path);
+        let active_epoch = Arc::clone(&self.active_epoch);
         let residents = Arc::clone(&self.residents);
         let (output, receiver) = broadcast::channel(1024);
         tokio::spawn(async move {
@@ -392,7 +405,11 @@ impl SessionSupervisor {
                 } else {
                     None
                 };
-                if active_id.as_ref() == Some(&message.session_id)
+                let current_epoch = active_epoch.load(Ordering::Acquire);
+                let current_activation = message
+                    .activation_epoch
+                    .is_none_or(|epoch| epoch == current_epoch);
+                if (active_id.as_ref() == Some(&message.session_id) && current_activation)
                     || matches!(&message.event, AgentEvent::RuntimeSessions { .. })
                 {
                     let _ = output.send(message.event);
@@ -410,16 +427,19 @@ impl SessionSupervisor {
             .get(&path)
             .map(|resident| (resident.id.clone(), resident.history.clone()))
         {
+            let epoch = self.active_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             *self.active_path.write().await = Some(path);
             self.emit_snapshots().await;
             let _ = self.events.send(TaggedEvent {
                 session_id: id.clone(),
                 event: AgentEvent::SessionReset,
+                activation_epoch: Some(epoch),
             });
             for event in history {
                 let _ = self.events.send(TaggedEvent {
                     session_id: id.clone(),
                     event,
+                    activation_epoch: Some(epoch),
                 });
             }
             return Ok(id);
@@ -446,10 +466,12 @@ impl SessionSupervisor {
                 background_tasks: HashSet::new(),
             },
         );
+        let epoch = self.active_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         *self.active_path.write().await = Some(path.clone());
         let _ = self.events.send(TaggedEvent {
             session_id: id.clone(),
             event: AgentEvent::SessionReset,
+            activation_epoch: Some(epoch),
         });
         self.forward(path, id.clone(), receiver);
         self.emit_snapshots().await;
@@ -484,14 +506,17 @@ impl SessionSupervisor {
                 background_tasks: HashSet::new(),
             },
         );
+        let epoch = self.active_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         *self.active_path.write().await = Some(path.clone());
         let _ = self.events.send(TaggedEvent {
             session_id: id.clone(),
             event: AgentEvent::SessionReset,
+            activation_epoch: Some(epoch),
         });
         let _ = self.events.send(TaggedEvent {
             session_id: id.clone(),
             event: AgentEvent::SessionsChanged { sessions },
+            activation_epoch: Some(epoch),
         });
         self.forward(path, id.clone(), receiver);
         self.emit_snapshots().await;
@@ -519,6 +544,7 @@ impl SessionSupervisor {
         let _ = self.events.send(TaggedEvent {
             session_id: id,
             event: AgentEvent::SessionsChanged { sessions },
+            activation_epoch: None,
         });
         Ok(())
     }
@@ -596,6 +622,7 @@ impl SessionSupervisor {
             let _ = self.events.send(TaggedEvent {
                 session_id: owner.clone(),
                 event,
+                activation_epoch: None,
             });
         }
         Ok(result)
@@ -624,7 +651,11 @@ impl SessionSupervisor {
             .active_session()
             .await
             .unwrap_or_else(|_| SessionId(String::new()));
-        let _ = self.events.send(TaggedEvent { session_id, event });
+        let _ = self.events.send(TaggedEvent {
+            session_id,
+            event,
+            activation_epoch: None,
+        });
     }
 
     pub async fn stop(&self, path: &str) -> Result<()> {
@@ -682,6 +713,7 @@ impl SessionSupervisor {
         let _ = self.events.send(TaggedEvent {
             session_id,
             event: AgentEvent::RuntimeSessions { sessions },
+            activation_epoch: None,
         });
     }
 
@@ -716,6 +748,7 @@ impl SessionSupervisor {
                             let _ = output.send(TaggedEvent {
                                 session_id: id.clone(),
                                 event: AgentEvent::RuntimeSessions { sessions },
+                                activation_epoch: None,
                             });
                             continue;
                         }
@@ -806,6 +839,7 @@ impl SessionSupervisor {
                 let _ = output.send(TaggedEvent {
                     session_id: id.clone(),
                     event: event.clone(),
+                    activation_epoch: None,
                 });
                 if matches!(event, AgentEvent::OauthComplete { .. })
                     && let Ok(models) = harness.list_models().await
@@ -813,6 +847,7 @@ impl SessionSupervisor {
                     let _ = output.send(TaggedEvent {
                         session_id: id.clone(),
                         event: AgentEvent::ModelsChanged { models },
+                        activation_epoch: None,
                     });
                 }
                 // During replay a single settled snapshot (emitted once the queue
@@ -821,6 +856,7 @@ impl SessionSupervisor {
                     let _ = output.send(TaggedEvent {
                         session_id: id.clone(),
                         event: AgentEvent::RuntimeSessions { sessions },
+                        activation_epoch: None,
                     });
                 }
             }
@@ -1133,5 +1169,54 @@ mod tests {
         let snapshot = &supervisor.snapshots().await[0];
         assert_eq!(snapshot.status, RuntimeStatus::Attention);
         assert!(snapshot.started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_activation_replay_cannot_reset_a_reselected_session() {
+        let supervisor = SessionSupervisor::new(Arc::new(MockHarness::default()));
+        let session_id = SessionId("session-a".into());
+        supervisor.residents.write().await.insert(
+            "a.jsonl".into(),
+            Resident {
+                id: session_id.clone(),
+                status: RuntimeStatus::Running,
+                started_at: Some(Instant::now()),
+                history: Vec::new(),
+                turn_running: true,
+                running_tools: HashMap::new(),
+                background_tasks: HashSet::new(),
+            },
+        );
+        *supervisor.active_path.write().await = Some("a.jsonl".into());
+        supervisor.active_epoch.store(3, Ordering::Release);
+        let mut foreground = supervisor.foreground_events();
+
+        let _ = supervisor.events.send(TaggedEvent {
+            session_id: session_id.clone(),
+            event: AgentEvent::SessionReset,
+            activation_epoch: Some(1),
+        });
+        let _ = supervisor.events.send(TaggedEvent {
+            session_id,
+            event: AgentEvent::UserMessage {
+                text: "latest prompt".into(),
+            },
+            activation_epoch: Some(3),
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), foreground.recv())
+            .await
+            .expect("fresh activation event")
+            .expect("foreground remains open");
+        assert!(matches!(
+            event,
+            AgentEvent::UserMessage { text } if text == "latest prompt"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), foreground.recv())
+                .await
+                .is_err(),
+            "the stale reset must be discarded"
+        );
     }
 }

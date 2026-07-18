@@ -24,7 +24,7 @@ use clipboard_rs::{Clipboard as ClipboardRs, ClipboardContext};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use effects::{TerminalGuard, display_path, git_branch};
+use effects::{TerminalGuard, git_branch};
 pub use fixtures::Story;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -309,6 +309,10 @@ pub enum UiCommand {
         expected_definition_hash: Option<String>,
     },
     NewSession,
+    NewSessionAt {
+        cwd: String,
+        prompt: Option<String>,
+    },
     NameSession(String),
     SessionInfo,
     CloneSession,
@@ -380,6 +384,7 @@ enum LoopWake {
     Input(Option<io::Result<Event>>),
     Agent(Result<pi_harness::AgentEvent, broadcast::error::RecvError>),
     Clipboard(Result<ClipboardPayload, String>),
+    GitRefresh { cwd: String, branch: Option<String> },
     Animation,
 }
 
@@ -561,7 +566,7 @@ pub async fn run(
         ..AppState::default()
     };
     if let Ok(cwd) = std::env::current_dir() {
-        state.cwd = display_path(&cwd);
+        state.set_workspace_cwd(&cwd);
         if let Some(branch) = git_branch(&cwd) {
             state.branch = branch;
         }
@@ -604,6 +609,13 @@ async fn run_app(
     let (_guard, mut terminal) = TerminalGuard::enter()?;
     let mut input = EventStream::new();
     let (image_sender, mut image_receiver) = mpsc::unbounded_channel();
+    if state.workspace_cwd.is_empty()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        state.set_workspace_cwd(&cwd);
+    }
+    let mut git_refresh = tokio::time::interval(Duration::from_secs(1));
+    git_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut dirty = true;
     let mut last_draw_at = None;
     // Every animated glyph in the TUI advances at 80-100 ms. Drawing faster
@@ -645,6 +657,14 @@ async fn run_app(
             clipboard = image_receiver.recv(), if state.image_processing_started_at.is_some() => {
                 LoopWake::Clipboard(clipboard.expect("clipboard worker sender remains alive"))
             },
+            _ = git_refresh.tick() => {
+                let cwd = state.workspace_cwd.clone();
+                let lookup_cwd = PathBuf::from(&cwd);
+                let branch = tokio::task::spawn_blocking(move || git_branch(&lookup_cwd))
+                    .await
+                    .unwrap_or(None);
+                LoopWake::GitRefresh { cwd, branch }
+            },
             _ = tokio::time::sleep(animation_wait) => LoopWake::Animation,
         };
         let input_event = match wake {
@@ -680,6 +700,13 @@ async fn run_app(
                     Err(error) => state.status = format!("clipboard unavailable: {error}"),
                 }
                 dirty = true;
+                continue;
+            }
+            LoopWake::GitRefresh { cwd, branch } => {
+                if cwd == state.workspace_cwd {
+                    state.branch = branch.unwrap_or_else(|| "no-git".into());
+                    dirty = true;
+                }
                 continue;
             }
             LoopWake::Animation => continue,
@@ -1069,6 +1096,45 @@ async fn run_app(
                     KeyCode::Esc if state.view == View::Dashboard => {
                         state.view = View::Transcript;
                     }
+                    KeyCode::Enter
+                        if state.view == View::Dashboard && !state.prompt.trim().is_empty() =>
+                    {
+                        let prompt = state.prompt.trim().to_string();
+                        if let Some(path) = prompt.strip_prefix("/cd ") {
+                            match state.change_workspace(path) {
+                                Ok(()) => state.clear_prompt(),
+                                Err(error) => state.status = error,
+                            }
+                        } else if prompt == "/cd" {
+                            state.status = "usage: /cd <workspace>".into();
+                        } else {
+                            let cwd = state.workspace_cwd.clone();
+                            state.clear_prompt();
+                            if let Some(sender) = &commands {
+                                let _ = sender.send(UiCommand::NewSessionAt {
+                                    cwd,
+                                    prompt: Some(prompt),
+                                });
+                            }
+                            state.view = View::Transcript;
+                        }
+                    }
+                    KeyCode::Backspace if state.view == View::Dashboard => state.backspace(),
+                    KeyCode::Delete if state.view == View::Dashboard => state.delete(),
+                    KeyCode::Left if state.view == View::Dashboard => state.move_cursor_left(),
+                    KeyCode::Right if state.view == View::Dashboard => state.move_cursor_right(),
+                    KeyCode::Home if state.view == View::Dashboard => state.cursor = 0,
+                    KeyCode::End if state.view == View::Dashboard => {
+                        state.cursor = state.prompt.chars().count();
+                    }
+                    KeyCode::Char(character)
+                        if state.view == View::Dashboard
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                    {
+                        state.insert_char(character);
+                    }
                     KeyCode::Up if state.view == View::Dashboard => {
                         state.dashboard_selected = state.dashboard_selected.saturating_sub(1);
                     }
@@ -1101,14 +1167,21 @@ async fn run_app(
                             state.view = View::Transcript;
                         }
                     }
-                    KeyCode::Char('n') if state.view == View::Dashboard => {
+                    KeyCode::Char('n')
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         if let Some(sender) = &commands {
-                            let _ = sender.send(UiCommand::NewSession);
+                            let _ = sender.send(UiCommand::NewSessionAt {
+                                cwd: state.workspace_cwd.clone(),
+                                prompt: None,
+                            });
                         }
                         state.view = View::Transcript;
                     }
                     KeyCode::Char('u')
                         if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(
                                 state.app_update,
                                 Some(pi_harness::AppUpdateStatus::Available { .. })
@@ -1130,17 +1203,28 @@ async fn run_app(
                         }
                     }
                     KeyCode::Char('l')
-                        if state.view == View::Dashboard && state.app_update.is_some() =>
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && state.app_update.is_some() =>
                     {
                         state.app_update = None;
                     }
-                    KeyCode::Char('r') if state.view == View::Dashboard => {
+                    KeyCode::Char('r')
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         state.begin_dashboard_rename();
                     }
-                    KeyCode::Char('d') if state.view == View::Dashboard => {
+                    KeyCode::Char('d')
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         state.begin_dashboard_delete();
                     }
-                    KeyCode::Char('s') if state.view == View::Dashboard => {
+                    KeyCode::Char('s')
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         if state.dashboard_actions().stop
                             && let Some(path) = state.dashboard_selected_path()
                             && let Some(sender) = &commands
@@ -1148,7 +1232,10 @@ async fn run_app(
                             let _ = sender.send(UiCommand::StopResident(path));
                         }
                     }
-                    KeyCode::Char('x') if state.view == View::Dashboard => {
+                    KeyCode::Char('x')
+                        if state.view == View::Dashboard
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         if state.dashboard_actions().close
                             && let Some(path) = state.dashboard_selected_path()
                             && let Some(sender) = &commands
@@ -2460,6 +2547,21 @@ mod tests {
         state.cycle_permission_mode();
         assert_eq!(state.focus, super::Focus::Scrollback);
         assert_eq!(state.permission_mode.label(), "plan");
+    }
+
+    #[test]
+    fn session_replay_restores_its_own_permission_mode() {
+        let mut state = super::AppState::default();
+        state.permission_mode = super::state::PermissionMode::AlwaysApprove;
+        state.apply(AgentEvent::SessionReset);
+        assert_eq!(state.permission_mode, super::state::PermissionMode::Normal);
+        state.apply(AgentEvent::PermissionModeChanged {
+            mode: "always_approve".into(),
+        });
+        assert_eq!(
+            state.permission_mode,
+            super::state::PermissionMode::AlwaysApprove
+        );
     }
 
     #[test]
@@ -6212,7 +6314,84 @@ mod tests {
             other => panic!("expected Compaction entry, got {other:?}"),
         }
         assert_eq!(state.context_used, 22_000);
+        assert!(state.context_known);
+        state.apply(AgentEvent::RuntimeState {
+            idle: true,
+            streaming: false,
+            compacting: false,
+            context_tokens: None,
+            context_window: Some(200_000),
+            context_percent: None,
+        });
+        assert_eq!(
+            state.context_used, 22_000,
+            "a token-less post-compaction snapshot must retain the estimate"
+        );
+        assert!(state.context_known);
         assert_eq!(state.status, "compacted");
+    }
+
+    #[test]
+    fn running_workflow_keeps_animation_active_after_parent_turn_finishes() {
+        let mut state = super::AppState::default();
+        state.workflow_runs.insert(
+            "workflow-1".into(),
+            workflow_snapshot("workflow-1", "running", Some("implement"), 10),
+        );
+        assert!(state.has_background_work());
+        state.workflow_runs.get_mut("workflow-1").unwrap().status = "completed".into();
+        assert!(!state.has_background_work());
+    }
+
+    #[test]
+    fn workflow_view_follows_a_late_active_phase_into_the_viewport() {
+        let mut workflow = workflow_snapshot("workflow-1", "running", Some("phase-19"), 10);
+        workflow.steps = (0..20)
+            .map(|index| pi_harness::WorkflowStepSnapshot {
+                id: format!("phase-{index:02}"),
+                r#type: "agent".into(),
+                status: if index == 19 {
+                    "running".into()
+                } else {
+                    "completed".into()
+                },
+                role: None,
+                model: None,
+                task_ids: Vec::new(),
+                artifact_ids: Vec::new(),
+                error: None,
+                attempt_count: 0,
+                timeout_ms: None,
+                max_attempts: None,
+                output_contract: None,
+                condition: None,
+                children: Vec::new(),
+                observability: None,
+            })
+            .collect();
+        let mut state = super::AppState::default();
+        state.view = super::View::Workflows;
+        state
+            .workflow_runs
+            .insert(workflow.run_id.clone(), workflow);
+        let backend = TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 100, 14);
+        assert!(
+            output.contains("phase-19"),
+            "the active workflow phase must remain visible: {output}"
+        );
+    }
+
+    #[test]
+    fn dashboard_workspace_change_resolves_relative_directories() {
+        let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let mut state = super::AppState::default();
+        state.set_workspace_cwd(&current);
+        state.change_workspace(".").unwrap();
+        assert_eq!(std::path::PathBuf::from(&state.workspace_cwd), current);
+        assert!(!state.cwd.is_empty());
     }
 
     #[test]
@@ -6797,17 +6976,17 @@ mod tests {
         assert!(output.contains("Inactive"));
         assert!(output.contains("Active refactor"));
         assert!(output.contains("2h ago"));
-        assert!(output.contains("s stop"));
-        assert!(output.contains("x close"));
-        assert!(!output.contains("d delete"));
+        assert!(output.contains("^S stop"));
+        assert!(output.contains("^X close"));
+        assert!(!output.contains("^D delete"));
         assert!(!output.contains("Messages total"));
 
         state.dashboard_selected = 1;
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();
         let output = buffer_text(terminal.backend().buffer(), width, height);
-        assert!(output.contains("d delete"));
-        assert!(!output.contains("s stop"));
-        assert!(!output.contains("x close"));
+        assert!(output.contains("^D delete"));
+        assert!(!output.contains("^S stop"));
+        assert!(!output.contains("^X close"));
     }
 
     #[test]
@@ -6845,8 +7024,8 @@ mod tests {
         let output = buffer_text(terminal.backend().buffer(), width, height);
         assert!(output.contains("Torii v0.2.0 available"));
         assert!(output.contains("38.0 MiB"));
-        assert!(output.contains("u update"));
-        assert!(output.contains("l later"));
-        assert!(output.contains("Enter open"));
+        assert!(output.contains("Ctrl+U update"));
+        assert!(output.contains("Ctrl+L later"));
+        assert!(output.contains("Enter send/open"));
     }
 }

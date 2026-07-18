@@ -83,6 +83,9 @@ pub enum AgentEvent {
         sessions: Vec<RuntimeSessionInfo>,
     },
     SessionReset,
+    PermissionModeChanged {
+        mode: String,
+    },
     UserMessage {
         text: String,
     },

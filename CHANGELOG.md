@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.5 - 2026-07-18
+
+### Multi-session workspaces
+
+- The dashboard now has a new-session prompt and supports `/cd PATH` for
+  dispatching resident sessions into different project workspaces.
+- Rapid switching between multiple running sessions uses activation generations
+  so a delayed replay cannot reset the selected transcript, hide its newest
+  prompt, or make live work appear stopped.
+- Permission modes are durable per session. Normal, plan, and always-approve
+  state restore correctly when switching or reopening a session.
+
+### Live runtime accuracy
+
+- Git branch state refreshes asynchronously for the active workspace instead of
+  remaining a startup snapshot.
+- Post-compaction context estimates remain visible until Pi supplies a newer
+  authoritative token count.
+- Running workflows keep their elapsed indicator animated and automatically
+  keep the active phase inside the execution-plan viewport.
+
 ## 0.1.4 - 2026-07-17
 
 ### Sessions and interaction

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { grokToolsExtension, isTopLevelSession, loadedHistory, readToriiSettings, writeToriiSubagentModel } from "./pi-adapter.ts";
+import { grokToolsExtension, isTopLevelSession, loadedHistory, readToriiSettings, storedPermissionMode, writeToriiSubagentModel } from "./pi-adapter.ts";
 
 test("Pi null and missing parent paths both identify top-level sessions", () => {
   assert.equal(isTopLevelSession(undefined), true);
@@ -94,6 +94,18 @@ test("Torii subagent model override persists independently of Pi settings", () =
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
   }
+});
+
+test("permission mode restores from the latest durable session entry", () => {
+  const manager = {
+    getEntries: () => [
+      { type: "custom", customType: "torii.permission_mode", data: { mode: "plan" } },
+      { type: "custom", customType: "unrelated", data: { mode: "normal" } },
+      { type: "custom", customType: "torii.permission_mode", data: { mode: "always_approve" } },
+    ],
+  } as unknown as Parameters<typeof storedPermissionMode>[0];
+  assert.equal(storedPermissionMode(manager), "always_approve");
+  assert.equal(storedPermissionMode({ getEntries: () => [] } as unknown as Parameters<typeof storedPermissionMode>[0]), "normal");
 });
 
 test("parent Grok tool extension exposes Rust-owned task controls", () => {

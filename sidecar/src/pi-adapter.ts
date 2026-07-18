@@ -1381,6 +1381,25 @@ export function listRewinds(active: ActiveSession) {
   }).reverse();
 }
 
+export type PermissionMode = "normal" | "plan" | "always_approve";
+
+export function storedPermissionMode(
+  sessionManager: Pick<SessionManager, "getEntries">,
+): PermissionMode {
+  for (const entry of [...sessionManager.getEntries()].reverse()) {
+    if (entry.type !== "custom" || entry.customType !== "torii.permission_mode") continue;
+    const data = entry.data;
+    if (typeof data !== "object" || data === null || !("mode" in data)) continue;
+    const mode = data.mode;
+    if (mode === "normal" || mode === "plan" || mode === "always_approve") return mode;
+  }
+  return "normal";
+}
+
+export function persistPermissionMode(active: ActiveSession, mode: PermissionMode): void {
+  active.session.sessionManager.appendCustomEntry("torii.permission_mode", { mode });
+}
+
 export function rewindToCheckpoint(active: ActiveSession, checkpointId: string): string {
   const entry = active.session.sessionManager.getEntry(checkpointId);
   if (entry?.type !== "custom" || (entry.customType !== "torii.rewind" && entry.customType !== "pi-shell.rewind")) throw new Error("rewind checkpoint not found");

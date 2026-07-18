@@ -245,6 +245,39 @@ async fn main() -> Result<()> {
                     let _ = command_supervisor.create(None).await;
                     continue;
                 }
+                if let pi_tui::UiCommand::NewSessionAt { cwd, prompt } = &command {
+                    match command_supervisor.create(Some(cwd.clone())).await {
+                        Ok(session) => {
+                            if let Some(prompt) = prompt.clone() {
+                                command_supervisor.mark_running(&session).await;
+                                if let Err(error) = command_harness
+                                    .deliver_message(&session, prompt, None, Vec::new())
+                                    .await
+                                {
+                                    command_supervisor
+                                        .publish_host_event(pi_harness::AgentEvent::Error {
+                                            kind: pi_harness::AgentErrorKind::Internal,
+                                            message: format!(
+                                                "failed to start dashboard session: {error:#}"
+                                            ),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            command_supervisor
+                                .publish_host_event(pi_harness::AgentEvent::Error {
+                                    kind: pi_harness::AgentErrorKind::Internal,
+                                    message: format!(
+                                        "failed to create workspace session: {error:#}"
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                    continue;
+                }
                 if matches!(command, pi_tui::UiCommand::RefreshSessions) {
                     let _ = command_supervisor.refresh_sessions().await;
                     continue;
@@ -298,6 +331,7 @@ async fn main() -> Result<()> {
                             .await;
                     }
                     pi_tui::UiCommand::NewSession => unreachable!(),
+                    pi_tui::UiCommand::NewSessionAt { .. } => unreachable!(),
                     pi_tui::UiCommand::RefreshSessions => unreachable!(),
                     pi_tui::UiCommand::NameSession(name) => {
                         let _ = command_harness.name_session(&command_session, name).await;

@@ -143,6 +143,7 @@ export type SidecarMessage =
 
 export type AgentEvent =
   | { type: "session_reset" }
+  | { type: "permission_mode_changed"; mode: "normal" | "plan" | "always_approve" }
   | { type: "auth_changed"; provider: string; configured: boolean }
   | { type: "runtime_state"; idle: boolean; streaming: boolean; compacting: boolean; context_tokens?: number; context_window?: number; context_percent?: number }
   | { type: "user_message"; text: string }

@@ -96,6 +96,9 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
   if (command.type === "open_session") {
     const { active, history } = await pi.openSession(command, openHooks);
     sessions.set(active.wireSessionId, active);
+    const permissionMode = pi.storedPermissionMode(active.session.sessionManager);
+    permissionModes.set(active.wireSessionId, permissionMode);
+    history.push({ type: "permission_mode_changed", mode: permissionMode });
     writeMessage({
       type: "response",
       request_id: command.request_id,
@@ -379,6 +382,8 @@ async function handleCommand(command: SidecarCommand): Promise<void> {
 
   if (command.type === "set_permission_mode") {
     permissionModes.set(command.session_id, command.mode);
+    pi.persistPermissionMode(active, command.mode);
+    emit({ type: "permission_mode_changed", mode: command.mode });
     writeMessage({ type: "response", request_id: command.request_id });
     return;
   }

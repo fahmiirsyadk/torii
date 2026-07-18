@@ -574,7 +574,7 @@ pub enum ToolStatus {
     Error,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionMode {
     Normal,
     Plan,
@@ -603,6 +603,14 @@ impl PermissionMode {
             Self::Normal => "normal",
             Self::Plan => "plan",
             Self::AlwaysApprove => "always_approve",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "plan" => Self::Plan,
+            "always_approve" => Self::AlwaysApprove,
+            _ => Self::Normal,
         }
     }
 }
@@ -635,6 +643,9 @@ pub struct AppState {
     pub paste_targets: RefCell<Vec<(u64, u16, u16, u16)>>,
     pub branch: String,
     pub cwd: String,
+    /// Absolute working directory used when the dashboard dispatches a new
+    /// session. Unlike `cwd`, this is never shortened for display.
+    pub workspace_cwd: String,
     pub theme_mode: ThemeMode,
     pub context_used: u64,
     pub context_known: bool,
@@ -791,6 +802,7 @@ impl Default for AppState {
             paste_targets: RefCell::new(Vec::new()),
             branch: "torii".into(),
             cwd: "~/dev/torii".into(),
+            workspace_cwd: String::new(),
             theme_mode: ThemeMode::Dark,
             context_used: 0,
             context_known: false,
@@ -1115,6 +1127,61 @@ impl AppState {
         self.available_sessions
             .get(self.dashboard_selected)
             .map(|session| session.path.clone())
+    }
+
+    pub fn set_workspace_cwd(&mut self, cwd: &std::path::Path) {
+        self.workspace_cwd = cwd.display().to_string();
+        self.cwd = crate::effects::display_path(cwd);
+    }
+
+    pub fn sync_current_session_workspace(&mut self) {
+        let cwd = self
+            .available_sessions
+            .iter()
+            .find(|session| session.current)
+            .map(|session| session.cwd.trim())
+            .filter(|cwd| !cwd.is_empty())
+            .map(std::path::PathBuf::from);
+        if let Some(cwd) = cwd {
+            self.set_workspace_cwd(&cwd);
+        }
+    }
+
+    pub fn change_workspace(&mut self, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("usage: /cd <workspace>".into());
+        }
+        let expanded = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .ok_or_else(|| "home directory is unavailable".to_string())?;
+            std::path::PathBuf::from(home).join(
+                value
+                    .trim_start_matches('~')
+                    .trim_start_matches(['/', '\\']),
+            )
+        } else {
+            let path = std::path::PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                let base = (!self.workspace_cwd.is_empty())
+                    .then(|| std::path::PathBuf::from(&self.workspace_cwd))
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                base.join(path)
+            }
+        };
+        let canonical = expanded
+            .canonicalize()
+            .map_err(|error| format!("workspace unavailable: {error}"))?;
+        if !canonical.is_dir() {
+            return Err("workspace must be a directory".into());
+        }
+        self.set_workspace_cwd(&canonical);
+        self.status = format!("workspace: {}", self.cwd);
+        Ok(())
     }
 
     pub fn dashboard_actions(&self) -> DashboardActions {
@@ -4082,6 +4149,14 @@ impl AppState {
 
     pub fn has_background_work(&self) -> bool {
         self.running_tool_count() > 0
+            || self
+                .subagent_tasks
+                .values()
+                .any(|task| task.status == "running")
+            || self
+                .workflow_runs
+                .values()
+                .any(|workflow| matches!(workflow.status.as_str(), "pending" | "running"))
     }
 
     /// Records the start of a new LLM turn. Called on local submission and
@@ -4119,9 +4194,9 @@ impl AppState {
                 context_window,
                 ..
             } => {
-                self.context_known = context_tokens.is_some();
                 if let Some(tokens) = context_tokens {
                     self.context_used = tokens;
+                    self.context_known = true;
                 }
                 if let Some(window) = context_window {
                     self.context_limit = window;
@@ -4148,6 +4223,7 @@ impl AppState {
                     .collect();
             }
             AgentEvent::SessionReset => {
+                self.permission_mode = PermissionMode::Normal;
                 self.view = View::Transcript;
                 self.entries.clear();
                 self.reset_entry_ids();
@@ -4186,6 +4262,9 @@ impl AppState {
                 self.inspected_subagent = None;
                 self.subagent_return_view = View::Transcript;
             }
+            AgentEvent::PermissionModeChanged { mode } => {
+                self.permission_mode = PermissionMode::from_wire(&mode);
+            }
             AgentEvent::UserMessage { text } => {
                 if self.active_subagent_task_ids.iter().all(|id| {
                     self.subagent_tasks
@@ -4223,6 +4302,7 @@ impl AppState {
             }
             AgentEvent::SessionList { sessions } => {
                 self.available_sessions = sessions;
+                self.sync_current_session_workspace();
                 self.dashboard_selected = self
                     .dashboard_selected
                     .min(self.available_sessions.len().saturating_sub(1));
@@ -4234,6 +4314,7 @@ impl AppState {
             }
             AgentEvent::SessionsChanged { sessions } => {
                 self.available_sessions = sessions;
+                self.sync_current_session_workspace();
                 self.dashboard_selected = self
                     .dashboard_selected
                     .min(self.available_sessions.len().saturating_sub(1));
@@ -5377,6 +5458,7 @@ fn apply_compaction(
             }
             if let Some(after) = tokens_after {
                 state.context_used = after;
+                state.context_known = true;
             }
             state.status = if latest_error.is_some() {
                 "compaction failed".into()
