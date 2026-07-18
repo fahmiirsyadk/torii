@@ -134,6 +134,27 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
             }
         ));
     }
+    if state.overlay == OverlayKind::SessionRename {
+        let target = state
+            .pending_session_path
+            .as_deref()
+            .and_then(|path| {
+                state
+                    .available_sessions
+                    .iter()
+                    .find(|session| session.path == path)
+            })
+            .map(|session| {
+                session
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(&session.first_message)
+            })
+            .unwrap_or("selected session");
+        notes.push(format!("Renaming: {target}"));
+        notes.push("This field is the new name, not a session search filter.".into());
+    }
     if state.overlay == OverlayKind::SessionDeleteConfirm {
         notes.push(format!(
             "Delete {}? This cannot be undone.",
@@ -254,6 +275,7 @@ fn generic_picker_data(state: &AppState) -> GenericPickerData {
         OverlayKind::Settings => "↑/↓ navigate · Space/Enter change · Esc close",
         OverlayKind::WorkflowPreview => "↑/↓ scroll · Enter use workflow · Esc back",
         OverlayKind::SessionDeleteConfirm => "Enter delete · Esc cancel",
+        OverlayKind::SessionRename => "Enter rename · Esc cancel",
         _ => "↑/↓ navigate · Enter confirm · Esc close",
     };
     GenericPickerData {
@@ -298,6 +320,15 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
             "Compact context automatically near the model limit",
         ),
         (
+            "Cache miss notices",
+            if state.runtime_settings.show_cache_miss_notices {
+                "on"
+            } else {
+                "off"
+            },
+            "Notify when significant prompt tokens are re-billed",
+        ),
+        (
             "Default project trust",
             state.runtime_settings.default_project_trust.as_str(),
             "Default policy for project-local resources",
@@ -324,7 +355,7 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
             }),
     );
     rows.push(PickerRow::header("Resources"));
-    let mut extensions = PickerRow::item(5, "Pi extensions");
+    let mut extensions = PickerRow::item(6, "Pi extensions");
     extensions.right = state
         .runtime_extensions
         .iter()
@@ -334,11 +365,11 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
     extensions.description = "Inspect and enable or disable SDK extensions".into();
     rows.push(extensions);
     rows.push(PickerRow::header("Models"));
-    let mut scoped = PickerRow::item(6, "Scoped models");
+    let mut scoped = PickerRow::item(7, "Scoped models");
     scoped.right = state.runtime_settings.enabled_models.len().to_string();
     scoped.description = "Limit model cycling and selection".into();
     rows.push(scoped);
-    let mut subagent = PickerRow::item(7, "Subagent model");
+    let mut subagent = PickerRow::item(8, "Subagent model");
     subagent.right = state
         .runtime_settings
         .subagent_model
@@ -348,7 +379,7 @@ fn settings_rows(state: &AppState) -> Vec<PickerRow> {
     subagent.description = "Default model for native delegated tasks".into();
     rows.push(subagent);
     rows.push(PickerRow::header("Appearance"));
-    let mut theme = PickerRow::item(8, "Theme");
+    let mut theme = PickerRow::item(9, "Theme");
     theme.right = state.theme_mode.label().into();
     theme.description = "Switch between Grok dark and light palettes".into();
     rows.push(theme);

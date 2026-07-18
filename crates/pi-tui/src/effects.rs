@@ -24,6 +24,12 @@ impl TerminalGuard {
                 return Err(error.into());
             }
         };
+        // Legacy conhost creates an alternate screen buffer with the parent
+        // buffer's larger scrollback dimensions. That exposes native horizontal
+        // and vertical scrollbars over a full-screen TUI and can cover the last
+        // status row. The alternate buffer is disposable, so keep it matched to
+        // the visible window while Torii owns it.
+        Self::fit_windows_alternate_buffer();
         if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
             ratatui::restore();
             return Err(error.into());
@@ -46,6 +52,13 @@ impl TerminalGuard {
             terminal,
         ))
     }
+
+    pub(super) fn fit_windows_alternate_buffer() {
+        #[cfg(windows)]
+        {
+            let _ = fit_windows_alternate_buffer();
+        }
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -56,6 +69,42 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         ratatui::restore();
     }
+}
+
+#[cfg(windows)]
+fn fit_windows_alternate_buffer() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle,
+        STD_OUTPUT_HANDLE, SetConsoleScreenBufferSize,
+    };
+
+    // SAFETY: all pointers refer to stack-owned Win32 structs for the duration
+    // of each call, and the output handle is only queried and resized.
+    unsafe {
+        let output = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(output, &mut info) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // A scrolled window cannot be shrunk directly without first moving it.
+        // Fresh alternate buffers start at the origin; leave unusual hosts
+        // untouched rather than changing their viewport position.
+        if info.srWindow.Left != 0 || info.srWindow.Top != 0 {
+            return Ok(());
+        }
+        let visible = COORD {
+            X: info.srWindow.Right.saturating_add(1),
+            Y: info.srWindow.Bottom.saturating_add(1),
+        };
+        if info.dwSize.X == visible.X && info.dwSize.Y == visible.Y {
+            return Ok(());
+        }
+        if SetConsoleScreenBufferSize(output, visible) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn display_path(path: &Path) -> String {

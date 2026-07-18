@@ -26,6 +26,14 @@ pub struct DashboardActions {
     pub stop: bool,
     pub close: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CacheMissNotice {
+    pub missed_tokens: u64,
+    pub missed_cost: f64,
+    pub idle_ms: u64,
+    pub model_changed: bool,
+}
 const PERMISSION_OPTIONS: &[&str] = &["Allow once", "Always allow", "Deny"];
 const SLASH_COMMANDS: &[&str] = &[
     "/dashboard",
@@ -685,6 +693,12 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub status: String,
     pub app_update: Option<AppUpdateStatus>,
+    pub cache_miss_notice: Option<CacheMissNotice>,
+    /// Opt-in render diagnostics. `render_fps_tenths` is stored as an integer
+    /// so stories and state snapshots remain deterministic and easy to compare.
+    pub perf_visible: bool,
+    pub render_fps_tenths: u32,
+    pub render_time_micros: u64,
     pub streaming: bool,
     /// A locally submitted foreground message that has not yet been
     /// acknowledged by a non-idle runtime event.
@@ -842,6 +856,10 @@ impl Default for AppState {
             permission_mode: PermissionMode::Normal,
             status: "idle".into(),
             app_update: None,
+            cache_miss_notice: None,
+            perf_visible: false,
+            render_fps_tenths: 0,
+            render_time_micros: 0,
             streaming: false,
             submission_pending: false,
             escape_armed_at: None,
@@ -1597,7 +1615,11 @@ impl AppState {
             OverlayKind::SessionRename | OverlayKind::SessionDeleteConfirm
         ) {
             self.pending_session_path = None;
-            self.open_overlay(OverlayKind::SessionPicker);
+            if self.view == View::Dashboard {
+                self.close_overlay();
+            } else {
+                self.open_overlay(OverlayKind::SessionPicker);
+            }
             return OverlayAction::None;
         }
         if matches!(
@@ -1714,6 +1736,14 @@ impl AppState {
                 format!(
                     "Auto compaction: {}",
                     if self.runtime_settings.auto_compaction {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                format!(
+                    "Cache miss notices: {}",
+                    if self.runtime_settings.show_cache_miss_notices {
                         "on"
                     } else {
                         "off"
@@ -2279,6 +2309,15 @@ impl AppState {
                         self.open_overlay(OverlayKind::ModelPicker)
                     }
                     crate::actions::ActionId::Settings => self.open_overlay(OverlayKind::Settings),
+                    crate::actions::ActionId::TogglePerformance => {
+                        self.perf_visible = !self.perf_visible;
+                        self.status = if self.perf_visible {
+                            "render performance meter enabled (F3 to hide)".into()
+                        } else {
+                            "render performance meter hidden".into()
+                        };
+                        self.close_overlay();
+                    }
                     crate::actions::ActionId::CycleMode => {
                         self.cycle_permission_mode();
                         self.close_overlay();
@@ -2431,7 +2470,11 @@ impl AppState {
                         key: "auto_compaction".into(),
                         value: serde_json::json!(!self.runtime_settings.auto_compaction),
                     },
-                    3 => {
+                    3 => OverlayAction::SetRuntimeSetting {
+                        key: "show_cache_miss_notices".into(),
+                        value: serde_json::json!(!self.runtime_settings.show_cache_miss_notices),
+                    },
+                    4 => {
                         let next = match self.runtime_settings.default_project_trust.as_str() {
                             "ask" => "always",
                             "always" => "never",
@@ -2442,16 +2485,16 @@ impl AppState {
                             value: serde_json::json!(next),
                         }
                     }
-                    4 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
-                    5 => {
+                    5 => OverlayAction::SetProjectTrust(!self.runtime_settings.project_trusted),
+                    6 => {
                         self.open_child_overlay(OverlayKind::Extensions);
                         return OverlayAction::None;
                     }
-                    6 => {
+                    7 => {
                         self.open_child_overlay(OverlayKind::ScopedModels);
                         return OverlayAction::None;
                     }
-                    7 => {
+                    8 => {
                         self.open_child_overlay(OverlayKind::SubagentModelPicker);
                         return OverlayAction::None;
                     }
@@ -2737,6 +2780,9 @@ impl AppState {
             }
             OverlayAction::SetRuntimeSetting { key, value } if key == "auto_compaction" => {
                 self.runtime_settings.auto_compaction = value.as_bool().unwrap_or(false)
+            }
+            OverlayAction::SetRuntimeSetting { key, value } if key == "show_cache_miss_notices" => {
+                self.runtime_settings.show_cache_miss_notices = value.as_bool().unwrap_or(false)
             }
             OverlayAction::SetRuntimeSetting { key, value } if key == "default_project_trust" => {
                 self.runtime_settings.default_project_trust =
@@ -4159,6 +4205,40 @@ impl AppState {
                 .any(|workflow| matches!(workflow.status.as_str(), "pending" | "running"))
     }
 
+    /// Whether the currently visible view contains a time-based animation.
+    ///
+    /// Resident sessions that are running in another workspace only animate
+    /// the dashboard. Treating them as globally animated forced a full
+    /// transcript redraw every 100 ms and repeatedly reset the terminal cursor.
+    pub fn needs_animation_frame(&self) -> bool {
+        if self.scroll_drag.is_some()
+            || self.scrollbar_dragging
+            || self.image_processing_started_at.is_some()
+        {
+            return true;
+        }
+        match self.view {
+            View::Dashboard => self
+                .runtime_sessions
+                .values()
+                .any(|session| session.status == "running"),
+            View::Transcript => {
+                self.streaming
+                    || self.active_compaction_started_at().is_some()
+                    || self.has_background_work()
+            }
+            View::Workflows | View::WorkflowArtifact => self
+                .workflow_runs
+                .values()
+                .any(|workflow| matches!(workflow.status.as_str(), "pending" | "running")),
+            View::Tasks | View::Subagent => self
+                .subagent_tasks
+                .values()
+                .any(|task| task.status == "running"),
+            View::BlockViewer => false,
+        }
+    }
+
     /// Records the start of a new LLM turn. Called on local submission and
     /// retained when the first runtime or content event arrives. Snapshots
     /// `context_used` as the input-token count and resets the output-char
@@ -4166,6 +4246,7 @@ impl AppState {
     /// tally while the model is generating.
     pub fn begin_turn_if_needed(&mut self) {
         if self.turn_started_at.is_none() {
+            self.cache_miss_notice = None;
             self.turn_started_at = Some(Instant::now());
             self.turn_input_tokens = self.context_used;
             self.turn_output_chars = 0;
@@ -4245,6 +4326,7 @@ impl AppState {
                 self.turn_started_at = None;
                 self.turn_input_tokens = 0;
                 self.turn_output_chars = 0;
+                self.cache_miss_notice = None;
                 self.expanded_tool_groups.clear();
                 self.focused_tool = None;
                 self.focused_entry = None;
@@ -4266,6 +4348,7 @@ impl AppState {
                 self.permission_mode = PermissionMode::from_wire(&mode);
             }
             AgentEvent::UserMessage { text } => {
+                self.cache_miss_notice = None;
                 if self.active_subagent_task_ids.iter().all(|id| {
                     self.subagent_tasks
                         .get(id)
@@ -4489,6 +4572,20 @@ impl AppState {
                 self.turn_output_chars = self.turn_output_chars.saturating_add(added);
                 self.status = "thinking…".into();
                 self.streaming = true;
+            }
+            AgentEvent::CacheMiss {
+                missed_tokens,
+                missed_cost,
+                idle_ms,
+                model_changed,
+            } => {
+                self.cache_miss_notice = Some(CacheMissNotice {
+                    missed_tokens,
+                    missed_cost,
+                    idle_ms,
+                    model_changed,
+                });
+                self.status = "prompt cache miss noticed".into();
             }
             AgentEvent::ToolCallStart { id, name, args } => {
                 if name.eq_ignore_ascii_case("update_plan") {

@@ -405,6 +405,14 @@ fn dispatch_registered_action(
         ActionId::ModelPicker => state.open_overlay(OverlayKind::ModelPicker),
         ActionId::SessionPicker => state.open_overlay(OverlayKind::SessionPicker),
         ActionId::Settings => state.open_overlay(OverlayKind::Settings),
+        ActionId::TogglePerformance => {
+            state.perf_visible = !state.perf_visible;
+            state.status = if state.perf_visible {
+                "render performance meter enabled (F3 to hide)".into()
+            } else {
+                "render performance meter hidden".into()
+            };
+        }
         ActionId::ToggleTasks => {
             state.view = if state.view == View::Tasks {
                 View::Transcript
@@ -617,30 +625,41 @@ async fn run_app(
     let mut git_refresh = tokio::time::interval(Duration::from_secs(1));
     git_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut dirty = true;
+    let mut interactive_dirty = true;
     let mut last_draw_at = None;
+    let mut render_window_started = Instant::now();
+    let mut render_window_frames = 0_u32;
     // Every animated glyph in the TUI advances at 80-100 ms. Drawing faster
     // cannot produce a different frame and makes long transcripts compete with
     // input handling while agents stream.
     const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
-        let animated = state.streaming
-            || state.scroll_drag.is_some()
-            || state.scrollbar_dragging
-            || state.image_processing_started_at.is_some()
-            || state.active_compaction_started_at().is_some()
-            || state.has_background_work()
-            || state
-                .runtime_sessions
-                .values()
-                .any(|session| session.status == "running");
+        let animated = state.needs_animation_frame();
         let animation_due = animated
             && last_draw_at
                 .is_none_or(|last_draw: Instant| last_draw.elapsed() >= ANIMATION_FRAME_INTERVAL);
-        if (dirty && !animated) || animation_due {
+        if (dirty && (!animated || interactive_dirty)) || animation_due {
+            let draw_started = Instant::now();
             terminal.draw(|frame| ui::render(frame, &state))?;
+            state.render_time_micros = draw_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            render_window_frames = render_window_frames.saturating_add(1);
+            let render_window_elapsed = render_window_started.elapsed();
+            if render_window_elapsed >= Duration::from_secs(1) {
+                state.render_fps_tenths = ((u128::from(render_window_frames) * 10_000)
+                    / render_window_elapsed.as_millis().max(1))
+                .try_into()
+                .unwrap_or(u32::MAX);
+                render_window_frames = 0;
+                render_window_started = Instant::now();
+            }
             last_draw_at = Some(Instant::now());
             dirty = false;
+            interactive_dirty = false;
         }
 
         let animation_wait = if animated {
@@ -704,8 +723,11 @@ async fn run_app(
             }
             LoopWake::GitRefresh { cwd, branch } => {
                 if cwd == state.workspace_cwd {
-                    state.branch = branch.unwrap_or_else(|| "no-git".into());
-                    dirty = true;
+                    let branch = branch.unwrap_or_else(|| "no-git".into());
+                    if state.branch != branch {
+                        state.branch = branch;
+                        dirty = true;
+                    }
                 }
                 continue;
             }
@@ -713,6 +735,11 @@ async fn run_app(
         };
 
         dirty = true;
+        interactive_dirty = true;
+        if matches!(&input_event, Event::Resize(_, _)) {
+            TerminalGuard::fit_windows_alternate_buffer();
+            terminal.autoresize()?;
+        }
         let size = terminal.size()?;
         let max_scroll = ui::max_scroll(&state, size.width, size.height);
         let page = usize::from(
@@ -2715,6 +2742,26 @@ mod tests {
         state.streaming = false;
         state.focus = super::Focus::Scrollback;
         assert!(!ui::composer_uses_hardware_cursor(&state));
+    }
+
+    #[test]
+    fn running_resident_session_only_animates_the_dashboard() {
+        let mut state = super::AppState::default();
+        state.runtime_sessions.insert(
+            "/sessions/background.jsonl".into(),
+            pi_harness::RuntimeSessionInfo {
+                path: "/sessions/background.jsonl".into(),
+                status: "running".into(),
+                started_at_ms: Some(0),
+            },
+        );
+
+        state.view = super::View::Transcript;
+        assert!(!state.needs_animation_frame());
+        assert!(ui::composer_uses_hardware_cursor(&state));
+
+        state.view = super::View::Dashboard;
+        assert!(state.needs_animation_frame());
     }
 
     #[test]
@@ -5165,6 +5212,38 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_rename_is_an_explicit_editor_and_cancel_returns_to_dashboard() {
+        let mut state = super::AppState {
+            view: super::View::Dashboard,
+            available_sessions: vec![pi_harness::SessionInfo {
+                id: "session".into(),
+                path: "/sessions/session.jsonl".into(),
+                name: Some("Original name".into()),
+                first_message: "first prompt".into(),
+                modified_at_ms: 0,
+                message_count: 1,
+                current: false,
+                cwd: "/work".into(),
+                parent_session_path: None,
+            }],
+            ..super::AppState::default()
+        };
+
+        state.begin_dashboard_rename();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), 90, 24);
+        assert!(output.contains("Renaming: Original name"));
+        assert!(output.contains("new name, not a session search filter"));
+        assert!(output.contains("Enter rename"));
+
+        state.cancel_oauth();
+        assert_eq!(state.view, super::View::Dashboard);
+        assert_eq!(state.overlay, super::OverlayKind::None);
+    }
+
+    #[test]
     fn session_reset_replaces_the_visible_transcript() {
         let mut state = fixtures::conversation();
         state.view = super::View::Dashboard;
@@ -5954,7 +6033,13 @@ mod tests {
         );
         assert_eq!(state.overlay, super::OverlayKind::Settings);
 
-        state.overlay_selected = 6;
+        state.overlay_selected = 3;
+        assert!(
+            matches!(state.activate_overlay(), super::state::OverlayAction::SetRuntimeSetting { key, value } if key == "show_cache_miss_notices" && value == serde_json::json!(true))
+        );
+        assert!(state.runtime_settings.show_cache_miss_notices);
+
+        state.overlay_selected = 7;
         assert!(matches!(
             state.activate_overlay(),
             super::state::OverlayAction::None
@@ -5962,7 +6047,7 @@ mod tests {
         assert_eq!(state.overlay, super::OverlayKind::ScopedModels);
         state.close_overlay();
         assert_eq!(state.overlay, super::OverlayKind::Settings);
-        assert_eq!(state.overlay_selected, 6);
+        assert_eq!(state.overlay_selected, 7);
 
         state.open_overlay(super::OverlayKind::ScopedModels);
         state.toggle_scoped_model();
@@ -6001,7 +6086,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = super::AppState::default();
         state.open_overlay(super::OverlayKind::Settings);
-        state.overlay_selected = 8;
+        state.overlay_selected = 9;
 
         assert!(matches!(
             state.activate_overlay(),
@@ -6043,7 +6128,7 @@ mod tests {
             ..super::AppState::default()
         };
         state.open_overlay(super::OverlayKind::Settings);
-        state.overlay_selected = 5;
+        state.overlay_selected = 6;
         assert!(matches!(
             state.activate_overlay(),
             super::state::OverlayAction::None
@@ -6889,6 +6974,40 @@ mod tests {
     }
 
     #[test]
+    fn cache_miss_replaces_the_finished_working_banner_until_the_next_turn() {
+        let (width, height) = (100, 20);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = super::AppState::default();
+        state.apply(AgentEvent::CacheMiss {
+            missed_tokens: 48_000,
+            missed_cost: 0.18,
+            idle_ms: 360_000,
+            model_changed: true,
+        });
+        state.apply(AgentEvent::TurnComplete {
+            usage: pi_harness::Usage {
+                input_tokens: 50_000,
+                output_tokens: 500,
+            },
+            stop_reason: "end_turn".into(),
+        });
+
+        terminal.draw(|frame| ui::render(frame, &state)).unwrap();
+        let output = buffer_text(terminal.backend().buffer(), width, height);
+        assert!(output.contains("Cache miss"));
+        assert!(output.contains("48K tokens re-billed"));
+        assert!(output.contains("after model switch"));
+        assert!(output.contains("~$0.18 extra"));
+        assert!(!output.contains("Working…"));
+
+        state.apply(AgentEvent::UserMessage {
+            text: "next turn".into(),
+        });
+        assert!(state.cache_miss_notice.is_none());
+    }
+
+    #[test]
     fn working_banner_input_snapshot_resets_between_turns() {
         let mut state = super::AppState::default();
         state.context_used = 2_000;
@@ -6980,6 +7099,21 @@ mod tests {
         assert!(output.contains("^X close"));
         assert!(!output.contains("^D delete"));
         assert!(!output.contains("Messages total"));
+        let sessions_row = output
+            .lines()
+            .position(|line| line.contains("Sessions"))
+            .unwrap();
+        let input_row = output
+            .lines()
+            .position(|line| line.contains("New session in"))
+            .unwrap();
+        let footer_row = output
+            .lines()
+            .position(|line| line.contains("Enter send/open"))
+            .unwrap();
+        assert!(sessions_row < input_row);
+        assert!(input_row < footer_row);
+        assert!(footer_row >= usize::from(height.saturating_sub(3)));
 
         state.dashboard_selected = 1;
         terminal.draw(|frame| ui::render(frame, &state)).unwrap();

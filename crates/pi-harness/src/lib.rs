@@ -157,6 +157,12 @@ pub enum AgentEvent {
     ReasoningDelta {
         text: String,
     },
+    CacheMiss {
+        missed_tokens: u64,
+        missed_cost: f64,
+        idle_ms: u64,
+        model_changed: bool,
+    },
     SubagentUpdate {
         task: Box<SubagentTask>,
     },
@@ -606,6 +612,8 @@ pub struct RuntimeSettings {
     pub steering_mode: String,
     pub follow_up_mode: String,
     pub auto_compaction: bool,
+    #[serde(default)]
+    pub show_cache_miss_notices: bool,
     pub default_project_trust: String,
     pub enabled_models: Vec<String>,
     pub project_trusted: bool,
@@ -619,6 +627,7 @@ impl Default for RuntimeSettings {
             steering_mode: "one-at-a-time".into(),
             follow_up_mode: "one-at-a-time".into(),
             auto_compaction: true,
+            show_cache_miss_notices: false,
             default_project_trust: "ask".into(),
             enabled_models: Vec::new(),
             project_trusted: false,

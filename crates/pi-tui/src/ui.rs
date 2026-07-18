@@ -404,6 +404,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     }
     if working_active {
         render_working_banner(frame, layout.turn_status, state, theme);
+    } else if state.cache_miss_notice.is_some() {
+        render_cache_miss_banner(frame, layout.turn_status, state, theme);
     }
     if compaction_active {
         render_compaction_banner(frame, layout.compaction, state, theme);
@@ -1477,24 +1479,27 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         vertical: 1,
     });
     let width = area.width.min(86);
-    let height = area.height.min(33);
     let panel = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
+        area.y,
         width,
-        height,
+        area.height,
     );
     let compact = panel.height < 25 || panel.width < 68;
     let logo_height = if compact { 5 } else { TORII.len() as u16 };
+    let footer_height = 1 + u16::from(state.app_update.is_some()) + u16::from(state.perf_visible);
     let chunks = Layout::vertical([
         Constraint::Length(logo_height),
         Constraint::Length(3),
-        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(4),
-        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(footer_height),
     ])
     .split(panel);
+    let input_area = chunks[4];
+    let session_title_area = chunks[2];
+    let session_list_area = chunks[3];
 
     let logo: Vec<Line<'_>> = if compact {
         TORII.iter().take(5).map(|line| Line::from(*line)).collect()
@@ -1531,7 +1536,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         .alignment(Alignment::Center),
         chunks[1],
     );
-    let input_width = usize::from(chunks[2].width.saturating_sub(4)).max(1);
+    let input_width = usize::from(input_area.width.saturating_sub(4)).max(1);
     let cursor = state.cursor.min(state.prompt.chars().count());
     let first = cursor.saturating_sub(input_width.saturating_sub(1));
     let visible_prompt = state
@@ -1552,28 +1557,35 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
                     ))
                     .border_style(Style::default().fg(theme.accent)),
             ),
-        chunks[2],
+        input_area,
     );
     let cursor_column = cursor
         .saturating_sub(first)
         .min(input_width.saturating_sub(1));
-    frame.set_cursor_position((
-        chunks[2]
+    let cursor_position = (
+        input_area
             .x
             .saturating_add(3)
             .saturating_add(cursor_column as u16),
-        chunks[2].y.saturating_add(1),
-    ));
+        input_area.y.saturating_add(1),
+    );
+    if state.needs_animation_frame() {
+        if let Some(cell) = frame.buffer_mut().cell_mut(cursor_position) {
+            cell.modifier.insert(Modifier::REVERSED);
+        }
+    } else {
+        frame.set_cursor_position(cursor_position);
+    }
     frame.render_widget(
         Paragraph::new("Sessions").style(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        chunks[3],
+        session_title_area,
     );
 
-    let visible = chunks[4].height as usize;
+    let visible = session_list_area.height as usize;
     let selected = state
         .dashboard_selected
         .min(state.available_sessions.len().saturating_sub(1));
@@ -1656,15 +1668,15 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
         )));
     }
     state.dashboard_list_rect.set(Some((
-        chunks[4].x,
-        chunks[4].y,
-        chunks[4].width,
-        chunks[4].height,
+        session_list_area.x,
+        session_list_area.y,
+        session_list_area.width,
+        session_list_area.height,
     )));
-    frame.render_widget(Paragraph::new(lines), chunks[4]);
+    frame.render_widget(Paragraph::new(lines), session_list_area);
     crate::picker::render_scrollbar_for(
         frame,
-        chunks[4],
+        session_list_area,
         viewport.start,
         viewport.end.saturating_sub(viewport.start),
         state.available_sessions.len(),
@@ -1681,10 +1693,20 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &AppState, theme: Theme) {
     if actions.close {
         footer.push_str("   ^X close");
     }
-    footer.push_str("   Esc return");
-    let mut footer_lines = Vec::with_capacity(2);
+    footer.push_str("   F3 perf   Esc return");
+    let mut footer_lines = Vec::with_capacity(3);
     if let Some(status) = state.app_update.as_ref() {
         footer_lines.push(update_status_line(status, theme));
+    }
+    if state.perf_visible {
+        footer_lines.push(Line::from(Span::styled(
+            format_render_performance(state),
+            Style::default().fg(if state.render_time_micros > 16_667 {
+                theme.warning
+            } else {
+                theme.muted
+            }),
+        )));
     }
     footer_lines.push(Line::from(footer));
     frame.render_widget(
@@ -1765,6 +1787,16 @@ fn format_dashboard_elapsed(milliseconds: u128) -> String {
     }
 }
 
+fn format_render_performance(state: &AppState) -> String {
+    let fps = state.render_fps_tenths;
+    let frame_millis = state.render_time_micros as f64 / 1_000.0;
+    format!(
+        "Render {}.{} FPS  ·  {frame_millis:.1} ms/frame  ·  F3 hide",
+        fps / 10,
+        fps % 10
+    )
+}
+
 fn truncate_text(value: &str, width: usize) -> String {
     let mut chars = value.chars();
     let mut result: String = chars.by_ref().take(width).collect();
@@ -1806,6 +1838,24 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: The
     let separator = || Span::styled(" │ ", Style::default().fg(theme.subtle));
     let queued = state.queued_steering.len() + state.queued_follow_up.len();
     let mut right: Vec<(Option<u8>, Span<'static>)> = Vec::new();
+    if state.perf_visible {
+        right.push((
+            None,
+            Span::styled(
+                format!(
+                    "{}.{} FPS · {:.1} ms",
+                    state.render_fps_tenths / 10,
+                    state.render_fps_tenths % 10,
+                    state.render_time_micros as f64 / 1_000.0
+                ),
+                Style::default().fg(if state.render_time_micros > 16_667 {
+                    theme.warning
+                } else {
+                    theme.muted
+                }),
+            ),
+        ));
+    }
     if state.tasks_total > 0 {
         if !right.is_empty() {
             right.push((None, separator()));
@@ -2675,6 +2725,40 @@ fn render_working_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, th
         &tokens_label,
         theme,
         theme.accent,
+        theme.muted,
+    );
+}
+
+fn render_cache_miss_banner(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
+    let Some(miss) = state.cache_miss_notice else {
+        return;
+    };
+    let cause = if miss.model_changed {
+        "after model switch".to_string()
+    } else if miss.idle_ms >= 5 * 60 * 1_000 {
+        format!(
+            "after {}m idle",
+            miss.idle_ms.saturating_add(30_000) / 60_000
+        )
+    } else {
+        "prompt cache changed".to_string()
+    };
+    let cost = if miss.missed_cost >= 0.01 {
+        format!("~${:.2} extra", miss.missed_cost)
+    } else {
+        "cache read missed".to_string()
+    };
+    render_three_column_banner(
+        frame,
+        area,
+        &format!(
+            "⚠ Cache miss · {} tokens re-billed",
+            compact_number(miss.missed_tokens)
+        ),
+        &cause,
+        &cost,
+        theme,
+        theme.warning,
         theme.muted,
     );
 }
@@ -3675,7 +3759,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
 }
 
 pub(crate) fn composer_uses_hardware_cursor(state: &AppState) -> bool {
-    state.focus == Focus::Prompt && !state.streaming
+    state.focus == Focus::Prompt && !state.needs_animation_frame()
 }
 
 pub(crate) fn render_composer_cursor(

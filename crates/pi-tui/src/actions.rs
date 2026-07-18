@@ -29,6 +29,7 @@ pub enum ActionId {
     ModelPicker,
     SessionPicker,
     Settings,
+    TogglePerformance,
     Quit,
 }
 
@@ -319,6 +320,16 @@ pub fn definitions() -> Vec<ActionDefinition> {
             palette: true,
         },
         ActionDefinition {
+            id: ActionId::TogglePerformance,
+            label: "Render performance",
+            description: "Show or hide FPS and frame render time",
+            context: ActionContext::Global,
+            primary: KeyBinding::new(KeyCode::F(3), KeyModifiers::NONE),
+            alternates: NONE,
+            hint_priority: None,
+            palette: true,
+        },
+        ActionDefinition {
             id: ActionId::CancelTurn,
             label: "Cancel turn",
             description: "Cancel the running turn",
@@ -415,6 +426,13 @@ mod tests {
         assert_eq!(
             KeyBinding::new(KeyCode::BackTab, KeyModifiers::SHIFT).display(),
             "Shift+Tab"
+        );
+        assert_eq!(
+            lookup(
+                &KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+                ActionContext::Global
+            ),
+            Some(ActionId::TogglePerformance)
         );
     }
 }

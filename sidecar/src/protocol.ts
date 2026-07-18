@@ -6,7 +6,7 @@ export type SidecarCommand =
   | { type: "reload_resources"; request_id: string; session_id: string }
   | { type: "set_extension_enabled"; request_id: string; session_id: string; path: string; enabled: boolean }
   | { type: "get_settings"; request_id: string; session_id: string }
-  | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust" | "subagent_model"; value: string | boolean | null }
+  | { type: "set_setting"; request_id: string; session_id: string; key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "show_cache_miss_notices" | "default_project_trust" | "subagent_model"; value: string | boolean | null }
   | { type: "set_scoped_models"; request_id: string; session_id: string; models: string[] }
   | { type: "set_project_trust"; request_id: string; session_id: string; trusted: boolean }
   | { type: "export_session"; request_id: string; session_id: string; path?: string }
@@ -90,6 +90,7 @@ export type SidecarMessage =
         steering_mode: "all" | "one-at-a-time";
         follow_up_mode: "all" | "one-at-a-time";
         auto_compaction: boolean;
+        show_cache_miss_notices: boolean;
         default_project_trust: "ask" | "always" | "never";
         enabled_models: string[];
         project_trusted: boolean;
@@ -158,6 +159,7 @@ export type AgentEvent =
   | { type: "oauth_complete"; provider: string }
   | { type: "text_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
+  | { type: "cache_miss"; missed_tokens: number; missed_cost: number; idle_ms: number; model_changed: boolean }
   | { type: "subagent_update"; task: SubagentTask }
   | { type: "subagent_transcript"; task_id: string; event: AgentEvent }
   | { type: "workflow_update"; workflow: WorkflowRunSnapshot }

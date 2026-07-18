@@ -80,8 +80,91 @@ export interface ActiveSession {
   settingsManager: SettingsManager;
   agentDir: string;
   lastCompletion?: Extract<AgentEvent, { type: "turn_complete" }>;
+  cacheRequest?: CacheRequest;
   toolStarted: Map<string, number>;
   compacting: boolean;
+}
+
+interface CacheRequest {
+  promptTokens: number;
+  modelKey: string;
+  timestamp: number;
+  reportedCache: boolean;
+}
+
+interface CacheMessage {
+  provider: string;
+  model: string;
+  timestamp: number;
+  usage: {
+    input: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: { input: number; cacheRead: number; cacheWrite: number };
+  };
+}
+
+const CACHE_NOISE_FLOOR_TOKENS = 1_024;
+const CACHE_NOTICE_TOKENS = 20_000;
+const CACHE_NOTICE_COST = 0.1;
+
+function nextCacheRequest(previous: CacheRequest | undefined, message: CacheMessage): CacheRequest | undefined {
+  const promptTokens = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
+  if (promptTokens <= 0) return previous;
+  return {
+    promptTokens,
+    modelKey: `${message.provider}/${message.model}`,
+    timestamp: message.timestamp,
+    reportedCache: previous?.reportedCache === true || message.usage.cacheRead + message.usage.cacheWrite > 0,
+  };
+}
+
+export function detectSignificantCacheMiss(
+  previous: CacheRequest | undefined,
+  message: CacheMessage,
+  cacheReadDollarsPerMillion = 0,
+): Extract<AgentEvent, { type: "cache_miss" }> | undefined {
+  const usage = message.usage;
+  const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  if (
+    previous === undefined ||
+    promptTokens <= 0 ||
+    (usage.cacheRead + usage.cacheWrite === 0 && !previous.reportedCache)
+  ) {
+    return undefined;
+  }
+  const missedTokens = Math.min(previous.promptTokens, promptTokens) - usage.cacheRead;
+  if (missedTokens <= CACHE_NOISE_FLOOR_TOKENS) return undefined;
+
+  const paidTokens = usage.input + usage.cacheWrite;
+  const paidPerToken =
+    paidTokens > 0 ? (usage.cost.input + usage.cost.cacheWrite) / paidTokens : 0;
+  const readPerToken =
+    usage.cacheRead > 0
+      ? usage.cost.cacheRead / usage.cacheRead
+      : cacheReadDollarsPerMillion / 1_000_000;
+  const missedCost = missedTokens * Math.max(0, paidPerToken - readPerToken);
+  if (missedTokens < CACHE_NOTICE_TOKENS && missedCost < CACHE_NOTICE_COST) return undefined;
+
+  return {
+    type: "cache_miss",
+    missed_tokens: missedTokens,
+    missed_cost: missedCost,
+    idle_ms: Math.max(0, message.timestamp - previous.timestamp),
+    model_changed: `${message.provider}/${message.model}` !== previous.modelKey,
+  };
+}
+
+function cacheRequestFromEntries(entries: ReturnType<SessionManager["getEntries"]>): CacheRequest | undefined {
+  let previous: CacheRequest | undefined;
+  for (const entry of entries) {
+    if (entry.type === "compaction" || entry.type === "branch_summary") {
+      previous = undefined;
+    } else if (entry.type === "message" && entry.message.role === "assistant") {
+      previous = nextCacheRequest(previous, entry.message);
+    }
+  }
+  return previous;
 }
 
 const PARENT_ONLY_TOOLS = new Set([
@@ -776,6 +859,15 @@ export function handlePiEvent(
     }
     case "message_end":
       if (event.message.role === "assistant") {
+        const cacheMiss = detectSignificantCacheMiss(
+          active.cacheRequest,
+          event.message,
+          active.modelRegistry.find(event.message.provider, event.message.model)?.cost.cacheRead ?? 0,
+        );
+        active.cacheRequest = nextCacheRequest(active.cacheRequest, event.message);
+        if (cacheMiss !== undefined && active.settingsManager.getShowCacheMissNotices()) {
+          emitEvent(sessionId, cacheMiss);
+        }
         if (
           (event.message.stopReason === "error" || event.message.stopReason === "aborted") &&
           event.message.errorMessage !== undefined
@@ -810,6 +902,7 @@ export function handlePiEvent(
       break;
     case "compaction_start":
       active.compacting = true;
+      active.cacheRequest = undefined;
       emitEvent(sessionId, { type: "compaction", phase: "start", reason: event.reason });
       break;
     case "compaction_end": {
@@ -1004,6 +1097,7 @@ export async function openSession(
     agentDir: services.agentDir,
     toolStarted: new Map(),
     compacting: false,
+    cacheRequest: cacheRequestFromEntries(sessionManager.getEntries()),
   };
   const history = [...loadedHistory(session, sessionManager), runtimeState(active)];
   await bindRuntime(active, hooks.emitEvent);
@@ -1165,6 +1259,7 @@ export function getSettings(active: ActiveSession) {
     steering_mode: active.session.steeringMode,
     follow_up_mode: active.session.followUpMode,
     auto_compaction: active.session.autoCompactionEnabled,
+    show_cache_miss_notices: manager.getShowCacheMissNotices(),
     default_project_trust: manager.getDefaultProjectTrust(),
     enabled_models: manager.getEnabledModels() ?? [],
     project_trusted: new ProjectTrustStore(active.agentDir).get(active.cwd) === true,
@@ -1211,12 +1306,13 @@ function resolveToriiSubagentModel(active: ActiveSession) {
 
 export async function applySetting(
   active: ActiveSession,
-  key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "default_project_trust" | "subagent_model",
+  key: "steering_mode" | "follow_up_mode" | "auto_compaction" | "show_cache_miss_notices" | "default_project_trust" | "subagent_model",
   value: string | boolean | null,
 ): Promise<void> {
   if (key === "steering_mode") await active.session.setSteeringMode(value as "all" | "one-at-a-time");
   else if (key === "follow_up_mode") await active.session.setFollowUpMode(value as "all" | "one-at-a-time");
   else if (key === "auto_compaction") await active.session.setAutoCompactionEnabled(value === true);
+  else if (key === "show_cache_miss_notices") active.settingsManager.setShowCacheMissNotices(value === true);
   else if (key === "default_project_trust") await active.settingsManager.setDefaultProjectTrust(value as "ask" | "always" | "never");
   else {
     if (value !== null && typeof value !== "string") throw new Error("subagent model must be a model identifier or null");

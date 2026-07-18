@@ -6,7 +6,47 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { grokToolsExtension, isTopLevelSession, loadedHistory, readToriiSettings, storedPermissionMode, writeToriiSubagentModel } from "./pi-adapter.ts";
+import { detectSignificantCacheMiss, grokToolsExtension, isTopLevelSession, loadedHistory, readToriiSettings, storedPermissionMode, writeToriiSubagentModel } from "./pi-adapter.ts";
+
+test("significant cache misses use Pi's token threshold and cause metadata", () => {
+  const previous = {
+    promptTokens: 50_000,
+    modelKey: "anthropic/claude",
+    timestamp: 1_000,
+    reportedCache: true,
+  };
+  const miss = detectSignificantCacheMiss(previous, {
+    provider: "anthropic",
+    model: "claude-next",
+    timestamp: 361_000,
+    usage: {
+      input: 50_000,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: { input: 0.15, cacheRead: 0, cacheWrite: 0 },
+    },
+  });
+  assert.deepEqual(miss, {
+    type: "cache_miss",
+    missed_tokens: 50_000,
+    missed_cost: 0.15,
+    idle_ms: 360_000,
+    model_changed: true,
+  });
+
+  const noise = detectSignificantCacheMiss(previous, {
+    provider: "anthropic",
+    model: "claude",
+    timestamp: 2_000,
+    usage: {
+      input: 500,
+      cacheRead: 49_500,
+      cacheWrite: 0,
+      cost: { input: 0.001, cacheRead: 0.005, cacheWrite: 0 },
+    },
+  });
+  assert.equal(noise, undefined);
+});
 
 test("Pi null and missing parent paths both identify top-level sessions", () => {
   assert.equal(isTopLevelSession(undefined), true);

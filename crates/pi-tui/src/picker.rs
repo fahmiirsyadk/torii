@@ -138,7 +138,13 @@ pub fn render(
     let mut y = geometry.modal.y + 1;
     if let Some((label, query)) = spec.query {
         let placeholder = if query.is_empty() {
-            "type to search…"
+            match label {
+                "Name" => "type the new session name…",
+                "Instructions" => "type instructions…",
+                "Key" => "paste the API key…",
+                "Reply" => "type a reply…",
+                _ => "type to search…",
+            }
         } else {
             query
         };
