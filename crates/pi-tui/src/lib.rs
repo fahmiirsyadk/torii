@@ -430,12 +430,13 @@ fn dispatch_registered_action(
             }
         }
         ActionId::CancelTurn => {
-            if !state.prompt.is_empty() || !state.image_attachments.is_empty() {
+            if state.streaming {
+                state.cancel_streaming();
+                if let Some(sender) = commands {
+                    let _ = sender.send(UiCommand::AbortAndRestoreQueue);
+                }
+            } else if !state.prompt.is_empty() || !state.image_attachments.is_empty() {
                 state.clear_prompt();
-            } else if state.streaming
-                && let Some(sender) = commands
-            {
-                let _ = sender.send(UiCommand::AbortAndRestoreQueue);
             }
         }
         ActionId::Quit => return ActionOutcome::Quit,
@@ -453,6 +454,12 @@ fn dispatch_pane_action(
     use actions::ActionId;
     match action {
         ActionId::ClearPrompt => {
+            // Ctrl+C is also the cancel-turn action. Let the Agent context
+            // handle it while a turn is active instead of clearing only the
+            // draft and swallowing cancellation.
+            if state.streaming {
+                return false;
+            }
             if state.prompt.is_empty() && state.image_attachments.is_empty() {
                 return false;
             }
@@ -1343,26 +1350,29 @@ async fn run_app(
                             }
                         } else {
                             let delivery = state.streaming.then_some(
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    pi_harness::MessageDelivery::Steer
-                                } else {
-                                    pi_harness::MessageDelivery::FollowUp
-                                },
+                                // Ctrl+Enter is "Send now": force a new
+                                // follow-up instead of steering the current
+                                // generation.
+                                pi_harness::MessageDelivery::FollowUp,
                             );
                             if let Some((prompt, images)) = state.submit_message()
                                 && let Some(sender) = &commands
-                                && sender
+                            {
+                                state.acknowledge_queue_delivery(&prompt, delivery);
+                                if sender
                                     .send(UiCommand::Submit {
                                         text: prompt,
                                         delivery,
                                         images,
                                     })
                                     .is_err()
-                            {
-                                state.submission_pending = false;
-                                state.streaming = false;
-                                state.turn_started_at = None;
-                                state.status = "send failed: runtime command channel closed".into();
+                                {
+                                    state.submission_pending = false;
+                                    state.streaming = false;
+                                    state.turn_started_at = None;
+                                    state.status =
+                                        "send failed: runtime command channel closed".into();
+                                }
                             }
                         }
                     }
@@ -2619,6 +2629,46 @@ mod tests {
             state.permission_mode,
             super::state::PermissionMode::AlwaysApprove
         );
+    }
+
+    #[test]
+    fn submitted_queue_items_are_removed_from_stale_queue_events() {
+        let mut state = super::AppState {
+            streaming: true,
+            queued_follow_up: vec!["already sent".into(), "keep me".into()],
+            ..super::AppState::default()
+        };
+        state.acknowledge_queue_delivery(
+            "already sent",
+            Some(pi_harness::MessageDelivery::FollowUp),
+        );
+        state.apply(AgentEvent::QueueChanged {
+            steering: Vec::new(),
+            follow_up: vec!["already sent".into(), "keep me".into()],
+        });
+        assert_eq!(state.queued_follow_up, vec!["keep me"]);
+        state.apply(AgentEvent::QueueChanged {
+            steering: Vec::new(),
+            follow_up: vec!["keep me".into()],
+        });
+        assert_eq!(state.queued_follow_up, vec!["keep me"]);
+    }
+
+    #[test]
+    fn cancelling_streaming_clears_local_working_and_queue_state() {
+        let mut state = super::AppState {
+            streaming: true,
+            submission_pending: true,
+            queued_steering: vec!["stop".into()],
+            queued_follow_up: vec!["later".into()],
+            ..super::AppState::default()
+        };
+        state.cancel_streaming();
+        assert!(!state.streaming);
+        assert!(!state.submission_pending);
+        assert!(state.queued_steering.is_empty());
+        assert!(state.queued_follow_up.is_empty());
+        assert_eq!(state.status, "canceling…");
     }
 
     #[test]

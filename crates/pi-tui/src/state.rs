@@ -725,6 +725,9 @@ pub struct AppState {
     pub pending_thinking_picker: bool,
     pub queued_steering: Vec<String>,
     pub queued_follow_up: Vec<String>,
+    /// Messages submitted locally whose queue-update event may still be stale.
+    pub pending_queue_removals_steering: Vec<String>,
+    pub pending_queue_removals_follow_up: Vec<String>,
     pub queue_visible: bool,
     pub scroll_from_bottom: usize,
     pub focus: Focus,
@@ -873,6 +876,8 @@ impl Default for AppState {
             pending_thinking_picker: false,
             queued_steering: Vec::new(),
             queued_follow_up: Vec::new(),
+            pending_queue_removals_steering: Vec::new(),
+            pending_queue_removals_follow_up: Vec::new(),
             queue_visible: true,
             scroll_from_bottom: 0,
             focus: Focus::Prompt,
@@ -4094,6 +4099,49 @@ impl AppState {
         Some(prompt)
     }
 
+    pub fn acknowledge_queue_delivery(
+        &mut self,
+        text: &str,
+        delivery: Option<pi_harness::MessageDelivery>,
+    ) {
+        match delivery {
+            Some(pi_harness::MessageDelivery::Steer) => {
+                self.pending_queue_removals_steering.push(text.into());
+            }
+            Some(pi_harness::MessageDelivery::FollowUp) => {
+                self.pending_queue_removals_follow_up.push(text.into());
+            }
+            None => {}
+        }
+        self.remove_first_queue_item(text, delivery);
+    }
+
+    fn remove_first_queue_item(
+        &mut self,
+        text: &str,
+        delivery: Option<pi_harness::MessageDelivery>,
+    ) {
+        let queue = match delivery {
+            Some(pi_harness::MessageDelivery::Steer) => &mut self.queued_steering,
+            Some(pi_harness::MessageDelivery::FollowUp) => &mut self.queued_follow_up,
+            None => return,
+        };
+        if let Some(index) = queue.iter().position(|item| item == text) {
+            queue.remove(index);
+        }
+    }
+
+    pub fn cancel_streaming(&mut self) {
+        self.streaming = false;
+        self.submission_pending = false;
+        self.turn_started_at = None;
+        self.queued_steering.clear();
+        self.queued_follow_up.clear();
+        self.pending_queue_removals_steering.clear();
+        self.pending_queue_removals_follow_up.clear();
+        self.status = "canceling…".into();
+    }
+
     pub fn submit_message(&mut self) -> Option<(String, Vec<pi_harness::MessageImage>)> {
         let prompt = self.prompt.trim().to_string();
         if prompt.is_empty() && self.image_attachments.is_empty() {
@@ -4361,6 +4409,8 @@ impl AppState {
                 self.clear_prompt();
                 self.queued_steering.clear();
                 self.queued_follow_up.clear();
+                self.pending_queue_removals_steering.clear();
+                self.pending_queue_removals_follow_up.clear();
                 self.pending_permission = None;
                 self.pending_oauth = None;
                 self.pending_api_key_provider = None;
@@ -4468,9 +4518,11 @@ impl AppState {
                 }
             }
             AgentEvent::QueueChanged {
-                steering,
-                follow_up,
+                mut steering,
+                mut follow_up,
             } => {
+                reconcile_queue(&mut steering, &mut self.pending_queue_removals_steering);
+                reconcile_queue(&mut follow_up, &mut self.pending_queue_removals_follow_up);
                 self.queued_steering = steering;
                 self.queued_follow_up = follow_up;
                 let count = self.queued_steering.len() + self.queued_follow_up.len();
@@ -4909,6 +4961,17 @@ impl AppState {
             _ => {}
         }
     }
+}
+
+fn reconcile_queue(queue: &mut Vec<String>, pending_removals: &mut Vec<String>) {
+    pending_removals.retain_mut(|text| {
+        if let Some(index) = queue.iter().position(|item| item == text) {
+            queue.remove(index);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 fn plan_entries_complete(entries: &[pi_harness::PlanEntry]) -> bool {

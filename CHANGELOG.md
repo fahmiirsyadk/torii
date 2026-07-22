@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7 - 2026-07-22
+
+### Streaming controls
+
+- Sent steering and follow-up messages no longer remain stuck in the queue UI
+  when a delayed queue event reports stale state.
+- Ctrl+Enter now forces a follow-up message while a turn is streaming.
+- Ctrl+C now reliably cancels an active turn instead of only clearing the draft,
+  and the local working and queue indicators update immediately.
+
 ## 0.1.6 - 2026-07-22
 
 ### Prompt and thinking UI
