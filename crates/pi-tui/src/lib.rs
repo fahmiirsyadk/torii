@@ -1326,8 +1326,7 @@ async fn run_app(
                             state.insert_char('\n');
                             continue;
                         }
-                        if matches!(state.prompt.trim(), "/paste" | "/paste-image") {
-                            state.clear_prompt_text();
+                        if state.consume_paste_command() {
                             begin_clipboard_load(&mut state, &image_sender);
                         } else if let Some(action) = state.activate_slash_command() {
                             if dispatch_overlay_action(action, &commands) {
@@ -2346,6 +2345,37 @@ mod tests {
         );
         assert!(state.prompt.is_empty());
         assert!(state.paste_blocks.is_empty());
+    }
+
+    #[test]
+    fn embedded_paste_command_is_removed_without_submitting_literal_text() {
+        let mut state = super::AppState {
+            prompt: "before /paste after".into(),
+            cursor: "before /paste after".chars().count(),
+            ..super::AppState::default()
+        };
+        assert!(state.consume_paste_command());
+        assert_eq!(state.prompt, "before  after");
+        assert_eq!(state.cursor, "before  after".chars().count());
+
+        state.prompt = "paste.example /pasteful".into();
+        state.cursor = state.prompt.chars().count();
+        assert!(!state.consume_paste_command());
+    }
+
+    #[test]
+    fn paste_command_removal_keeps_existing_paste_ranges_aligned() {
+        let mut state = super::AppState {
+            prompt: " /paste tail".into(),
+            cursor: 0,
+            ..super::AppState::default()
+        };
+        state.insert_paste("head".into());
+        state.cursor = state.prompt.chars().count();
+        assert!(state.consume_paste_command());
+        assert_eq!(state.prompt, "head  tail");
+        assert_eq!(state.paste_blocks[0].start, 0);
+        assert_eq!(state.paste_blocks[0].end, 4);
     }
 
     #[test]

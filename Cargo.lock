@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "pi-harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "pi-harness-pi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "torii"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "crossterm",

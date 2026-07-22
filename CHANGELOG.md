@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.6 - 2026-07-22
+
+### Prompt and thinking UI
+
+- `/paste` and `/paste-image` now work when embedded in a sentence without
+  submitting the command literally.
+- Pasted content keeps the surrounding prompt and paste-chip ranges aligned.
+- The composer border pulses while the model is thinking or streaming.
+
 ## 0.1.5 - 2026-07-18
 
 ### Multi-session workspaces

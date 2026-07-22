@@ -3516,6 +3516,32 @@ fn diff_render_lines(
     lines
 }
 
+fn thinking_border_color(state: &AppState, theme: Theme) -> Color {
+    let base = theme.prompt_border_active;
+    if !state.streaming && !state.submission_pending {
+        return base;
+    }
+    let Some(started) = state.turn_started_at else {
+        return base;
+    };
+    let phase = (started.elapsed().as_millis() % 1_600) as f32 / 800.0;
+    let amount = if phase <= 1.0 { phase } else { 2.0 - phase };
+    match (base, theme.accent_thinking) {
+        (Color::Rgb(br, bg, bb), Color::Rgb(ar, ag, ab)) => Color::Rgb(
+            lerp(br, ar, amount),
+            lerp(bg, ag, amount),
+            lerp(bb, ab, amount),
+        ),
+        _ => base,
+    }
+}
+
+fn lerp(from: u8, to: u8, amount: f32) -> u8 {
+    (f32::from(from) + (f32::from(to) - f32::from(from)) * amount)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Theme) {
     let image_labels = state
         .image_attachments
@@ -3556,7 +3582,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: T
         Style::default().fg(theme.foreground)
     };
     let border_color = if state.focus == Focus::Prompt {
-        theme.prompt_border_active
+        thinking_border_color(state, theme)
     } else {
         theme.prompt_border
     };

@@ -3614,6 +3614,56 @@ impl AppState {
         self.image_hover = None;
     }
 
+    /// Removes a `/paste` command embedded in the prompt, leaving the rest of
+    /// the sentence in place. Slash commands are recognized as whitespace-
+    /// delimited tokens so ordinary text such as `https://paste.example` is
+    /// not changed.
+    pub fn consume_paste_command(&mut self) -> bool {
+        let command = ["/paste-image", "/paste"].into_iter().find_map(|command| {
+            self.prompt
+                .match_indices(command)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .find_map(|(byte, _)| {
+                    let start_ok = byte == 0
+                        || self.prompt[..byte]
+                            .chars()
+                            .next_back()
+                            .is_some_and(char::is_whitespace);
+                    let end = byte + command.len();
+                    let end_ok = end == self.prompt.len()
+                        || self.prompt[end..]
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_whitespace);
+                    (start_ok && end_ok).then_some((byte, end))
+                })
+        });
+        let Some((start_byte, end_byte)) = command else {
+            return false;
+        };
+        let start = self.prompt[..start_byte].chars().count();
+        let removed = self.prompt[start_byte..end_byte].chars().count();
+        self.prompt.replace_range(start_byte..end_byte, "");
+        for block in &mut self.paste_blocks {
+            if block.start >= start + removed {
+                block.start -= removed;
+                block.end -= removed;
+            } else if block.end > start {
+                block.end = block.end.saturating_sub(removed.min(block.end - start));
+            }
+        }
+        self.paste_blocks.retain(|block| block.start < block.end);
+        self.cursor = if self.cursor >= start + removed {
+            self.cursor - removed
+        } else {
+            self.cursor.min(start)
+        };
+        self.history_index = None;
+        true
+    }
+
     pub fn clear_prompt_text(&mut self) {
         self.prompt.clear();
         self.cursor = 0;
